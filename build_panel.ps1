@@ -18,8 +18,22 @@ Write-Host "[build] Project: $ProjectRoot"
 Write-Host "[build] Python : $Python"
 
 $PythonBasePrefix = & $Python -c "import sys; print(sys.base_prefix)"
-$env:TCL_LIBRARY = Join-Path $PythonBasePrefix "tcl\tcl8.6"
-$env:TK_LIBRARY = Join-Path $PythonBasePrefix "tcl\tk8.6"
+$TclCandidates = @(
+    (Join-Path $PythonBasePrefix "tcl\tcl8.6"),
+    (Join-Path $PythonBasePrefix "Library\lib\tcl8.6")
+)
+$TkCandidates = @(
+    (Join-Path $PythonBasePrefix "tcl\tk8.6"),
+    (Join-Path $PythonBasePrefix "Library\lib\tk8.6")
+)
+$env:TCL_LIBRARY = ($TclCandidates | Where-Object { Test-Path (Join-Path $_ "init.tcl") } | Select-Object -First 1)
+$env:TK_LIBRARY = ($TkCandidates | Where-Object { Test-Path (Join-Path $_ "tk.tcl") } | Select-Object -First 1)
+if (-not $env:TCL_LIBRARY) {
+    throw "Tcl data directory not found under Python base prefix: $PythonBasePrefix"
+}
+if (-not $env:TK_LIBRARY) {
+    throw "Tk data directory not found under Python base prefix: $PythonBasePrefix"
+}
 Write-Host "[build] Tcl    : $env:TCL_LIBRARY"
 Write-Host "[build] Tk     : $env:TK_LIBRARY"
 

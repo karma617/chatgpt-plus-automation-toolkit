@@ -1,3 +1,6 @@
+import json
+from types import SimpleNamespace
+
 import panel_runner
 
 
@@ -20,9 +23,12 @@ def test_default_env_resolves_next_to_frozen_exe(monkeypatch, tmp_path) -> None:
 
 
 def test_flow_key_for_actions() -> None:
+    assert panel_runner.flow_key_for_action("register-only") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-flow1") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-auto") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-flow2-nocard") == "flow1"
+    assert panel_runner.flow_key_for_action("paypal-flow2-jp") == "flow1"
+    assert panel_runner.flow_key_for_action("paypal-flow2-jp-nocard") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-flow2-filler") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-auto-nocard") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-auto-filler") == "flow1"
@@ -53,21 +59,33 @@ def test_parse_mail_source_and_selected_email_args() -> None:
 
 
 def test_parse_all_supported_actions() -> None:
-    for action in (
-        "paypal-flow1",
-        "paypal-flow2",
-        "paypal-flow2-nocard",
-        "paypal-flow2-filler",
-        "paypal-flow3",
-        "paypal-auto",
-        "paypal-auto-nocard",
-        "paypal-auto-filler",
-        "check-config",
-    ):
+    for action in panel_runner.VALID_ACTIONS:
         args = panel_runner.parse_args([action])
         assert args.action == action
         assert args.count == 1
         assert args.workers == 1
+
+
+def test_parse_register_only_args() -> None:
+    args = panel_runner.parse_args(
+        [
+            "register-only",
+            "--count",
+            "3",
+            "--workers",
+            "2",
+            "--mail-source",
+            "hotmail",
+            "--email",
+            "user@example.com",
+        ]
+    )
+
+    assert args.action == "register-only"
+    assert args.count == 3
+    assert args.workers == 2
+    assert args.mail_source == "hotmail"
+    assert args.email == "user@example.com"
 
 
 def test_result_event_is_json_line() -> None:
@@ -119,3 +137,68 @@ def test_paypal_flow3_treats_nonzero_auth_return_code_as_failure(monkeypatch, ca
     output = capsys.readouterr().out
     assert '"status":"failure"' in output
     assert "flow3 failed code=1" in output
+
+
+def test_register_only_run_action_delegates_to_bridge(monkeypatch, tmp_path, capsys) -> None:
+    cfg = {
+        "mail": {"source": "default"},
+        "mail_sources": {"hotmail": {"source": "hotmail", "accounts_file": "hotmail.txt"}},
+    }
+    captured = {}
+    summary_file = tmp_path / "output" / "register_only" / "registered_sessions.txt"
+
+    def fake_run_register_tool_only(
+        received_cfg,
+        *,
+        count: int,
+        workers: int,
+        mail_source: str,
+        selected_email: str,
+    ):
+        captured.update(
+            {
+                "cfg": received_cfg,
+                "count": count,
+                "workers": workers,
+                "mail_source": mail_source,
+                "selected_email": selected_email,
+            }
+        )
+        return SimpleNamespace(
+            ok=True,
+            returncode=0,
+            success_count=2,
+            target_count=2,
+            summary_file=summary_file,
+        )
+
+    args = panel_runner.parse_args(
+        [
+            "register-only",
+            "--count",
+            "2",
+            "--workers",
+            "3",
+            "--mail-source",
+            "hotmail",
+            "--email",
+            "user@example.com",
+        ]
+    )
+    monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(panel_runner, "run_register_tool_only", fake_run_register_tool_only)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 0
+    assert captured["count"] == 2
+    assert captured["workers"] == 3
+    assert captured["mail_source"] == "hotmail"
+    assert captured["selected_email"] == "user@example.com"
+    assert captured["cfg"]["mail"]["active_source"] == "hotmail"
+    output = capsys.readouterr().out
+    event = json.loads(output)
+    assert event["flow"] == "register-only"
+    assert event["status"] == "success"
+    assert event["account"] == "user@example.com"
+    assert event["path"] == str(summary_file)

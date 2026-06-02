@@ -12,13 +12,23 @@ hiddenimports += collect_submodules("control_panel")
 block_cipher = None
 
 tcl_root = Path(sys.base_prefix) / "tcl"
+tcl_roots = [
+    Path(sys.base_prefix) / "tcl",
+    Path(sys.base_prefix) / "Library" / "lib",
+    Path(sys.prefix) / "tcl",
+    Path(sys.prefix) / "Library" / "lib",
+]
 datas = []
-if (tcl_root / "tcl8.6" / "init.tcl").exists():
-    # PyInstaller 6 + Python 3.13 runtime hook expects _tcl_data under dist/_internal
-    datas.append((str(tcl_root / "tcl8.6"), "_tcl_data"))
-if (tcl_root / "tk8.6" / "tk.tcl").exists():
-    # PyInstaller 6 + Python 3.13 runtime hook expects _tk_data under dist/_internal
-    datas.append((str(tcl_root / "tk8.6"), "_tk_data"))
+for tcl_root in tcl_roots:
+    if (tcl_root / "tcl8.6" / "init.tcl").exists():
+        # PyInstaller 6 + Python 3.13 runtime hook expects _tcl_data under dist/_internal
+        datas.append((str(tcl_root / "tcl8.6"), "_tcl_data"))
+        break
+for tcl_root in tcl_roots:
+    if (tcl_root / "tk8.6" / "tk.tcl").exists():
+        # Conda puts Tcl/Tk data under Library/lib instead of sys.base_prefix/tcl.
+        datas.append((str(tcl_root / "tk8.6"), "_tk_data"))
+        break
 
 
 a = Analysis(

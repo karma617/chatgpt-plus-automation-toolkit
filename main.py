@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import sys
+from pathlib import Path
 
 import authorization_flow
 import fill_billing_test
@@ -33,6 +34,13 @@ from modules.utils import (
 
 
 install_print_theme()
+
+
+def _zh(text: str) -> str:
+    return text.encode("ascii").decode("unicode_escape")
+
+
+LABEL_REGISTER_ONLY_SUCCESS = _zh(r"\u4ec5\u6ce8\u518c\u6210\u529f\uff0c\u5df2\u5199\u5165\u6ce8\u518c\u8f93\u51fa\u6e05\u5355")
 
 
 def _display_width(s: str) -> int:
@@ -325,6 +333,9 @@ async def run_account(
     worker_id: int,
     proxy: str | None = None,
     sms_selection: dict[str, object] | None = None,
+    create_payment_link: bool = True,
+    session_cache_path: str | Path | None = None,
+    session_source: str = "main_flow1",
 ) -> bool | None:
     account = store.claim_next(worker_id)
     if not account:
@@ -378,8 +389,12 @@ async def run_account(
         access_token = str(chatgpt_session.get("accessToken") or "")
         if not access_token:
             raise RuntimeError("无法获取 accessToken，当前页面可能未登录 ChatGPT")
-        log(f"{prefix} accessToken acquired, generating Plus checkout link")
-        payment_link = await create_plus_checkout_link(page, access_token, cfg["chatgpt"])
+        payment_link = ""
+        if create_payment_link:
+            log(f"{prefix} accessToken acquired, generating Plus checkout link")
+            payment_link = await create_plus_checkout_link(page, access_token, cfg["chatgpt"])
+        else:
+            log(f"{prefix} accessToken acquired, skip Plus checkout link")
         cache_record = session_export.extract_session_record(
             chatgpt_session,
             email=account.email,
@@ -388,17 +403,20 @@ async def run_account(
             code_address=account.code_address,
             payment_link=payment_link,
             profile_dir=str(profile_dir),
-            source="main_flow1",
+            source=session_source,
         )
-        cache_path = session_export.upsert_session_cache(cache_record)
-        log(f"{prefix} 已缓存流程四 Session: {cache_path}")
+        cache_path = session_export.upsert_session_cache(cache_record, path=session_cache_path or session_export.CACHE_PATH)
+        log(f"{prefix} 已缓存 Session: {cache_path}")
         await session.__aexit__(None, None, None)
         session = None
-        store.save_success(account.email, account.code_address, payment_link)
+        store.save_success(account.email, account.code_address, payment_link or str(cache_path))
         store.complete(account.email)
-        log(f"{prefix} 成功，已写入 {output_file('flow1_success')}")
+        if create_payment_link:
+            log(f"{prefix} 成功，已写入 {output_file('flow1_success')}")
+        else:
+            log(f"{prefix} {LABEL_REGISTER_ONLY_SUCCESS}")
         print()
-        print(f"{account.email}----{account.code_address}----{payment_link}")
+        print(f"{account.email}----{account.code_address}----{payment_link or cache_path}")
         return True
     except FatalAccountError as exc:
         await save_failure_artifacts(prefix, account.email, session)

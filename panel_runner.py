@@ -24,7 +24,11 @@ for _stream in (sys.stdout, sys.stderr):
 def runtime_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    source_root = Path(__file__).resolve().parent
+    packaged_root = source_root / "ChatGPTAssistantPanel"
+    if not (source_root / "config.yaml").exists() and (packaged_root / "config.yaml").exists():
+        return packaged_root
+    return source_root
 
 
 def install_runtime_project_root() -> None:
@@ -41,10 +45,12 @@ from modules.paypal_filler_bridge import run_paypal_filler_flow2
 from modules.paypal_flow import _run_paypal_authorize
 from modules.paypal_pay import run_paypal_pay
 from modules.paypal_register import run_paypal_register
+from modules.register_tool_bridge import run_register_tool_only
 from modules.utils import load_config
 
 
 VALID_ACTIONS = (
+    "register-only",
     "paypal-flow1",
     "paypal-flow2",
     "paypal-flow2-nocard",
@@ -133,6 +139,7 @@ def resolve_env_path(env_path: str | Path = ".env") -> Path:
 
 def flow_key_for_action(action: str) -> str:
     if action in {
+        "register-only",
         "paypal-flow1",
         "paypal-flow2",
         "paypal-flow2-nocard",
@@ -227,6 +234,29 @@ def run_action(args: argparse.Namespace) -> int:
                 flush=True,
             )
             return 0
+        if flow == "register-only":
+            result = run_register_tool_only(
+                cfg,
+                count=target,
+                workers=workers,
+                mail_source=args.mail_source,
+                selected_email=args.email,
+            )
+            status = "success" if result.ok else "failure"
+            detail = getattr(result, "message", "") or (
+                f"completed success={result.success_count}/{result.target_count} code={result.returncode}"
+            )
+            print(
+                result_event(
+                    flow,
+                    status,
+                    detail,
+                    account=args.email,
+                    path=str(result.summary_file),
+                ),
+                flush=True,
+            )
+            return 0 if result.ok else (result.returncode or 1)
         if flow in {
             "paypal-flow1",
             "paypal-flow2",

@@ -15,12 +15,17 @@ from modules.terminal_theme import GRAY, paint, style_timed_log
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+
+def _u(value: str) -> str:
+    return value.encode("ascii").decode("unicode_escape")
+
+
 OUTPUT_FILES = {
-    "flow1_success": "output/gopay娉ㄥ唽plus/娴佺▼1_娉ㄥ唽鎴愬姛闀块摼鎺?txt",
-    "flow1_failed": "output/gopay娉ㄥ唽plus/娴佺▼1_娉ㄥ唽澶辫触璐﹀彿.txt",
-    "flow1_in_progress": "output/gopay娉ㄥ唽plus/娴佺▼1_娉ㄥ唽澶勭悊涓?txt",
-    "flow2_paid_success": "output/gopay娉ㄥ唽plus/娴佺▼2_鏀粯鎴愬姛寰呮巿鏉?txt",
-    "flow2_nonzero_billing": "output/gopay娉ㄥ唽plus/娴佺▼2_闈?鍏冭处鍗曡烦杩?txt",
+    "flow1_success": _u("output/gopay\\u6ce8\\u518cplus/\\u6d41\\u7a0b1_\\u6ce8\\u518c\\u6210\\u529f\\u957f\\u94fe\\u63a5.txt"),
+    "flow1_failed": _u("output/gopay\\u6ce8\\u518cplus/\\u6d41\\u7a0b1_\\u6ce8\\u518c\\u5931\\u8d25\\u8d26\\u53f7.txt"),
+    "flow1_in_progress": _u("output/gopay\\u6ce8\\u518cplus/\\u6d41\\u7a0b1_\\u6ce8\\u518c\\u5904\\u7406\\u4e2d.txt"),
+    "flow2_paid_success": _u("output/gopay\\u6ce8\\u518cplus/\\u6d41\\u7a0b2_\\u652f\\u4ed8\\u6210\\u529f\\u5f85\\u6388\\u6743.txt"),
+    "flow2_nonzero_billing": _u("output/gopay\\u6ce8\\u518cplus/\\u6d41\\u7a0b2_\\u975e0\\u5143\\u8d26\\u5355\\u8df3\\u8fc7.txt"),
 }
 
 LEGACY_OUTPUT_FILES = {

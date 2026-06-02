@@ -53,7 +53,11 @@ def strip_ansi_for_display(text: str) -> str:
 def app_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    source_root = Path(__file__).resolve().parent
+    packaged_root = source_root / "ChatGPTAssistantPanel"
+    if not (source_root / "config.yaml").exists() and (packaged_root / "config.yaml").exists():
+        return packaged_root
+    return source_root
 
 
 class ResourcePage(ttk.Frame):
@@ -152,7 +156,7 @@ class EnvPage(ttk.Frame):
         scrollbar.pack(side=RIGHT, fill=Y, padx=(0, 10), pady=(0, 10))
 
         for row, key in enumerate(get_known_env_fields()):
-            ttk.Label(self.form, text=key, width=36).grid(row=row, column=0, sticky="w", padx=6, pady=3)
+            ttk.Label(self.form, text=str(key), width=36).grid(row=row, column=0, sticky="w", padx=6, pady=3)
             var = tk.StringVar()
             self.vars[key] = var
             ttk.Entry(self.form, textvariable=var, width=88, show="").grid(row=row, column=1, sticky="ew", padx=6, pady=3)
@@ -161,7 +165,8 @@ class EnvPage(ttk.Frame):
     def refresh(self) -> None:
         values = read_env(self.env_path)
         for key, var in self.vars.items():
-            var.set(values.get(key, ""))
+            env_key = getattr(key, "key", str(key))
+            var.set(values.get(env_key, ""))
 
     def save(self) -> None:
         update_env(self.env_path, {key: var.get() for key, var in self.vars.items()})
@@ -212,6 +217,7 @@ class RunPage(ttk.Frame):
         ttk.Label(input_row, text="指定邮箱").pack(side=LEFT, padx=(10, 2))
         self.email_var = tk.StringVar(value="")
         ttk.Entry(input_row, textvariable=self.email_var, width=36).pack(side=LEFT, padx=4)
+        ttk.Button(button_row_1, text="\u4ec5\u6ce8\u518c\u8d26\u53f7", command=lambda: self.start("register-only")).pack(side=LEFT, padx=4)
         ttk.Button(button_row_1, text="流程1 生成长链接", command=lambda: self.start("paypal-flow1")).pack(side=LEFT, padx=4)
         ttk.Button(button_row_1, text="流程2 真实卡PayPal", command=lambda: self.start("paypal-flow2")).pack(side=LEFT, padx=4)
         ttk.Button(button_row_1, text="流程2 无卡PayPal", command=lambda: self.start("paypal-flow2-nocard")).pack(side=LEFT, padx=4)
@@ -399,6 +405,7 @@ class ControlPanelApp(tk.Tk):
             ("虚拟卡池", ["paypal_cards"]),
             ("手机号池", ["paypal_phones", "auth_phones"]),
             ("邮箱池", ["hotmail_accounts", "hotmail_mail_pool", "icloud_accounts", "icloud_mail_pool", "mail_accounts", "mail_pool"]),
+            ("\u4ec5\u6ce8\u518c\u8f93\u51fa", ["register_only_sessions", "register_only_used"]),
             ("长链接池", ["paypal_links"]),
             ("授权账号/输出", ["paypal_pending_auth", "paypal_authorized_rt", "paypal_authorized_sub"]),
         ]

@@ -36,6 +36,8 @@ def get_panel_files(root: Path | str) -> dict[str, PanelFile]:
         _panel_file(root_path, "icloud_mail_pool", "iCloud 邮箱池", "data/icloud/mail_pool.txt"),
         _panel_file(root_path, "mail_accounts", "通用账号池", "data/accounts.txt"),
         _panel_file(root_path, "mail_pool", "通用邮箱池", "data/mail_pool.txt"),
+        _panel_file(root_path, "register_only_sessions", "\u4ec5\u6ce8\u518c Session \u6e05\u5355", "output/register_only/registered_sessions.txt"),
+        _panel_file(root_path, "register_only_used", "\u4ec5\u6ce8\u518c\u5df2\u7528\u90ae\u7bb1", "output/register_only/used_emails.txt"),
         _panel_file(root_path, "paypal_links", "PayPal 长链接账号", "output/paypal注册/长链接账号/account.txt"),
         _panel_file(root_path, "paypal_pending_auth", "PayPal 待授权账号", "output/paypal注册/待授权账号/account.txt"),
         _panel_file(root_path, "paypal_authorized_rt", "PayPal 授权 RT 输出", "output/paypal注册/授权成功/account-rt.txt"),
