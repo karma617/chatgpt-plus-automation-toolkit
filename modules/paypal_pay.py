@@ -500,6 +500,23 @@ def _display_proxy(proxy: str | None) -> str:
     return text
 
 
+def _is_proxy_failure(reason: str | None) -> bool:
+    text = str(reason or "").lower()
+    markers = (
+        "err_socks_connection_failed",
+        "err_timed_out",
+        "err_tunnel_connection_failed",
+        "err_no_supported_proxies",
+        "err_proxy_connection_failed",
+        "err_proxy_auth_unsupported",
+        "err_proxy_auth_requested",
+        "browser does not support socks5 proxy authentication",
+        "upstream socks5",
+        "proxy",
+    )
+    return any(marker in text for marker in markers)
+
+
 def load_link_pool() -> list[dict[str, str]]:
     if not LINK_POOL_FILE.exists():
         return []
@@ -3375,6 +3392,7 @@ async def pay_one(
     max_phone_retries: int = 3,
     proxy: str | None = None,
     flow2_region_mode: str = "default",
+    last_error: dict[str, str] | None = None,
 ) -> bool:
     """执行一次 PayPal 支付。"""
     email = item["email"]
@@ -3510,6 +3528,8 @@ async def pay_one(
             raise RuntimeError("支付流程未返回成功页面")
 
     except Exception as exc:
+        if last_error is not None:
+            last_error["reason"] = str(exc)
         log(f"{prefix} ❌ 失败: {exc}")
         traceback.print_exc()
         paypal_flow_state.mark_stage_failure(email, stage="flow2", reason=str(exc))
@@ -3611,17 +3631,30 @@ async def run_paypal_pay(
                 if not card:
                     log(f"[paypal-pay-{index:02d}] 卡池已空")
                     return
-            proxy = proxy_pool.pick(index) if proxy_pool else fallback_proxy or None
-            ok = await pay_one(
-                item,
-                card,
-                phone_pool,
-                cfg,
-                worker_id=index,
-                max_phone_retries=max_retries,
-                proxy=proxy,
-                flow2_region_mode=resolved_region_mode,
-            )
+            proxies = proxy_pool.sequence(index) if proxy_pool else [fallback_proxy or None]
+            ok = False
+            for proxy_attempt, proxy in enumerate(proxies, start=1):
+                last_error: dict[str, str] = {}
+                ok = await pay_one(
+                    item,
+                    card,
+                    phone_pool,
+                    cfg,
+                    worker_id=index,
+                    max_phone_retries=max_retries,
+                    proxy=proxy,
+                    flow2_region_mode=resolved_region_mode,
+                    last_error=last_error,
+                )
+                if ok:
+                    break
+                reason = last_error.get("reason", "")
+                if not proxy_pool or proxy_attempt >= len(proxies) or not _is_proxy_failure(reason):
+                    break
+                log(
+                    f"[paypal-pay-{index:02d}][{item['email']}] "
+                    f"代理失败，切换下一条代理 ({proxy_attempt}/{len(proxies)}): {_display_proxy(proxy)}"
+                )
             if ok and not local_random_mode:
                 card_pool.remove(card)
             if ok:

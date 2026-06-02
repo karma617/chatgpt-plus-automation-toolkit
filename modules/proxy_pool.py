@@ -29,5 +29,11 @@ class ProxyPool:
             return None
         return self.proxies[(worker_id - 1) % len(self.proxies)]
 
+    def sequence(self, worker_id: int) -> list[str]:
+        if not self.proxies:
+            return []
+        start = (worker_id - 1) % len(self.proxies)
+        return self.proxies[start:] + self.proxies[:start]
+
     def count(self) -> int:
         return len(self.proxies)

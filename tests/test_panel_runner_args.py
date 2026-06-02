@@ -25,6 +25,7 @@ def test_default_env_resolves_next_to_frozen_exe(monkeypatch, tmp_path) -> None:
 def test_flow_key_for_actions() -> None:
     assert panel_runner.flow_key_for_action("register-only") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-flow1") == "flow1"
+    assert panel_runner.flow_key_for_action("paypal-flow1-jp") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-auto") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-flow2-nocard") == "flow1"
     assert panel_runner.flow_key_for_action("paypal-flow2-jp") == "flow1"
@@ -39,6 +40,14 @@ def test_parse_paypal_flow1_args() -> None:
     args = panel_runner.parse_args(["paypal-flow1", "--count", "2", "--workers", "1"])
 
     assert args.action == "paypal-flow1"
+    assert args.count == 2
+    assert args.workers == 1
+
+
+def test_parse_paypal_flow1_jp_args() -> None:
+    args = panel_runner.parse_args(["paypal-flow1-jp", "--count", "2", "--workers", "1"])
+
+    assert args.action == "paypal-flow1-jp"
     assert args.count == 2
     assert args.workers == 1
 
@@ -174,6 +183,27 @@ def test_paypal_flow1_result_uses_last_run_detail(monkeypatch, tmp_path, capsys)
     assert event["status"] == "success"
     assert event["message"] == "no new registered accounts; reused existing unfinished links=1/4; next=paypal-flow2/paypal-auto"
     assert event["path"] == str(link_file)
+
+
+def test_paypal_flow1_jp_delegates_to_register_with_jp_region(monkeypatch, capsys) -> None:
+    args = panel_runner.parse_args(["paypal-flow1-jp", "--count", "1", "--workers", "1", "--email", "user@example.com"])
+    captured = {}
+
+    async def fake_run_paypal_register(*args, **kwargs):
+        captured.update(kwargs)
+        return 1
+
+    monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fake_run_paypal_register)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 0
+    assert captured["checkout_region"] == "jp"
+    assert captured["selected_email"] == "user@example.com"
+    event = json.loads(capsys.readouterr().out)
+    assert event["flow"] == "paypal-flow1-jp"
+    assert event["status"] == "success"
 
 
 def test_paypal_auto_reuses_existing_link_when_flow1_has_no_new_accounts(monkeypatch, capsys) -> None:

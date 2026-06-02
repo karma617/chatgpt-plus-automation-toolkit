@@ -296,7 +296,60 @@ def _extract_sms_code(data: Any) -> str:
 def _extract_smsbower_country_price(raw: Any, country_id: int, service: str) -> dict[str, Any] | None:
     from modules.hero_sms_provider import extract_country_price
 
-    return extract_country_price(raw, country_id, normalize_service(service))
+    service_code = normalize_service(service)
+    matrix = raw
+    if isinstance(matrix, dict):
+        for key in ("data", "result", "prices", "countries", "response"):
+            nested = matrix.get(key)
+            if isinstance(nested, dict):
+                matrix = nested
+                break
+    if isinstance(matrix, dict):
+        country_node = matrix.get(str(country_id))
+        if isinstance(country_node, dict):
+            service_node = country_node.get(service_code)
+            parsed = _extract_provider_price_summary(service_node)
+            if parsed:
+                return parsed
+            parsed = _extract_provider_price_summary(country_node)
+            if parsed:
+                return parsed
+    return extract_country_price(raw, country_id, service_code)
+
+
+def _extract_provider_price_summary(node: Any) -> dict[str, Any] | None:
+    if not isinstance(node, dict):
+        return None
+    direct_price = parse_number(node.get("cost") or node.get("price") or node.get("activationCost") or node.get("amount") or node.get("rate"))
+    direct_count = parse_integer(node.get("count") or node.get("qty") or node.get("available") or node.get("stock") or node.get("total"))
+    if direct_price is not None or direct_count is not None:
+        return {"price": direct_price, "count": direct_count}
+
+    provider_nodes: list[dict[str, Any]] = []
+    for key, value in node.items():
+        if str(key).isdigit() and isinstance(value, dict):
+            provider_nodes.append(value)
+    if not provider_nodes:
+        for key in ("providers", "providerMap", "providerPrices", "provider"):
+            value = node.get(key)
+            if isinstance(value, dict):
+                provider_nodes.extend(item for item in value.values() if isinstance(item, dict))
+            elif isinstance(value, list):
+                provider_nodes.extend(item for item in value if isinstance(item, dict))
+
+    candidates: list[tuple[float, int | None]] = []
+    for item in provider_nodes:
+        price = parse_number(item.get("price") or item.get("cost") or item.get("activationCost") or item.get("amount") or item.get("rate"))
+        count = parse_integer(item.get("count") or item.get("qty") or item.get("available") or item.get("stock") or item.get("total"))
+        if price is not None:
+            candidates.append((price, count))
+    if not candidates:
+        return None
+
+    min_price = min(price for price, _count in candidates)
+    min_price_count = sum((count or 0) for price, count in candidates if price == min_price)
+    total_count = sum((count or 0) for _price, count in candidates)
+    return {"price": min_price, "count": min_price_count or total_count or None}
 
 
 def _extract_price_rows(data: Any, service: str) -> list[dict[str, Any]]:
@@ -311,7 +364,18 @@ def _extract_price_rows(data: Any, service: str) -> list[dict[str, Any]]:
             row.setdefault("country", key)
             service_node = value.get(normalize_service(service))
             if isinstance(service_node, dict):
-                row.update(service_node)
+                providers = {
+                    str(provider_id): payload
+                    for provider_id, payload in service_node.items()
+                    if str(provider_id).isdigit() and isinstance(payload, dict)
+                }
+                if providers:
+                    row["providers"] = providers
+                    summary = _extract_provider_price_summary(service_node)
+                    if summary:
+                        row.update(summary)
+                else:
+                    row.update(service_node)
             rows.append(row)
     for key in ("data", "result", "prices", "countries"):
         nested = data.get(key)

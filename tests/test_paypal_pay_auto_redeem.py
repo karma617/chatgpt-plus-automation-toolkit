@@ -298,3 +298,61 @@ def test_run_paypal_pay_jp_uses_jp_proxy_file(monkeypatch, tmp_path: Path) -> No
 
     assert result == 0
     assert captured["proxy"] == "http://jp-proxy.example.test:8080"
+
+
+def test_run_paypal_pay_rotates_proxy_on_proxy_failure(monkeypatch, tmp_path: Path) -> None:
+    phones_file = tmp_path / "phones.txt"
+    links_file = tmp_path / "links.txt"
+    proxy_file = tmp_path / "jp.txt"
+    phones_file.write_text("15555550123|https://sms.example.test/get\n", encoding="utf-8")
+    links_file.write_text("user5@example.com----query-code----https://pay.example.test/session\n", encoding="utf-8")
+    proxy_file.write_text(
+        "\n".join(
+            [
+                "http://bad-proxy.example.test:1080",
+                "http://good-proxy.example.test:1080",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                f"PAYPAL_PHONES_FILE={phones_file}",
+                "PAYPAL_USE_PROXY=true",
+                f"PAYPAL_PROXY_FILE_JP={proxy_file}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    attempts = []
+
+    async def fake_pay_one(*args, **kwargs):
+        proxy = kwargs.get("proxy")
+        attempts.append(proxy)
+        if "bad-proxy" in proxy:
+            kwargs["last_error"]["reason"] = "Page.goto: net::ERR_SOCKS_CONNECTION_FAILED"
+            return False
+        return True
+
+    monkeypatch.setattr(utils, "PROJECT_ROOT", tmp_path)
+    _use_paypal_files(monkeypatch, tmp_path, links_file)
+    monkeypatch.setattr(paypal_pay, "pay_one", fake_pay_one)
+
+    result = asyncio.run(
+        paypal_pay.run_paypal_pay(
+            {},
+            count=1,
+            workers=1,
+            card_source_mode="local_random",
+            flow2_region_mode="jp",
+        )
+    )
+
+    assert result == 1
+    assert attempts == [
+        "http://bad-proxy.example.test:1080",
+        "http://good-proxy.example.test:1080",
+    ]

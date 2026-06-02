@@ -5,6 +5,25 @@ from typing import Any
 from playwright.async_api import Page
 
 
+CHECKOUT_REGION_BILLING: dict[str, tuple[str, str]] = {
+    "us": ("US", "USD"),
+    # JP PayPal is created as a US checkout link, then paid under JP IP/address in flow2.
+    "jp": ("US", "USD"),
+}
+
+
+def normalize_checkout_region(value: str | None) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"jp", "japan", "jpn"}:
+        return "jp"
+    return "us"
+
+
+def checkout_billing_for_region(value: str | None) -> dict[str, str]:
+    country, currency = CHECKOUT_REGION_BILLING[normalize_checkout_region(value)]
+    return {"country": country, "currency": currency}
+
+
 async def get_chatgpt_session(page: Page) -> dict[str, Any]:
     data = await page.evaluate(
         """async () => {
@@ -25,13 +44,23 @@ async def get_access_token(page: Page) -> str:
     return str(token)
 
 
-async def create_plus_checkout_link(page: Page, access_token: str, cfg: dict[str, Any]) -> str:
-    payload = {
-        "plan_name": cfg["plan_name"],
-        "billing_details": {
+async def create_plus_checkout_link(
+    page: Page,
+    access_token: str,
+    cfg: dict[str, Any],
+    *,
+    checkout_region: str | None = None,
+) -> str:
+    if checkout_region is not None:
+        billing_details = checkout_billing_for_region(checkout_region)
+    else:
+        billing_details = {
             "country": cfg["billing_country"],
             "currency": cfg["currency"],
-        },
+        }
+    payload = {
+        "plan_name": cfg["plan_name"],
+        "billing_details": billing_details,
         "cancel_url": cfg["cancel_url"],
         "promo_campaign": {
             "promo_campaign_id": cfg["promo_campaign_id"],

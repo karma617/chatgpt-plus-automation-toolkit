@@ -74,8 +74,13 @@ if (-not $ExistingDistRoot -and $ExistingDistCandidates.Count -gt 0) {
     $ExistingDistRoot = $ExistingDistCandidates[0]
 }
 
-$DistOutputRoot = Join-Path $ProjectRoot "dist"
+$FinalDistOutputRoot = Join-Path $ProjectRoot "dist"
+$FinalDistRoot = Join-Path $FinalDistOutputRoot "ChatGPTAssistantPanel"
+$DistOutputRoot = Join-Path $ProjectRoot "build\dist_staging"
 $DistRoot = Join-Path $DistOutputRoot "ChatGPTAssistantPanel"
+if (Test-Path $DistOutputRoot) {
+    Remove-Item -LiteralPath $DistOutputRoot -Recurse -Force -ErrorAction Stop
+}
 $RuntimeStateDirs = @("data", "output")
 $RuntimeStateFiles = @(".env", "config.yaml")
 $RuntimeBackupRoot = Join-Path $ProjectRoot "build\_dist_runtime_backup"
@@ -200,4 +205,36 @@ foreach ($name in @("profiles", "logs")) {
     }
 }
 
-Write-Host "[build] Done: $DistRoot"
+if (-not (Test-Path $FinalDistOutputRoot)) {
+    New-Item -ItemType Directory -Path $FinalDistOutputRoot -Force | Out-Null
+}
+
+$publishReady = $true
+if (Test-Path $FinalDistRoot) {
+    $previousRoot = Join-Path $ProjectRoot ("dist_build_previous_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    New-Item -ItemType Directory -Path $previousRoot -Force | Out-Null
+    try {
+        Move-Item -LiteralPath $FinalDistRoot -Destination (Join-Path $previousRoot "ChatGPTAssistantPanel") -Force -ErrorAction Stop
+        Write-Host "[build] Move previous dist to $previousRoot"
+    } catch {
+        $publishReady = $false
+        Write-Warning "Final dist is locked and cannot be replaced: $FinalDistRoot"
+        Write-Warning "Staged build is preserved at: $DistRoot"
+    }
+}
+
+if ($publishReady) {
+    Move-Item -LiteralPath $DistRoot -Destination $FinalDistRoot -Force -ErrorAction Stop
+    Write-Host "[build] Done: $FinalDistRoot"
+} else {
+    try {
+        New-Item -ItemType Directory -Path $FinalDistRoot -Force | Out-Null
+        Get-ChildItem -LiteralPath $DistRoot -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $FinalDistRoot -Recurse -Force -ErrorAction Stop
+        }
+        Write-Warning "Copied staged build into locked final dist without deleting stale files."
+        Write-Host "[build] Done: $FinalDistRoot"
+    } catch {
+        throw "Final dist is locked. Close the panel/browser processes, then move staged build manually from: $DistRoot"
+    }
+}

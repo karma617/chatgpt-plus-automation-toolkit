@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 
 from .browser import BrowserSession
-from .checkout import create_plus_checkout_link, get_chatgpt_session
+from .checkout import checkout_billing_for_region, create_plus_checkout_link, get_chatgpt_session, normalize_checkout_region
 from .free_browser_flow import FreeBrowserFlow
 from .free_register import FreeProfile, FreeRegisterError, generate_free_profile, random_birth_date
 from .mail_provider import MailProvider
@@ -342,6 +342,7 @@ async def register_one(
     create_payment_link: bool = True,
     session_cache_path: str | Path | None = None,
     session_source: str = "paypal_flow1",
+    checkout_region: str = "us",
 ) -> str | None:
     email = account.email
     prefix = f"[paypal-reg-{worker_id:02d}][{email}]"
@@ -492,10 +493,11 @@ async def register_one(
 
         payment_link = ""
         if create_payment_link:
-            env = load_env(".env")
-            billing_country = env.get("PAYPAL_BILLING_COUNTRY") or "US"
-            chatgpt_cfg = {**cfg["chatgpt"], "billing_country": billing_country, "currency": "USD"}
-            payment_link = await create_plus_checkout_link(page, access_token, chatgpt_cfg)
+            region = normalize_checkout_region(checkout_region)
+            billing = checkout_billing_for_region(region)
+            chatgpt_cfg = {**cfg["chatgpt"], "billing_country": billing["country"], "currency": billing["currency"]}
+            log(f"{prefix} create Plus checkout link: mode={region.upper()} billing={billing['country']}/{billing['currency']}")
+            payment_link = await create_plus_checkout_link(page, access_token, chatgpt_cfg, checkout_region=region)
         source_format = "hotmail" if account.client_id and account.refresh_token else ("icloud_query" if email.lower().endswith("@icloud.com") else "code_address")
         code_address = (account.code_address or account.mail_url or "").strip()
         session_record = session_export.extract_session_record(
@@ -543,10 +545,13 @@ async def run_paypal_register(
     count: int = 1,
     workers: int = 1,
     selected_email: str | None = None,
+    checkout_region: str = "us",
 ) -> int:
     """Batch run flow-1 (register + payment link)."""
     reset_last_run_detail()
     env = load_env(".env")
+    region = normalize_checkout_region(checkout_region)
+    region_label = "JP-PAY-US-LINK" if region == "jp" else "US"
     active_source = _active_mail_source(cfg)
     mail_cfg = cfg.get("mail", {})
     accounts_file = resolve_path(str(mail_cfg.get("accounts_file") or ""))
@@ -637,7 +642,10 @@ async def run_paypal_register(
             log(f"PayPal flow1: proxy disabled, using local proxy: {fallback_proxy}")
 
     target = min(count, len(pending_accounts))
-    log(f"PayPal flow1: source={active_source}, pending={len(pending_accounts)}, target={target}, workers={workers}")
+    log(
+        f"PayPal flow1: checkout_region={region_label}, source={active_source}, "
+        f"pending={len(pending_accounts)}, target={target}, workers={workers}"
+    )
 
     success = 0
     sem = asyncio.Semaphore(workers)
@@ -649,7 +657,14 @@ async def run_paypal_register(
             if proxy:
                 log(f"[paypal-reg-{index:02d}] using proxy: {proxy}")
             account_mail_source = _mail_source_for_registered_account(account, active_source)
-            link = await register_one(account, account_mail_source, cfg, worker_id=index, proxy=proxy)
+            link = await register_one(
+                account,
+                account_mail_source,
+                cfg,
+                worker_id=index,
+                proxy=proxy,
+                checkout_region=region,
+            )
             if link:
                 code_address = account.code_address or "mail"
                 save_to_link_pool(account.email, code_address, link, account_line=account.raw)

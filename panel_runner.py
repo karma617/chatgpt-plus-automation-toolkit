@@ -53,6 +53,7 @@ from modules.utils import load_config
 VALID_ACTIONS = (
     "register-only",
     "paypal-flow1",
+    "paypal-flow1-jp",
     "paypal-flow2",
     "paypal-flow2-nocard",
     "paypal-flow2-jp",
@@ -170,6 +171,7 @@ def flow_key_for_action(action: str) -> str:
     if action in {
         "register-only",
         "paypal-flow1",
+        "paypal-flow1-jp",
         "paypal-flow2",
         "paypal-flow2-nocard",
         "paypal-flow2-jp",
@@ -201,6 +203,15 @@ async def _run_async_action(args: argparse.Namespace, cfg: dict) -> int:
             count=args.count,
             workers=args.workers,
             selected_email=args.email,
+            checkout_region="us",
+        )
+    if args.action == "paypal-flow1-jp":
+        return await run_paypal_register(
+            cfg,
+            count=args.count,
+            workers=args.workers,
+            selected_email=args.email,
+            checkout_region="jp",
         )
     if args.action == "paypal-flow2":
         return await run_paypal_pay(cfg, count=args.count, workers=args.workers, card_source_mode="real", selected_email=args.email)
@@ -290,12 +301,13 @@ def run_action(args: argparse.Namespace) -> int:
             return 0 if result.ok else (result.returncode or 1)
         if flow in {
             "paypal-flow1",
+            "paypal-flow1-jp",
             "paypal-flow2",
             "paypal-flow2-nocard",
             "paypal-flow2-jp",
             "paypal-flow2-jp-nocard",
         }:
-            if flow == "paypal-flow1":
+            if flow in {"paypal-flow1", "paypal-flow1-jp"}:
                 reset_last_run_detail()
             success = asyncio.run(run_with_playwright_noise_filter(_run_async_action(args, cfg)))
         elif flow == "paypal-flow2-filler":
@@ -383,7 +395,7 @@ def run_action(args: argparse.Namespace) -> int:
     message = f"completed success={success}/{target}"
     account = ""
     path = ""
-    if flow == "paypal-flow1":
+    if flow in {"paypal-flow1", "paypal-flow1-jp"}:
         detail = get_last_run_detail()
         message = detail.get("message") or message
         account = detail.get("account") or ""

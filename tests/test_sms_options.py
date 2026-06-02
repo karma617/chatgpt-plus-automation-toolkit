@@ -82,6 +82,25 @@ def test_herosms_service_dropdown_uses_provider_services(monkeypatch) -> None:
     assert [item.display() for item in options] == ["dr - OpenAI", "tg - Telegram"]
 
 
+def test_smsbower_country_dropdown_parses_provider_price_map(monkeypatch) -> None:
+    class FakeSmsBowerProvider:
+        def __init__(self, api_key: str, **_kwargs) -> None:
+            self.api_key = api_key
+
+        def get_countries(self) -> list[dict]:
+            return [{"id": "12", "eng": "United States", "prefix": "1"}]
+
+        def list_country_prices(self, service: str, countries: list[PhoneCountry]) -> list[PhoneCountry]:
+            assert service == "dr"
+            return [PhoneCountry("US", "1", "United States", 12, price=0.02, count=320)]
+
+    monkeypatch.setattr(sms_options, "SmsBowerProvider", FakeSmsBowerProvider)
+
+    options = dynamic_env_options("SMSBOWER_COUNTRY_SELECT", {"SMSBOWER_API_KEY": "sms-key", "SMSBOWER_SERVICE": "dr"})
+
+    assert [item.display() for item in options] == ["12 - \u7f8e\u56fd / +1 / US / $0.02 / \u5e93\u5b58 320"]
+
+
 def test_sub2api_groups_use_x_api_key_and_keep_openai_groups(monkeypatch) -> None:
     calls: list[dict] = []
 
