@@ -28,7 +28,11 @@ from modules.fivesim_sms_provider import (
     FIVESIM_ISO_TO_COUNTRY,
     configured_fivesim_countries,
 )
+from modules.smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
+from modules.smsbower_provider import SmsBowerProvider, smsbower_country_catalog
+from modules.sms_country_filter import filter_allowed_sms_countries
 from modules.paypal_phone_pool import PhoneInfo, PhonePool
+from modules.auth_upload import auth_upload_enabled, parse_upload_targets
 from modules.terminal_theme import install_print_theme
 from modules.utils import LEGACY_OUTPUT_FILES, log, migrate_output_file, output_file, resolve_path
 
@@ -69,7 +73,7 @@ def read_paid_accounts(path: str | Path = output_file("flow2_paid_success")) -> 
                     "password": password,
                     "client_id": client_id,
                     "refresh_token": refresh_token,
-                    "source_format": "hotmail_graph",
+                    "source_format": "hotmail",
                 }
             )
             continue
@@ -174,6 +178,27 @@ def remove_accounts_from_paid_file(path: str | Path, accounts: set[str]) -> int:
     if removed:
         write_paid_accounts(path, remaining)
     return removed
+
+
+def mark_paypal_flow_state_if_applicable(
+    paid_file: str | Path,
+    *,
+    completed: set[str] | None = None,
+    discarded: set[str] | None = None,
+    reason: str = "",
+) -> None:
+    try:
+        from modules.paypal_pay import PENDING_AUTH_FILE
+        from modules import paypal_flow_state
+
+        if resolve_path(paid_file).resolve() != PENDING_AUTH_FILE.resolve():
+            return
+        if completed:
+            paypal_flow_state.mark_completed_many(completed)
+        if discarded:
+            paypal_flow_state.mark_discarded_many(discarded, reason=reason)
+    except Exception:
+        return
 
 
 def accounts_by_error_type(db_path: Path, error_type: str) -> set[str]:
@@ -283,15 +308,24 @@ def env_float(value: str | None, default: float) -> float:
 
 
 def server_upload_enabled(env: dict[str, str]) -> bool:
-    return (env.get("AUTH_SERVER_UPLOAD") or "").strip().lower() in {"1", "true", "yes", "on"}
+    return auth_upload_enabled(env)
 
 
 def auth_server_env_status() -> tuple[bool, bool, bool]:
     env = read_env_keys(AUTH_ROOT / ".env")
+    targets = parse_upload_targets(env)
+    cpa_ready = True
+    sub2api_ready = True
+    if "cpa" in targets:
+        cpa_ready = bool((env.get("CPA_SERVER_URL") or env.get("AUTH_SERVER_URL") or "").strip()) and bool(
+            (env.get("CPA_SERVER_API_KEY") or env.get("AUTH_SERVER_API_KEY") or "").strip()
+        )
+    if "sub2api" in targets:
+        sub2api_ready = bool((env.get("SUB2API_SERVER_URL") or "").strip()) and bool((env.get("SUB2API_API_KEY") or "").strip())
     return (
         server_upload_enabled(env),
-        bool((env.get("AUTH_SERVER_URL") or "").strip()),
-        bool((env.get("AUTH_SERVER_API_KEY") or "").strip()),
+        cpa_ready and sub2api_ready,
+        bool(targets),
     )
 
 
@@ -470,11 +504,28 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
         provider_name = "grizzly"
     elif provider_name in {"5sim", "fivesim", "5sims", "five_sim"}:
         provider_name = "fivesim"
+    elif provider_name in {"smsbower", "sms_bower", "sms-bower"}:
+        provider_name = "smsbower"
     else:
         print(f"[SMS] SMS_PROVIDER={provider_name} 暂不支持，{flow_label}保持原手机号失败处理。")
         return None
 
-    if provider_name == "grizzly":
+    if provider_name == "smsbower":
+        api_key = (getattr(args, "smsbower_api_key", "") or env.get("SMSBOWER_API_KEY") or env.get("SMS_API_KEY") or "").strip()
+        api_key_name = "SMSBOWER_API_KEY"
+        provider_label = "SMSBower"
+        base_url = SMSBOWER_DEFAULT_ENDPOINT
+        provider = SmsBowerProvider(api_key, base_url=base_url) if api_key else None
+        raw_service = (getattr(args, "smsbower_service", "") or env.get("SMSBOWER_SERVICE") or "auto").strip() or "auto"
+        service = provider.resolve_openai_service(raw_service) if provider else "dr"
+        top_n = env_int(str(getattr(args, "smsbower_country_top_n", "") or env.get("SMSBOWER_COUNTRY_TOP_N") or ""), 10)
+        threshold = env_int(str(getattr(args, "smsbower_provider_threshold", "") or env.get("SMSBOWER_PROVIDER_THRESHOLD") or ""), 20)
+        prompt_operator = env_bool(env.get("SMSBOWER_PROMPT_PROVIDER_SELECTION"), default=True)
+        forced_country = (getattr(args, "country", "") or env.get("SMSBOWER_COUNTRY_SELECT") or "").strip()
+        prompt_country = env_bool(env.get("SMSBOWER_PROMPT_COUNTRY_SELECTION"), default=True)
+        poll_interval = env_float(env.get("SMSBOWER_POLL_INTERVAL"), 5.0)
+        max_attempts = env_int(env.get("SMSBOWER_MAX_ATTEMPTS"), 60)
+    elif provider_name == "grizzly":
         api_key = (getattr(args, "grizzly_api_key", "") or env.get("GRIZZLY_API_KEY") or env.get("SMS_API_KEY") or "").strip()
         api_key_name = "GRIZZLY_API_KEY"
         provider_label = "GrizzlySMS"
@@ -528,7 +579,12 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
     if provider is None:
         return None
 
-    catalog = configured_fivesim_countries() if provider_name == "fivesim" else configured_country_catalog()
+    if provider_name == "fivesim":
+        catalog = configured_fivesim_countries()
+    elif provider_name == "smsbower":
+        catalog = smsbower_country_catalog(provider)
+    else:
+        catalog = configured_country_catalog()
     try:
         if provider_name == "fivesim":
             priced = provider.list_country_prices(service, catalog)
@@ -545,6 +601,9 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
             known_rows = [row for row in priced if row.iso_code and row.dial_code]
             if known_rows:
                 priced = known_rows + [row for row in priced if not (row.iso_code and row.dial_code)]
+        priced = filter_allowed_sms_countries(priced)
+        if not priced:
+            raise RuntimeError("接码平台没有返回白名单国家的可用报价")
 
         top_rows = priced[: max(1, top_n)]
         print_country_price_table(top_rows, title=f"[SMS] {provider_label} 最便宜国家 Top 列表", country_id_label=f"{provider_label} ID")
@@ -568,6 +627,7 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
             "provider": provider_name,
             "provider_label": provider_label,
             "api_key": api_key,
+            "base_url": base_url if provider_name == "smsbower" else "",
             "service": service,
             "country": selected_country,
             "operator": selected_operator,
@@ -642,6 +702,8 @@ def build_auth_command(
                     provider_name,
                     "--sms-api-key",
                     str(sms_selection.get("api_key") or ""),
+                    "--sms-api-url",
+                    str(sms_selection.get("base_url") or ""),
                     "--sms-service",
                     str(sms_selection.get("service") or "dr"),
                     "--sms-country",
@@ -805,6 +867,7 @@ def interactive_authorize(args: argparse.Namespace | None = None) -> int:
     already_authorized = authorized_accounts(output_root)
     removed_existing = remove_accounts_from_paid_file(paid_file, already_authorized)
     if removed_existing:
+        mark_paypal_flow_state_if_applicable(paid_file, completed=already_authorized)
         log(f"已从待授权账号池移除历史已授权账号: {removed_existing} 个")
         records = read_paid_accounts(paid_file)
 
@@ -893,6 +956,7 @@ def interactive_authorize(args: argparse.Namespace | None = None) -> int:
     success_accounts = {account.lower() for ok, account in results if ok}
     removed_after_success = remove_accounts_from_paid_file(paid_file, success_accounts)
     if removed_after_success:
+        mark_paypal_flow_state_if_applicable(paid_file, completed=success_accounts)
         log(f"已从待授权账号池移除本次授权成功账号: {removed_after_success} 个")
 
     phone_required_accounts = accounts_by_error_type(output_root / "auth_tasks.db", "phone_required")
@@ -903,6 +967,11 @@ def interactive_authorize(args: argparse.Namespace | None = None) -> int:
         {selected_by_email[email]["account"].lower() for email in phone_required_accounts if email in selected_by_email},
     )
     if removed_phone_required:
+        mark_paypal_flow_state_if_applicable(
+            paid_file,
+            discarded={selected_by_email[email]["account"].lower() for email in phone_required_accounts if email in selected_by_email},
+            reason="auth_phone_required",
+        )
         discarded_path = append_discarded_accounts(phone_required_selected, "授权阶段出现手机号必填页", output_root)
         log(f"已从待授权账号池移除手机号必填弃置账号: {removed_phone_required} 个；记录: {discarded_path}")
 
@@ -913,6 +982,11 @@ def interactive_authorize(args: argparse.Namespace | None = None) -> int:
         {selected_by_email[email]["account"].lower() for email in no_valid_org_accounts if email in selected_by_email},
     )
     if removed_no_valid_org:
+        mark_paypal_flow_state_if_applicable(
+            paid_file,
+            discarded={selected_by_email[email]["account"].lower() for email in no_valid_org_accounts if email in selected_by_email},
+            reason="auth_no_valid_organizations",
+        )
         discarded_path = append_discarded_accounts(no_valid_org_selected, "授权阶段 no_valid_organizations 当前页重试2次仍失败", output_root)
         log(f"已从待授权账号池移除 no_valid_organizations 弃置账号: {removed_no_valid_org} 个；记录: {discarded_path}")
 
@@ -934,6 +1008,11 @@ def interactive_authorize(args: argparse.Namespace | None = None) -> int:
         {selected_by_email[email]["account"].lower() for email in invalid_state_accounts if email in selected_by_email},
     )
     if removed_invalid_state:
+        mark_paypal_flow_state_if_applicable(
+            paid_file,
+            discarded={selected_by_email[email]["account"].lower() for email in invalid_state_accounts if email in selected_by_email},
+            reason="auth_invalid_state_repeated",
+        )
         discarded_path = append_discarded_accounts(invalid_state_selected, "授权阶段验证状态异常 invalid_state 累计2次", output_root)
         log(f"已从待授权账号池移除 invalid_state 弃置账号: {removed_invalid_state} 个；记录: {discarded_path}")
 

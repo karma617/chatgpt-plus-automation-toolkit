@@ -34,7 +34,7 @@ HOTMAIL_FALLBACK_INTERVAL_SEC = 60
 HOTMAIL_IMAP_ATTEMPT_TIMEOUT_SEC = 15
 HOTMAIL_GRAPH_ATTEMPT_TIMEOUT_SEC = 12
 HOTMAIL_FALLBACK_MISS_THRESHOLD = 3
-HOTMAIL_APPLE_FIRST_HARD_MODE = True
+HOTMAIL_APPLE_FIRST_HARD_MODE = False
 
 
 @dataclass
@@ -50,11 +50,24 @@ _HOTMAIL_FALLBACK_LAST_RUN: dict[str, datetime] = {}
 _HOTMAIL_APPLEEMAIL_MISS_COUNT: dict[str, int] = {}
 _EXTERNAL_IMAP163_FETCHERS: dict[str, Any] = {}
 _EXTERNAL_IMAP163_FAILED_PATHS: set[str] = set()
+HOTMAIL_SOURCES = {"hotmail"}
 
 EXTERNAL_MAIL_FETCH_MODE_ENV = "MAIL_FETCH_SOURCE"
 EXTERNAL_MAIL_FETCH_MODE_IMAP163 = {"desktop_imap163", "external_imap163", "imap163"}
 EXTERNAL_IMAP163_DIR_ENV = "EXTERNAL_IMAP163_DIR"
 DEFAULT_EXTERNAL_IMAP163_DIR = ""
+
+
+def _truthy_env_value(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def hotmail_appleemail_api_enabled() -> bool:
+    env = load_env(".env")
+    provider = (env.get("HOTMAIL_CODE_PROVIDER") or env.get("HOTMAIL_FETCH_PROVIDER") or "").strip().lower()
+    if provider in {"appleemail", "apple_email", "apple", "api"}:
+        return True
+    return _truthy_env_value(env.get("HOTMAIL_USE_APPLEEMAIL_API") or env.get("APPLEEMAIL_ENABLED"))
 
 
 def is_appleemail_nonrecoverable_error(message: str) -> bool:
@@ -101,7 +114,7 @@ class MailProvider:
             try:
                 code = await self.fetch_code(account, since, exclude)
                 if code:
-                    if self.source == "hotmail_graph":
+                    if self.source in HOTMAIL_SOURCES:
                         self.log(f"已从 Hotmail 新邮件提取验证码: {code}")
                     else:
                         self.log(f"已从邮箱来源 {self.source} 提取验证码: {code}")
@@ -121,8 +134,8 @@ class MailProvider:
             raise RuntimeError("domain163 账号行需要包含 imap163 接码标识，例如：邮箱----imap163")
         if self.source == "icloud_query":
             return await fetch_icloud_query_code(account, since, exclude or set())
-        if self.source != "hotmail_graph":
-            raise RuntimeError(f"当前邮箱来源仅支持 moemail / hotmail_graph / icloud_query / domain163，实际配置: {self.source}")
+        if self.source not in HOTMAIL_SOURCES:
+            raise RuntimeError(f"当前邮箱来源仅支持 moemail / hotmail / icloud_query / domain163，实际配置: {self.source}")
         return await fetch_hotmail_graph_code(account, since, exclude or set())
 
 
@@ -343,7 +356,7 @@ def parse_icloud_time(item: dict[str, Any]) -> datetime | None:
 async def fetch_hotmail_graph_code(account: MailAccount, since: datetime, exclude: set[str]) -> str | None:
     if not account.client_id or not account.refresh_token:
         raise RuntimeError("Hotmail Graph 需要 email----password----client_id----refresh_token 格式")
-    if account.email.lower() not in _APPLEEMAIL_UNAVAILABLE:
+    if hotmail_appleemail_api_enabled() and account.email.lower() not in _APPLEEMAIL_UNAVAILABLE:
         try:
             code = await fetch_appleemail_code(account, since, exclude)
             if code:

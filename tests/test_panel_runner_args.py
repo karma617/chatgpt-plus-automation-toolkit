@@ -58,6 +58,15 @@ def test_parse_mail_source_and_selected_email_args() -> None:
     assert args.email == "User@Hotmail.com"
 
 
+def test_mail_source_choices_do_not_expose_hotmail_graph() -> None:
+    try:
+        panel_runner.parse_args(["paypal-flow1", "--mail-source", "hotmail_graph"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("hotmail_graph should not be accepted as a panel mail source")
+
+
 def test_parse_all_supported_actions() -> None:
     for action in panel_runner.VALID_ACTIONS:
         args = panel_runner.parse_args([action])
@@ -137,6 +146,65 @@ def test_paypal_flow3_treats_nonzero_auth_return_code_as_failure(monkeypatch, ca
     output = capsys.readouterr().out
     assert '"status":"failure"' in output
     assert "flow3 failed code=1" in output
+
+
+def test_paypal_flow1_result_uses_last_run_detail(monkeypatch, tmp_path, capsys) -> None:
+    args = panel_runner.parse_args(["paypal-flow1", "--count", "1", "--workers", "1"])
+    link_file = tmp_path / "account.txt"
+    link_file.write_text("user@example.com----pw----client----rt----https://pay.example\n", encoding="utf-8")
+
+    async def fake_run_paypal_register(*_args, **_kwargs):
+        panel_runner.get_last_run_detail()
+        import modules.paypal_register as paypal_register
+
+        paypal_register._set_last_run_detail(
+            "no new registered accounts; reused existing unfinished links=1/4; next=paypal-flow2/paypal-auto",
+            path=str(link_file),
+        )
+        return 1
+
+    monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fake_run_paypal_register)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 0
+    event = json.loads(capsys.readouterr().out)
+    assert event["flow"] == "paypal-flow1"
+    assert event["status"] == "success"
+    assert event["message"] == "no new registered accounts; reused existing unfinished links=1/4; next=paypal-flow2/paypal-auto"
+    assert event["path"] == str(link_file)
+
+
+def test_paypal_auto_reuses_existing_link_when_flow1_has_no_new_accounts(monkeypatch, capsys) -> None:
+    args = panel_runner.parse_args(["paypal-auto-nocard", "--count", "1", "--workers", "1"])
+    captured = {}
+    pending_calls = {"count": 0}
+
+    async def fake_register(*args, **kwargs):
+        return 0
+
+    async def fake_pay(*args, **kwargs):
+        captured.update(kwargs)
+        return 1
+
+    def fake_pending_count(*args, **kwargs):
+        pending_calls["count"] += 1
+        return 1 if pending_calls["count"] >= 2 else 0
+
+    monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fake_register)
+    monkeypatch.setattr(panel_runner, "run_paypal_pay", fake_pay)
+    monkeypatch.setattr(panel_runner, "_run_paypal_authorize", lambda **kwargs: 0)
+    monkeypatch.setattr(panel_runner, "_count_payment_links", lambda selected_email="": 1)
+    monkeypatch.setattr(panel_runner, "_count_pending_auth", fake_pending_count)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 0
+    assert captured["card_source_mode"] == "local_random"
+    assert captured["count"] == 1
+    assert '"status":"success"' in capsys.readouterr().out
 
 
 def test_register_only_run_action_delegates_to_bridge(monkeypatch, tmp_path, capsys) -> None:

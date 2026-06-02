@@ -50,6 +50,7 @@ def test_run_register_only_many_uses_register_only_outputs_and_disables_payment_
     monkeypatch.setattr(bridge, "REGISTER_ONLY_USED_FILE", used_file)
     monkeypatch.setattr(bridge, "REGISTER_ONLY_IN_PROGRESS_FILE", in_progress_file)
     monkeypatch.setattr(bridge, "REGISTER_ONLY_FAILED_FILE", failed_file)
+    monkeypatch.setattr(bridge, "register_only_mode", lambda: "email")
     monkeypatch.setattr(main, "create_store", fake_create_store)
     monkeypatch.setattr(main, "ensure_register_accounts", fake_ensure_register_accounts)
     monkeypatch.setattr(main, "create_proxy_pool", lambda cfg: FakeProxyPool())
@@ -82,7 +83,7 @@ def test_run_register_only_many_uses_register_only_outputs_and_disables_payment_
     assert captured["run_store"] is created_store
     assert captured["worker_id"] == 1
     assert captured["kwargs"]["proxy"] == "http://proxy-1"
-    assert captured["kwargs"]["sms_selection"] is sms_selection
+    assert captured["kwargs"]["sms_selection"] is None
     assert captured["kwargs"]["create_payment_link"] is False
     assert captured["kwargs"]["session_cache_path"] == session_cache
     assert captured["kwargs"]["session_source"] == "register_only_gui"
@@ -90,3 +91,61 @@ def test_run_register_only_many_uses_register_only_outputs_and_disables_payment_
     assert in_progress_file.exists()
     assert failed_file.exists()
     assert used_file.read_text(encoding="utf-8") == "user@example.com\n"
+
+
+def test_register_only_mode_defaults_to_email() -> None:
+    assert bridge.register_only_mode({}) == "email"
+    assert bridge.register_only_mode({"REGISTER_ONLY_MODE": "phone"}) == "phone"
+    assert bridge.register_only_mode({"REGISTER_ONLY_MODE": "手机号注册"}) == "phone"
+    assert bridge.register_only_mode({"REGISTER_ONLY_MODE": "bad-value"}) == "email"
+
+
+def test_run_register_only_many_uses_sms_only_in_phone_mode(monkeypatch, tmp_path) -> None:
+    output_dir = tmp_path / "output" / "register_only"
+    session_dir = output_dir / "sessiond"
+    session_cache = session_dir / "session_cache.jsonl"
+    summary_file = output_dir / "registered_sessions.txt"
+    used_file = output_dir / "used_emails.txt"
+    in_progress_file = output_dir / "in_progress.txt"
+    failed_file = output_dir / "failed_accounts.txt"
+    sms_selection = {"provider_label": "fake-sms"}
+    created_store = SimpleNamespace(name="store")
+    captured = {}
+
+    async def fake_ensure_register_accounts(cfg, store, desired_count: int) -> int:
+        return desired_count
+
+    async def fake_run_account(cfg, store, worker_id: int, **kwargs):
+        captured["kwargs"] = kwargs
+        summary_file.write_text("phone@example.com----session\n", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_SESSION_DIR", session_dir)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_SESSION_CACHE_FILE", session_cache)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_SUMMARY_FILE", summary_file)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_USED_FILE", used_file)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_IN_PROGRESS_FILE", in_progress_file)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_FAILED_FILE", failed_file)
+    monkeypatch.setattr(bridge, "register_only_mode", lambda: "phone")
+    monkeypatch.setattr(main, "create_store", lambda cfg: created_store)
+    monkeypatch.setattr(main, "ensure_register_accounts", fake_ensure_register_accounts)
+    monkeypatch.setattr(main, "create_proxy_pool", lambda cfg: None)
+    monkeypatch.setattr(main, "resolve_flow1_sms_selection", lambda: sms_selection)
+    monkeypatch.setattr(main, "run_account", fake_run_account)
+    monkeypatch.setattr(main, "log", lambda message: None)
+    monkeypatch.setattr(main, "worker_log", lambda worker_id, message: None)
+
+    result = asyncio.run(
+        bridge.run_register_only_many(
+            {
+                "mail": {"source": "hotmail"},
+                "output": {"success_file": "old-success.txt", "failed_file": "old-failed.txt"},
+            },
+            count=1,
+            workers=1,
+        )
+    )
+
+    assert result.returncode == 0
+    assert captured["kwargs"]["sms_selection"] is sms_selection

@@ -10,6 +10,7 @@ from typing import Any
 import requests
 
 from .paypal_card_pool import CardPool
+from .proxy_config import local_proxy_url, paypal_flow2_proxy_file
 from .utils import log, resolve_path
 
 
@@ -33,6 +34,7 @@ class RedeemConfig:
     use_proxy: bool
     proxy_file: Path | None
     stop_on_request_error: bool
+    local_proxy: str = ""
 
 
 def _bool_env(value: str | None, default: bool = False) -> bool:
@@ -44,8 +46,7 @@ def _bool_env(value: str | None, default: bool = False) -> bool:
 def load_redeem_config(env: dict[str, str]) -> RedeemConfig:
     proxy_file = (
         env.get("PAYPAL_CARD_REDEEM_PROXY_FILE")
-        or env.get("PAYPAL_PROXY_FILE")
-        or env.get("PROXY_FILE")
+        or paypal_flow2_proxy_file(env, "us")
         or ""
     ).strip()
     return RedeemConfig(
@@ -67,6 +68,7 @@ def load_redeem_config(env: dict[str, str]) -> RedeemConfig:
         ),
         proxy_file=resolve_path(proxy_file) if proxy_file else None,
         stop_on_request_error=_bool_env(env.get("PAYPAL_CARD_REDEEM_STOP_ON_REQUEST_ERROR"), default=True),
+        local_proxy=local_proxy_url(env),
     )
 
 
@@ -114,9 +116,9 @@ def _load_first_proxy(path: Path | None) -> str:
 
 
 def _request_proxies(cfg: RedeemConfig) -> dict[str, str] | None:
-    if not cfg.use_proxy:
-        return None
-    proxy = _load_first_proxy(cfg.proxy_file)
+    proxy = _load_first_proxy(cfg.proxy_file) if cfg.use_proxy else ""
+    if not proxy:
+        proxy = cfg.local_proxy
     if not proxy:
         return None
     return {"http": proxy, "https": proxy}

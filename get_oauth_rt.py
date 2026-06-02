@@ -40,6 +40,8 @@ from mail_adapters.service import wait_code as wait_mail_adapter_code
 from modules.grizzly_sms_provider import GrizzlySMSProvider
 from modules.hero_sms_provider import HeroSMSProvider, PhoneCountry, local_phone_number
 from modules.fivesim_sms_provider import FiveSimProvider
+from modules.smsbower_provider import SmsBowerProvider
+from modules.auth_upload import auth_upload_enabled, upload_bundle
 from modules.terminal_theme import install_print_theme
 from modules.utils import load_env
 
@@ -664,8 +666,31 @@ def load_root_env() -> dict:
                 data[key] = os.environ.get(key, value)
     for key in (
         "AUTH_SERVER_UPLOAD",
+        "AUTH_UPLOAD_TARGET",
         "AUTH_SERVER_URL",
+        "AUTH_SERVER_UPSERT_PATH",
         "AUTH_SERVER_API_KEY",
+        "AUTH_SERVER_API_KEY_HEADER",
+        "AUTH_SERVER_AUTH_SCHEME",
+        "AUTH_SERVER_TIMEOUT",
+        "CPA_SERVER_URL",
+        "CPA_SERVER_UPSERT_PATH",
+        "CPA_SERVER_API_KEY",
+        "CPA_SERVER_API_KEY_HEADER",
+        "CPA_SERVER_AUTH_SCHEME",
+        "CPA_SERVER_TIMEOUT",
+        "SUB2API_SERVER_URL",
+        "SUB2API_IMPORT_PATH",
+        "SUB2API_API_KEY",
+        "SUB2API_API_KEY_HEADER",
+        "SUB2API_AUTH_SCHEME",
+        "SUB2API_GROUP_IDS",
+        "SUB2API_PROXY_ID",
+        "SUB2API_PRIORITY",
+        "SUB2API_CONCURRENCY",
+        "SUB2API_AUTO_PAUSE_ON_EXPIRED",
+        "SUB2API_UPDATE_EXISTING",
+        "SUB2API_TIMEOUT",
         "INBOX_LOUCER_BASE_URL",
         "INBOX_LOUCER_USERNAME",
         "INBOX_LOUCER_PASSWORD",
@@ -1080,8 +1105,7 @@ def maybe_save_store(args, bundle: dict, *, refreshed: bool = False) -> None:
 
 
 def should_upload_to_server(env: dict) -> bool:
-    raw = (env.get("AUTH_SERVER_UPLOAD") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return auth_upload_enabled(env)
 
 
 def upload_bundle_to_server(bundle: dict, account_type: str = "") -> bool:
@@ -1089,31 +1113,20 @@ def upload_bundle_to_server(bundle: dict, account_type: str = "") -> bool:
     if not should_upload_to_server(env):
         return False
 
-    base_url = (env.get("AUTH_SERVER_URL") or "").strip().rstrip("/")
-    api_key = (env.get("AUTH_SERVER_API_KEY") or env.get("ACCOUNT_POOL_API_KEY") or "").strip()
-    if not base_url or not api_key:
-        print("[warn] 已开启服务器上传，但 AUTH_SERVER_URL/AUTH_SERVER_API_KEY 未配置。")
-        return False
-
     payload = server_upload_payload(bundle, account_type=account_type)
-
-    try:
-        import requests
-
-        resp = requests.post(
-            f"{base_url}/api/accounts/upsert",
-            json=payload,
-            headers={"X-API-Key": api_key},
-            timeout=15,
-        )
-        if resp.status_code not in {200, 201}:
-            print(f"[warn] 服务器上传失败: HTTP {resp.status_code} {resp.text[:200]}")
-            return False
-        print("[ok] 已同步到服务器数据库")
-        return True
-    except Exception as exc:
-        print(f"[warn] 服务器上传异常，不影响本地落盘: {exc}")
-        return False
+    results = upload_bundle(payload, env, account_type=account_type)
+    uploaded = False
+    for result in results:
+        if result.skipped:
+            print(f"[warn] {result.target} 上传已跳过: {result.error}")
+            continue
+        if result.ok:
+            uploaded = True
+            print(f"[ok] 已同步到 {result.target} 服务器")
+        else:
+            detail = f"HTTP {result.status_code} " if result.status_code else ""
+            print(f"[warn] {result.target} 上传失败: {detail}{result.error}")
+    return uploaded
 
 
 def safe_filename_part(value: str, *, default: str = "unknown") -> str:
@@ -2722,6 +2735,8 @@ def sms_provider_name(args) -> str:
         return "grizzly"
     if name in {"fivesim", "5sim", "five_sim", "5sims"}:
         return "fivesim"
+    if name in {"smsbower", "sms_bower", "sms-bower"}:
+        return "smsbower"
     return name
 
 
@@ -3149,6 +3164,9 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
     elif provider_name == "fivesim":
         provider = FiveSimProvider(api_key)
         label = "5sim"
+    elif provider_name == "smsbower":
+        provider = SmsBowerProvider(api_key, base_url=str(getattr(args, "sms_api_url", "") or "").strip() or "https://smsbower.app/stubs/handler_api.php")
+        label = "SMSBower"
     else:
         provider = HeroSMSProvider(api_key)
         label = "HeroSMS"
@@ -6260,8 +6278,9 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rt-txt", default=str(DEFAULT_RT_TXT), help="标准 TXT 输出文件，格式为 账号----refresh_token")
     parser.add_argument("--sub-out", default="", help="SUB 聚合格式输出文件，默认写到输出分类目录 sub2api_accounts.json")
     parser.add_argument("--no-sub-output", action="store_true", help="标准输出时不写 SUB 聚合 JSON")
-    parser.add_argument("--sms-provider", default="", help="接码平台：herosms / grizzly / fivesim")
+    parser.add_argument("--sms-provider", default="", help="接码平台：herosms / grizzly / fivesim / smsbower")
     parser.add_argument("--sms-api-key", default="", help="接码平台 API Key")
+    parser.add_argument("--sms-api-url", default="", help="接码平台接口地址")
     parser.add_argument("--sms-service", default="", help="接码平台服务代码")
     parser.add_argument("--sms-country", type=int, default=0, help="接码平台国家 ID")
     parser.add_argument("--sms-country-iso", default="", help="手机号国家 ISO")

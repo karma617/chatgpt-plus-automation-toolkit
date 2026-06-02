@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, replace
@@ -192,6 +193,10 @@ class HeroSMSProvider:
             except Exception:
                 continue
         return []
+
+    def get_services(self) -> dict[str, str]:
+        data = self.request("getServicesList")
+        return parse_services_response(data)
 
     def get_top_countries_by_service(self, service: str = "dr") -> list[dict[str, Any]]:
         last_error: Exception | None = None
@@ -422,6 +427,59 @@ def parse_countries_response(data: Any) -> list[dict[str, Any]]:
             nested = parse_countries_response(value)
             if nested:
                 result.extend(nested)
+    return result
+
+
+def parse_services_response(data: Any) -> dict[str, str]:
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return {}
+
+    if isinstance(data, dict):
+        services = data.get("services") or data.get("data") or data.get("result") or data.get("response") or data
+    else:
+        services = data
+    if isinstance(services, dict):
+        nested = services.get("services") or services.get("items") or services.get("list")
+        if isinstance(nested, (dict, list)):
+            services = nested
+
+    result: dict[str, str] = {}
+    if isinstance(services, dict):
+        for key, value in services.items():
+            code = str(key).strip()
+            if isinstance(value, dict):
+                code = str(
+                    value.get("code")
+                    or value.get("activate_org_code")
+                    or value.get("service")
+                    or value.get("slug")
+                    or code
+                ).strip()
+                name = str(value.get("name") or value.get("title") or value.get("label") or value.get("service") or code).strip()
+            else:
+                name = str(value).strip()
+            if code:
+                result[code] = name or code
+        return result
+
+    if isinstance(services, list):
+        for item in services:
+            if not isinstance(item, dict):
+                continue
+            code = str(
+                item.get("code")
+                or item.get("activate_org_code")
+                or item.get("service")
+                or item.get("slug")
+                or item.get("id")
+                or ""
+            ).strip()
+            name = str(item.get("name") or item.get("title") or item.get("label") or item.get("service") or code).strip()
+            if code:
+                result[code] = name or code
     return result
 
 

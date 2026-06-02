@@ -43,9 +43,10 @@ from main import apply_env_config
 from main import configure_mail_source
 from modules.paypal_filler_bridge import run_paypal_filler_flow2
 from modules.paypal_flow import _run_paypal_authorize
-from modules.paypal_pay import run_paypal_pay
-from modules.paypal_register import run_paypal_register
+from modules.paypal_pay import PENDING_AUTH_FILE, load_link_pool, run_paypal_pay
+from modules.paypal_register import get_last_run_detail, reset_last_run_detail, run_paypal_register
 from modules.register_tool_bridge import run_register_tool_only
+from modules.storage import parse_mail_line
 from modules.utils import load_config
 
 
@@ -101,11 +102,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", default="config.yaml", help="Config file path")
     parser.add_argument(
         "--mail-source",
-        choices=("default", "moemail", "hotmail", "hotmail_graph", "icloud", "icloud_query", "domain163"),
+        choices=("default", "moemail", "hotmail", "icloud", "icloud_query", "domain163"),
         default="default",
         help="Override flow mail source",
     )
-    parser.add_argument("--email", default="", help="Only use this mailbox for flow1/paypal-auto")
+    parser.add_argument("--email", default="", help="Only use this mailbox for PayPal flows")
     args, extra = parser.parse_known_args(argv)
     setattr(args, "extra_args", list(extra))
     return args
@@ -121,6 +122,34 @@ def result_event(flow: str, status: str, message: str, *, account: str = "", pat
         "path": path,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _matches_selected_email(email: str, selected_email: str = "") -> bool:
+    selected = (selected_email or "").strip().lower()
+    return not selected or (email or "").strip().lower() == selected
+
+
+def _count_payment_links(selected_email: str = "") -> int:
+    return sum(
+        1
+        for item in load_link_pool()
+        if _matches_selected_email(str(item.get("email") or ""), selected_email)
+    )
+
+
+def _count_pending_auth(selected_email: str = "") -> int:
+    if not PENDING_AUTH_FILE.exists():
+        return 0
+    count = 0
+    for raw in PENDING_AUTH_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        account = parse_mail_line(line)
+        email = account.email if account else line.split("----", 1)[0].strip()
+        if "@" in email and _matches_selected_email(email, selected_email):
+            count += 1
+    return count
 
 
 def resolve_config_path(config_path: str | Path) -> Path:
@@ -174,9 +203,9 @@ async def _run_async_action(args: argparse.Namespace, cfg: dict) -> int:
             selected_email=args.email,
         )
     if args.action == "paypal-flow2":
-        return await run_paypal_pay(cfg, count=args.count, workers=args.workers, card_source_mode="real")
+        return await run_paypal_pay(cfg, count=args.count, workers=args.workers, card_source_mode="real", selected_email=args.email)
     if args.action == "paypal-flow2-nocard":
-        return await run_paypal_pay(cfg, count=args.count, workers=args.workers, card_source_mode="local_random")
+        return await run_paypal_pay(cfg, count=args.count, workers=args.workers, card_source_mode="local_random", selected_email=args.email)
     if args.action == "paypal-flow2-jp":
         return await run_paypal_pay(
             cfg,
@@ -184,6 +213,7 @@ async def _run_async_action(args: argparse.Namespace, cfg: dict) -> int:
             workers=args.workers,
             card_source_mode="real",
             flow2_region_mode="jp",
+            selected_email=args.email,
         )
     if args.action == "paypal-flow2-jp-nocard":
         return await run_paypal_pay(
@@ -192,6 +222,7 @@ async def _run_async_action(args: argparse.Namespace, cfg: dict) -> int:
             workers=args.workers,
             card_source_mode="local_random",
             flow2_region_mode="jp",
+            selected_email=args.email,
         )
     raise ValueError(f"Unsupported async action: {args.action}")
 
@@ -264,6 +295,8 @@ def run_action(args: argparse.Namespace) -> int:
             "paypal-flow2-jp",
             "paypal-flow2-jp-nocard",
         }:
+            if flow == "paypal-flow1":
+                reset_last_run_detail()
             success = asyncio.run(run_with_playwright_noise_filter(_run_async_action(args, cfg)))
         elif flow == "paypal-flow2-filler":
             success = int(
@@ -299,34 +332,47 @@ def run_action(args: argparse.Namespace) -> int:
                     )
                 )
             )
-            if reg_success <= 0:
+            link_count = _count_payment_links(args.email)
+            pending_count = _count_pending_auth(args.email)
+            if reg_success <= 0 and link_count <= 0 and pending_count <= 0:
                 detail = f" for selected email {args.email}" if args.email else ""
                 print(result_event(flow, "failure", f"flow1 produced no payment links{detail}"), flush=True)
                 return 1
-            if use_filler_flow2:
-                pay_success = int(
-                    run_paypal_filler_flow2(
-                        cfg,
-                        count=reg_success,
-                        workers=workers,
-                        selected_email=args.email,
+            pay_success = 0
+            if link_count > 0:
+                pay_target = min(target, link_count)
+                if use_filler_flow2:
+                    pay_success = int(
+                        run_paypal_filler_flow2(
+                            cfg,
+                            count=pay_target,
+                            workers=workers,
+                            selected_email=args.email,
+                        )
                     )
-                )
-            else:
-                pay_mode = "local_random" if use_local_random_mode else "real"
-                pay_success = asyncio.run(
-                    run_with_playwright_noise_filter(
-                        run_paypal_pay(cfg, count=reg_success, workers=workers, card_source_mode=pay_mode)
+                else:
+                    pay_mode = "local_random" if use_local_random_mode else "real"
+                    pay_success = asyncio.run(
+                        run_with_playwright_noise_filter(
+                            run_paypal_pay(
+                                cfg,
+                                count=pay_target,
+                                workers=workers,
+                                card_source_mode=pay_mode,
+                                selected_email=args.email,
+                            )
+                        )
                     )
-                )
-            if pay_success <= 0:
+            pending_count = _count_pending_auth(args.email)
+            if pay_success <= 0 and pending_count <= 0:
                 print(result_event(flow, "failure", "flow2 produced no pending auth accounts"), flush=True)
                 return 1
-            auth_code = int(_run_paypal_authorize(count=pay_success, workers=workers) or 0)
+            auth_target = max(1, min(target, pending_count if pending_count > 0 else pay_success))
+            auth_code = int(_run_paypal_authorize(count=auth_target, workers=workers) or 0)
             if auth_code != 0:
                 print(result_event(flow, "failure", f"flow3 failed code={auth_code}"), flush=True)
                 return auth_code
-            success = pay_success
+            success = auth_target
         else:
             raise ValueError(f"Unsupported action: {flow}")
     except Exception as exc:
@@ -335,7 +381,14 @@ def run_action(args: argparse.Namespace) -> int:
 
     status = "success" if int(success or 0) > 0 else "failure"
     message = f"completed success={success}/{target}"
-    print(result_event(flow, status, message), flush=True)
+    account = ""
+    path = ""
+    if flow == "paypal-flow1":
+        detail = get_last_run_detail()
+        message = detail.get("message") or message
+        account = detail.get("account") or ""
+        path = detail.get("path") or ""
+    print(result_event(flow, status, message, account=account, path=path), flush=True)
     return 0 if status == "success" else 1
 
 

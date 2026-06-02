@@ -18,6 +18,7 @@ from .free_browser_flow import FreeBrowserFlow
 from .mail_provider import MailProvider
 from .moemail_factory import create_moemail_accounts, split_domains
 from .proxy_pool import ProxyPool
+from .proxy_config import register_local_proxy_url
 from .storage import MailAccount, parse_mail_line
 from .utils import load_env, log, now_utc, resolve_path, safe_filename
 
@@ -82,7 +83,6 @@ def resolve_flow_mail_source(cfg: dict[str, Any], env: dict[str, str], flow: str
 def normalize_mail_source(value: str) -> str:
     aliases = {
         "hotmail": "hotmail",
-        "hotmail_graph": "hotmail",
         "moemail": "moemail",
         "icloud": "icloud_query",
         "icloud_query": "icloud_query",
@@ -546,6 +546,8 @@ def create_sms_provider_from_selection(sms_selection: dict[str, object]):
     from .grizzly_sms_provider import GrizzlySMSProvider
     from .hero_sms_provider import HeroSMSProvider
     from .fivesim_sms_provider import FiveSimProvider
+    from .smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
+    from .smsbower_provider import SmsBowerProvider
 
     provider_name = str(sms_selection.get("provider") or "herosms").lower()
     api_key = str(sms_selection.get("api_key") or "").strip()
@@ -553,6 +555,8 @@ def create_sms_provider_from_selection(sms_selection: dict[str, object]):
         return GrizzlySMSProvider(api_key)
     if provider_name in {"fivesim", "5sim"}:
         return FiveSimProvider(api_key)
+    if provider_name in {"smsbower", "sms_bower", "sms-bower"}:
+        return SmsBowerProvider(api_key, base_url=str(sms_selection.get("base_url") or "").strip() or SMSBOWER_DEFAULT_ENDPOINT)
     return HeroSMSProvider(api_key)
 
 
@@ -847,6 +851,7 @@ async def phase2_email_oauth_token(
 
 async def run_free_register_many(cfg: dict[str, Any], *, count: int, workers: int, sms_selection: dict[str, object] | None, register_mode: str = "phone") -> int:
     proxy_pool = ProxyPool(cfg.get("browser", {}).get("proxy_file", "data/proxies/proxies.txt")) if cfg.get("browser", {}).get("use_proxy") else None
+    fallback_proxy = register_local_proxy_url(load_env(".env"))
     success = 0
     attempts = 0
     max_attempts = max(count * int(cfg.get("free_register", {}).get("max_attempt_multiplier", 5)), count)
@@ -862,7 +867,7 @@ async def run_free_register_many(cfg: dict[str, Any], *, count: int, workers: in
                 attempt_no = attempts
             log(f"[free-{worker_id:02d}] 开始第 {attempt_no}/{max_attempts} 次尝试，目标成功 {success}/{count}")
             # 每次尝试都轮换代理，避免同一 worker 被单个代理绑死
-            proxy = proxy_pool.pick(attempt_no) if proxy_pool else None
+            proxy = proxy_pool.pick(attempt_no) if proxy_pool else fallback_proxy or None
             worker_sms_selection = {**sms_selection} if sms_selection else None
             if register_mode == "email":
                 ok = await run_free_register_once_email(cfg, sms_selection=worker_sms_selection, worker_id=worker_id, proxy=proxy)

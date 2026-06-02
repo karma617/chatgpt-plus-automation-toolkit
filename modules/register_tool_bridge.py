@@ -14,6 +14,7 @@ def _zh(text: str) -> str:
 
 LABEL_REGISTER_ONLY = _zh(r"\u4ec5\u6ce8\u518c")
 LABEL_TARGET_SUCCESS = _zh(r"\u76ee\u6807\u6210\u529f\u6570")
+LABEL_REGISTER_MODE = _zh(r"\u6ce8\u518c\u65b9\u5f0f")
 LABEL_MAIL_SOURCE = _zh(r"\u90ae\u7bb1\u6765\u6e90")
 LABEL_PROXY = _zh(r"\u4ee3\u7406")
 LABEL_SMS = _zh(r"\u4ec5\u6ce8\u518c/\u624b\u673a\u63a5\u7801")
@@ -29,6 +30,8 @@ LABEL_NO_REGISTER_ACCOUNTS = _zh(
     r"\u5f53\u524d\u90ae\u7bb1\u6c60\u6ca1\u6709\u53ef\u7528\u8d26\u53f7\uff0c"
     r"\u4e14\u672a\u80fd\u901a\u8fc7\u5f53\u524d\u9879\u76ee\u914d\u7f6e\u81ea\u52a8\u8865\u53f7"
 )
+LABEL_REGISTER_MODE_EMAIL = _zh(r"\u90ae\u7bb1\u6ce8\u518c")
+LABEL_REGISTER_MODE_PHONE = _zh(r"\u624b\u673a\u53f7\u6ce8\u518c")
 
 REGISTER_ONLY_OUTPUT_DIR = resolve_path("output/register_only")
 REGISTER_ONLY_SESSION_DIR = REGISTER_ONLY_OUTPUT_DIR / "sessiond"
@@ -37,6 +40,25 @@ REGISTER_ONLY_SUMMARY_FILE = REGISTER_ONLY_OUTPUT_DIR / "registered_sessions.txt
 REGISTER_ONLY_USED_FILE = REGISTER_ONLY_OUTPUT_DIR / "used_emails.txt"
 REGISTER_ONLY_IN_PROGRESS_FILE = REGISTER_ONLY_OUTPUT_DIR / "in_progress.txt"
 REGISTER_ONLY_FAILED_FILE = REGISTER_ONLY_OUTPUT_DIR / "failed_accounts.txt"
+
+
+def register_only_mode(env: dict[str, str] | None = None) -> str:
+    if env is None:
+        from .utils import load_env
+
+        env = load_env(".env")
+    value = (env.get("REGISTER_ONLY_MODE") or env.get("FREE_REGISTER_MODE") or "email").strip().lower()
+    aliases = {
+        "email": "email",
+        "mail": "email",
+        "邮箱": "email",
+        "邮箱注册": "email",
+        "phone": "phone",
+        "sms": "phone",
+        "手机号": "phone",
+        "手机号注册": "phone",
+    }
+    return aliases.get(value, "email")
 
 
 @dataclass(frozen=True)
@@ -83,6 +105,7 @@ async def run_register_only_many(
     import main as main_app
 
     register_cfg = clone_register_only_config(cfg, selected_email=selected_email)
+    mode = register_only_mode()
     ensure_output_files()
     store = main_app.create_store(register_cfg)
     target = max(1, int(count or 1))
@@ -99,7 +122,7 @@ async def run_register_only_many(
         )
 
     proxy_pool = main_app.create_proxy_pool(register_cfg)
-    sms_selection = main_app.resolve_flow1_sms_selection()
+    sms_selection = main_app.resolve_flow1_sms_selection() if mode == "phone" else None
     worker_count = max(1, int(workers or 1))
     counter = main_app.SuccessCounter(target)
     counter.target = target
@@ -108,6 +131,7 @@ async def run_register_only_many(
     main_app.log(
         f"{LABEL_REGISTER_ONLY}: workers={worker_count}, "
         f"{LABEL_TARGET_SUCCESS}={target}, "
+        f"{LABEL_REGISTER_MODE}={LABEL_REGISTER_MODE_PHONE if mode == 'phone' else LABEL_REGISTER_MODE_EMAIL}, "
         f"{LABEL_MAIL_SOURCE}={register_cfg.get('mail', {}).get('active_source', register_cfg.get('mail', {}).get('source'))}, "
         f"{LABEL_PROXY}={proxy_status}"
     )
@@ -124,7 +148,7 @@ async def run_register_only_many(
         while True:
             if not await counter.acquire_slot():
                 return
-            proxy = proxy_pool.pick(worker_id) if proxy_pool else None
+            proxy = proxy_pool.pick(worker_id) if proxy_pool else main_app.fallback_proxy_from_env() or None
             result = await main_app.run_account(
                 register_cfg,
                 store,

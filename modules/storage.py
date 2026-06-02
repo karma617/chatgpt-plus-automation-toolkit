@@ -259,9 +259,10 @@ class AccountStore:
                 self.accounts_file.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
             self.finish_claim(account.email)
 
-    def save_success(self, email: str, code_address: str, payment_link: str) -> None:
+    def save_success(self, email: str, code_address: str, payment_link: str, account_line: str | None = None) -> None:
         with self._lock:
-            text = f"{email}----{code_address}----{payment_link}\n"
+            payload = str(account_line or "").strip()
+            text = f"{payload}\n" if payload else f"{email}----{code_address}----{payment_link}\n"
             with self.success_file.open("a", encoding="utf-8") as fh:
                 fh.write(text)
 

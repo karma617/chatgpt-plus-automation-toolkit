@@ -18,8 +18,10 @@ from typing import Any
 import requests
 
 from .browser import BrowserSession
+from . import paypal_flow_state
 from .paypal_card_pool import CardInfo, CardPool
 from .paypal_phone_pool import PhoneInfo, PhonePool
+from .proxy_config import local_proxy_url, paypal_flow2_proxy_enabled, paypal_flow2_proxy_file
 from .utils import load_env, log, resolve_path, safe_filename
 
 
@@ -501,6 +503,7 @@ def _display_proxy(proxy: str | None) -> str:
 def load_link_pool() -> list[dict[str, str]]:
     if not LINK_POOL_FILE.exists():
         return []
+    blocked = paypal_flow_state.link_pool_blocked_emails(pending_file=PENDING_AUTH_FILE)
     items = []
     for line in LINK_POOL_FILE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -508,14 +511,32 @@ def load_link_pool() -> list[dict[str, str]]:
             continue
         parts = line.split("----")
         if len(parts) >= 3:
-            items.append({"email": parts[0].strip(), "query_code": parts[1].strip(), "payment_link": "----".join(parts[2:]).strip()})
+            payment_link = parts[-1].strip()
+            account_line = "----".join(part.strip() for part in parts[:-1]).strip()
+            query_code = parts[1].strip()
+            if len(parts) >= 5:
+                query_code = parts[0].strip()
+            email = parts[0].strip()
+            if email.lower() in blocked:
+                continue
+            items.append(
+                {
+                    "email": email,
+                    "query_code": query_code,
+                    "payment_link": payment_link,
+                    "account_line": account_line,
+                }
+            )
     return items
 
 
-def save_pending_auth(email: str, query_code: str) -> None:
+def save_pending_auth(email: str, query_code: str, account_line: str | None = None) -> None:
     PENDING_AUTH_DIR.mkdir(parents=True, exist_ok=True)
+    raw = str(account_line or "").strip()
+    line = raw if raw and raw.split("----", 1)[0].strip().lower() == email.strip().lower() else f"{email}----{query_code}"
     with PENDING_AUTH_FILE.open("a", encoding="utf-8") as f:
-        f.write(f"{email}----{query_code}\n")
+        f.write(line + "\n")
+    paypal_flow_state.mark_paid_pending_auth(email, account_line=line)
 
 
 def remove_from_link_pool(email: str) -> None:
@@ -2418,8 +2439,8 @@ async def fill_paypal(
 async def handle_paypal_captcha(page, timeout_seconds: int = 180, solver_proxy: str | None = None, force: bool = False) -> None:
     """检测 PayPal 人机验证码并处理。
 
-    当前只保留人工处理逻辑；检测到 hosted checkout 的遮挡层时，先按
-    GuJumpgate 的做法清理页面上的 captcha artifact，再等待人工完成。
+    检测到 hosted checkout 的遮挡层时，先清理页面上的 captcha artifact。
+    PAYPAL_CAPTCHA_MODE=api 时优先走打码平台，失败后回退人工完成。
     """
     await _remove_hosted_captcha_artifacts(page)
     # 检测是否有验证码弹窗（避免 v3 eval 误判）
@@ -2454,7 +2475,20 @@ async def handle_paypal_captcha(page, timeout_seconds: int = 180, solver_proxy: 
             log("[PayPal] CAPTCHA 遮挡元素已移除，继续流程")
             return
 
-    await _wait_captcha_manual(page, timeout_seconds)
+    env = load_env(".env")
+    timeout_value = int(env.get("PAYPAL_CAPTCHA_TIMEOUT") or timeout_seconds or 180)
+    captcha_mode = (env.get("PAYPAL_CAPTCHA_MODE") or "manual").strip().lower()
+    if captcha_mode == "api":
+        try:
+            await _solve_captcha_via_api(page, env, solver_proxy=solver_proxy)
+            if await _wait_captcha_cleared(page, timeout_seconds=30):
+                log("[PayPal] CAPTCHA 自动处理完成")
+                return
+            log("[PayPal] CAPTCHA 自动处理后仍未清除，回退人工处理")
+        except Exception as exc:
+            log(f"[PayPal] CAPTCHA 自动处理失败，回退人工处理: {exc}")
+
+    await _wait_captcha_manual(page, timeout_value)
 
 
 async def _detect_captcha(page) -> bool:
@@ -2988,10 +3022,170 @@ async def _post_captcha_nudge(page) -> None:
             continue
 
 
+async def _extract_captcha_info(page) -> dict[str, Any]:
+    """提取当前页面可交给打码平台处理的 CAPTCHA 信息。"""
+    script = """() => {
+        const decode = (value) => {
+            try { return decodeURIComponent(value || ''); } catch { return value || ''; }
+        };
+        const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 20 || rect.height < 20) return false;
+            const style = window.getComputedStyle(el);
+            if (!style) return false;
+            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.05;
+        };
+        const fromUrl = (raw, keys) => {
+            const src = String(raw || '');
+            for (const key of keys) {
+                const m = src.match(new RegExp('[?&]' + key + '=([^&]+)', 'i'));
+                if (m) return decode(m[1]);
+            }
+            return '';
+        };
+        const dataNode = Array.from(document.querySelectorAll('[data-sitekey], [data-site-key]'))
+            .find((el) => visible(el));
+        if (dataNode) {
+            const sitekey = dataNode.getAttribute('data-sitekey') || dataNode.getAttribute('data-site-key') || '';
+            const cls = String(dataNode.className || '').toLowerCase();
+            const id = String(dataNode.id || '').toLowerCase();
+            const provider = (cls.includes('hcaptcha') || id.includes('hcaptcha')) ? 'hcaptcha' : 'recaptcha';
+            return {
+                provider,
+                sitekey,
+                pageUrl: location.href,
+                enterprise: /enterprise/i.test(document.documentElement.outerHTML.slice(0, 250000)),
+                invisible: dataNode.getAttribute('data-size') === 'invisible',
+            };
+        }
+        for (const frame of Array.from(document.querySelectorAll('iframe'))) {
+            const src = frame.getAttribute('src') || '';
+            const low = src.toLowerCase();
+            if (!visible(frame) && !/recaptcha|hcaptcha|captcha|challenge/.test(low)) continue;
+            if (low.includes('hcaptcha')) {
+                const sitekey = fromUrl(src, ['sitekey', 'siteKey', 'k']);
+                if (sitekey) {
+                    return { provider: 'hcaptcha', sitekey, pageUrl: location.href, enterprise: true, invisible: false };
+                }
+            }
+            if (low.includes('recaptcha')) {
+                const sitekey = fromUrl(src, ['k', 'sitekey', 'siteKey']);
+                if (sitekey) {
+                    return {
+                        provider: 'recaptcha',
+                        sitekey,
+                        pageUrl: location.href,
+                        enterprise: low.includes('enterprise'),
+                        invisible: low.includes('size=invisible'),
+                        recaptchaVersion: low.includes('recaptcha_v3') ? 'v3' : 'v2',
+                        action: fromUrl(src, ['action']) || 'verify',
+                    };
+                }
+            }
+        }
+        return {};
+    }"""
+    targets = [page]
+    try:
+        targets.extend([fr for fr in page.frames if fr is not page.main_frame])
+    except Exception:
+        pass
+    for target in targets:
+        try:
+            info = await target.evaluate(script)
+        except Exception:
+            continue
+        if isinstance(info, dict) and info.get("provider") and info.get("sitekey"):
+            if not info.get("pageUrl"):
+                info["pageUrl"] = page.url
+            return info
+    return {}
+
+
 async def _solve_captcha_via_api(page, env: dict[str, str], solver_proxy: str | None = None) -> None:
-    """兼容旧调用：打码平台逻辑已移除，只保留人工处理。"""
+    """使用配置的打码平台处理 PayPal CAPTCHA。"""
     await _cleanup_hosted_captcha_artifacts(page, timeout_ms=15000)
-    await _wait_captcha_manual(page)
+    info = await _extract_captcha_info(page)
+    provider = str(info.get("provider") or "").strip().lower()
+    if provider not in {"recaptcha", "hcaptcha"}:
+        raise RuntimeError(f"未识别可自动处理的 CAPTCHA 类型: {provider or 'unknown'}")
+    site_key = str(info.get("sitekey") or "").strip()
+    if not site_key:
+        raise RuntimeError("未提取到 CAPTCHA sitekey")
+
+    api_provider = (env.get("CAPTCHA_API_PROVIDER") or "capsolver").strip().lower()
+    timeout = int(env.get("PAYPAL_CAPTCHA_TIMEOUT") or 180)
+    log(f"[PayPal] CAPTCHA 自动处理: platform={api_provider}, type={provider}, sitekey={site_key[:16]}...")
+
+    if provider == "hcaptcha":
+        page_url = page.url
+    else:
+        page_url = str(info.get("pageUrl") or page.url)
+
+    if api_provider == "yescaptcha":
+        from .yescaptcha_solver import YesCaptchaSolver
+
+        solver = YesCaptchaSolver(env.get("YESCAPTCHA_API_KEY", ""), timeout=timeout)
+        if provider == "hcaptcha":
+            token = await asyncio.to_thread(
+                solver.solve_hcaptcha,
+                page_url,
+                site_key,
+                enterprise=bool(info.get("enterprise", True)),
+            )
+            await _inject_hcaptcha_token(page, token)
+        else:
+            recaptcha_version = str(info.get("recaptchaVersion") or "v2").lower()
+            if recaptcha_version == "v3":
+                raise RuntimeError("YesCaptcha 当前 PayPal 自动接入仅处理 reCAPTCHA v2 / hCaptcha")
+            token = await asyncio.to_thread(solver.solve_recaptcha_v2, page_url, site_key)
+            await _inject_recaptcha_token(page, token)
+    elif api_provider in {"capsolver", "twocaptcha", "captchaai"}:
+        import recaptcha_solver
+
+        api_key = (
+            env.get("CAPSOLVER_API_KEY")
+            if api_provider == "capsolver"
+            else env.get("TWOCAPTCHA_API_KEY")
+        )
+        if api_provider == "captchaai":
+            api_key = env.get("CAPTCHAAI_KEY") or env.get("CAPTCHA_API_KEY")
+        if not api_key:
+            raise RuntimeError(f"{api_provider} API key 未配置")
+        if provider == "hcaptcha":
+            token = await asyncio.to_thread(
+                recaptcha_solver.solve_hcaptcha,
+                api_key,
+                site_key,
+                page_url,
+                timeout,
+                20,
+                5,
+                bool(info.get("invisible", False)),
+                solver_proxy or "",
+            )
+            await _inject_hcaptcha_token(page, token)
+        else:
+            token = await asyncio.to_thread(
+                recaptcha_solver.solve_recaptcha_v2,
+                api_key,
+                site_key,
+                page_url,
+                bool(info.get("invisible", False)),
+                bool(info.get("enterprise", False)),
+                timeout,
+                20,
+                5,
+                "",
+                solver_proxy or "",
+            )
+            await _inject_recaptcha_token(page, token)
+    else:
+        raise RuntimeError(f"不支持的验证码服务商: {api_provider}")
+
+    await page.wait_for_timeout(800)
+    await _post_captcha_nudge(page)
 
 async def fill_sms_code(
     page,
@@ -3186,6 +3380,7 @@ async def pay_one(
     email = item["email"]
     query_code = item["query_code"]
     payment_link = item["payment_link"]
+    account_line = item.get("account_line", "")
     prefix = f"[paypal-pay-{worker_id:02d}][{email}]"
     paypal_password = generate_paypal_password(email)
     region_mode = _normalize_flow2_region_mode(flow2_region_mode)
@@ -3305,7 +3500,7 @@ async def pay_one(
         final_url = page.url
         if "chatgpt.com" in final_url or "success" in final_url.lower():
             log(f"{prefix} ✅ 支付成功！")
-            save_pending_auth(email, query_code)
+            save_pending_auth(email, query_code, account_line=account_line)
             remove_from_link_pool(email)
             return True
         else:
@@ -3317,6 +3512,7 @@ async def pay_one(
     except Exception as exc:
         log(f"{prefix} ❌ 失败: {exc}")
         traceback.print_exc()
+        paypal_flow_state.mark_stage_failure(email, stage="flow2", reason=str(exc))
         if phone:
             phone_pool.release(phone.number, success=False)
         return False
@@ -3330,14 +3526,20 @@ async def run_paypal_pay(
     workers: int = 1,
     card_source_mode: str | None = None,
     flow2_region_mode: str | None = None,
+    selected_email: str | None = None,
 ) -> int:
     """批量执行流程2。返回成功数。"""
     log(f"PayPal flow2 code version: {PAYPAL_FLOW2_CODE_VERSION} file={Path(__file__).resolve()}")
     env = load_env(".env")
     resolved_region_mode = _normalize_flow2_region_mode(flow2_region_mode)
+    paypal_flow_state.sync_from_files(link_file=LINK_POOL_FILE, pending_file=PENDING_AUTH_FILE)
     pool = load_link_pool()
+    selected = (selected_email or "").strip().lower()
+    if selected:
+        pool = [item for item in pool if str(item.get("email") or "").strip().lower() == selected]
     if not pool:
-        log("PayPal 流程2：长链接池为空，请先运行流程1")
+        detail = f" (selected={selected_email})" if selected_email else ""
+        log(f"PayPal 流程2：长链接池为空，请先运行流程1{detail}")
         return 0
 
     cards_file = env.get("PAYPAL_CARDS_FILE") or "data/paypal/cards.txt"
@@ -3352,31 +3554,28 @@ async def run_paypal_pay(
     else:
         local_random_mode = is_local_random_card_mode(env)
 
-    # 代理池（通过 PAYPAL_USE_PROXY 开关控制）
+    # 代理池（US/JP 分开配置）；未启用或无可用池时回退本地代理。
     from .proxy_pool import ProxyPool
-    if resolved_region_mode == "jp":
-        use_proxy = True
-    else:
-        use_proxy = (env.get("PAYPAL_USE_PROXY") or "").strip().lower() in ("true", "1", "yes")
+    use_proxy = paypal_flow2_proxy_enabled(env)
     proxy_pool: ProxyPool | None = None
+    fallback_proxy = ""
     if use_proxy:
-        if resolved_region_mode == "jp":
-            proxy_file = (
-                env.get("PAYPAL_PROXY_FILE_JP")
-                or env.get("PAYPAL_PROXY_FILE")
-                or env.get("PROXY_FILE")
-                or "data/proxies/proxies_jp.txt"
-            )
-        else:
-            proxy_file = env.get("PAYPAL_PROXY_FILE") or env.get("PROXY_FILE") or "data/proxies/proxies.txt"
+        proxy_file = paypal_flow2_proxy_file(env, resolved_region_mode)
         proxy_pool = ProxyPool(proxy_file)
         if proxy_pool.count() <= 0:
-            log(f"PayPal 流程2：PAYPAL_USE_PROXY 已开启但代理池为空: {proxy_file}")
-            return 0
+            fallback_proxy = local_proxy_url(env)
+            proxy_pool = None
+            log(f"PayPal 流程2：代理池为空，改用本地代理: {proxy_file} -> {_display_proxy(fallback_proxy)}")
         if resolved_region_mode == "jp":
-            log(f"PayPal 流程2：日本代理模式已启用，代理池={proxy_file}，代理数={proxy_pool.count()}")
+            count_text = proxy_pool.count() if proxy_pool else 0
+            log(f"PayPal 流程2：日本代理模式已启用，代理池={proxy_file}，代理数={count_text}")
         else:
-            log(f"PayPal 流程2：代理已启用，代理数={proxy_pool.count()}")
+            count_text = proxy_pool.count() if proxy_pool else 0
+            log(f"PayPal 流程2：美国支付代理已启用，代理池={proxy_file}，代理数={count_text}")
+    else:
+        fallback_proxy = local_proxy_url(env)
+        if fallback_proxy:
+            log(f"PayPal 流程2：代理池关闭，使用本地代理: {_display_proxy(fallback_proxy)}")
 
     if not local_random_mode:
         desired_cards = min(count, len(pool), phone_pool.count())
@@ -3412,7 +3611,7 @@ async def run_paypal_pay(
                 if not card:
                     log(f"[paypal-pay-{index:02d}] 卡池已空")
                     return
-            proxy = proxy_pool.pick(index) if proxy_pool else None
+            proxy = proxy_pool.pick(index) if proxy_pool else fallback_proxy or None
             ok = await pay_one(
                 item,
                 card,

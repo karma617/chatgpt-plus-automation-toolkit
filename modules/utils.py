@@ -4,6 +4,7 @@ import asyncio
 import random
 import re
 import string
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ import yaml
 from modules.terminal_theme import GRAY, paint, style_timed_log
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 
 
 def _u(value: str) -> str:

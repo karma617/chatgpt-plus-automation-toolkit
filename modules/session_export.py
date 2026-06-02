@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .auth_upload import session_upload_enabled, upload_bundle
 from .utils import LEGACY_OUTPUT_FILES, log, migrate_output_file, output_file, resolve_path, safe_filename
 
 
@@ -41,7 +42,7 @@ def read_env(path: str | Path = ".env") -> dict[str, str]:
 
 
 def session_export_upload_enabled(env: dict[str, str]) -> bool:
-    return env_bool(env.get("SESSION_EXPORT_SERVER_UPLOAD"), default=False)
+    return session_upload_enabled(env)
 
 
 def utc_now() -> str:
@@ -236,7 +237,7 @@ def read_paid_records(path: str | Path = output_file("flow2_paid_success")) -> l
                     "client_id": parts[2],
                     "refresh_token": parts[3],
                     "code_address": account,
-                    "source_format": "hotmail_graph",
+                    "source_format": "hotmail",
                 }
             )
         elif len(parts) >= 2:
@@ -330,28 +331,19 @@ def upload_session_to_server(record: dict[str, Any], env: dict[str, str] | None 
     env = env or read_env(".env")
     if not session_export_upload_enabled(env):
         return False
-    base_url = (env.get("AUTH_SERVER_URL") or "").strip().rstrip("/")
-    api_key = (env.get("AUTH_SERVER_API_KEY") or "").strip()
-    if not base_url or not api_key:
-        log("流程四服务器上传已开启，但 AUTH_SERVER_URL/AUTH_SERVER_API_KEY 未配置")
-        return False
-    try:
-        import requests
-
-        resp = requests.post(
-            f"{base_url}/api/accounts/upsert",
-            json=server_upload_payload(record),
-            headers={"X-API-Key": api_key},
-            timeout=15,
-        )
-        if resp.status_code not in {200, 201}:
-            log(f"流程四服务器上传失败: HTTP {resp.status_code} {resp.text[:200]}")
-            return False
-        log(f"流程四已上传服务器: {record.get('email')}")
-        return True
-    except Exception as exc:  # noqa: BLE001
-        log(f"流程四服务器上传异常，不影响本地导出: {exc}")
-        return False
+    results = upload_bundle(server_upload_payload(record), env, account_type="session_export")
+    uploaded = False
+    for result in results:
+        if result.skipped:
+            log(f"流程四 {result.target} 上传已跳过: {result.error}")
+            continue
+        if result.ok:
+            uploaded = True
+            log(f"流程四已上传 {result.target}: {record.get('email')}")
+        else:
+            detail = f"HTTP {result.status_code} " if result.status_code else ""
+            log(f"流程四 {result.target} 上传失败: {detail}{result.error}")
+    return uploaded
 
 
 def sub2api_account_payload(record: dict[str, Any]) -> dict[str, Any]:

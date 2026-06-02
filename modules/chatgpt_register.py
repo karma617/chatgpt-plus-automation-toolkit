@@ -11,6 +11,7 @@ from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeou
 from .grizzly_sms_provider import GrizzlySMSProvider
 from .hero_sms_provider import HeroSMSProvider, PhoneCountry, SmsActivation, local_phone_number
 from .mail_provider import MailProvider
+from .smsbower_provider import SmsBowerProvider
 from .storage import MailAccount
 from .utils import log, random_profile
 
@@ -152,19 +153,20 @@ class ChatGPTRegister:
         if "chatgpt.com" in url and (
             "/g/" in url
             or "/c/" in url
+            or is_chatgpt_success_landing(url, low, text)
             or await chatgpt_logged_in_markers(self.page, low, text)
         ):
             return "logged_in"
+        if await visible_input_count(self.page, r"password") > 0 and not likely_code_page(low):
+            return "password"
+        if likely_code_page(low) or await visible_code_inputs(self.page) > 0:
+            return "code"
         if await is_phone_login_page(self.page, low, text):
             return "phone_login"
         if is_entry_page(low, text):
             return "entry"
         if await visible_input_count(self.page, r"email|username") > 0:
             return "email"
-        if await visible_input_count(self.page, r"password") > 0 and not likely_code_page(low):
-            return "password"
-        if likely_code_page(low) or await visible_code_inputs(self.page) > 0:
-            return "code"
         if any(key in low for key in ["tell us about yourself", "full name", "birthday", "date of birth", "age"]) or any(
             key in text for key in ["姓名", "名字", "年龄", "生日", "出生"]
         ):
@@ -309,7 +311,7 @@ class ChatGPTRegister:
         if not locator:
             raise RuntimeError("未找到邮箱输入框")
         await human_fill(locator, email, force_mouse=True)
-        if not await click_email_submit(self.page, locator):
+        if not await click_email_submit_safe(self.page, locator):
             raise RuntimeError("邮箱页未找到安全的继续按钮")
 
     async def fill_password(self, account: MailAccount) -> None:
@@ -358,7 +360,7 @@ class ChatGPTRegister:
         provider_name = str(selection.get("provider") or "herosms").lower()
         if provider_name in {"fivesim", "5sim"}:
             provider_name = "fivesim"
-        default_label = {"grizzly": "GrizzlySMS", "fivesim": "5sim"}.get(provider_name, "HeroSMS")
+        default_label = {"grizzly": "GrizzlySMS", "fivesim": "5sim", "smsbower": "SMSBower"}.get(provider_name, "HeroSMS")
         provider_label = str(selection.get("provider_label") or default_label)
         api_key = str(selection.get("api_key") or "").strip()
         default_service = "openai" if provider_name == "fivesim" else "dr"
@@ -380,6 +382,8 @@ class ChatGPTRegister:
             from .fivesim_sms_provider import FiveSimProvider
 
             provider = FiveSimProvider(api_key)
+        elif provider_name == "smsbower":
+            provider = SmsBowerProvider(api_key, base_url=str(selection.get("base_url") or "").strip() or "https://smsbower.app/stubs/handler_api.php")
         else:
             provider = HeroSMSProvider(api_key)
         # 5sim 用 slug；HeroSMS/Grizzly 用 hero_sms_country int
@@ -909,6 +913,30 @@ async def chatgpt_logged_in_markers(page: Page, low: str, text: str) -> bool:
     )
 
 
+def is_chatgpt_success_landing(url: str, low: str, text: str) -> bool:
+    value = (url or "").strip().lower()
+    if "chatgpt.com" not in value:
+        return False
+    if any(part in value for part in ("/auth/", "/email-verification", "/about-you", "/signup", "/login")):
+        return False
+    path = value.split("chatgpt.com", 1)[-1].split("?", 1)[0].split("#", 1)[0] or "/"
+    if path != "/" and not path.startswith(("/g/", "/c/")):
+        return False
+    blockers = (
+        "log in",
+        "login",
+        "sign up",
+        "create account",
+        "get started",
+        "verify you are human",
+        "just a moment",
+        "captcha",
+        "cloudflare",
+        "checking your browser",
+    )
+    return not any(item in low for item in blockers) and not any(item in text for item in ("登录", "注册"))
+
+
 async def is_phone_login_page(page: Page, low: str, text: str) -> bool:
     url = page.url.lower()
     if "usernamekind=phone_number" in url or "screen_hint=phone" in url:
@@ -1234,6 +1262,90 @@ async def click_email_submit(page: Page, email_input: Locator) -> bool:
     )
     if isinstance(clicked, dict) and clicked.get("clicked"):
         await page.keyboard.press("Enter")
+        await settle(page)
+        return True
+    return False
+
+
+async def click_email_submit_safe(page: Page, email_input: Locator) -> bool:
+    """Submit the email form without clicking phone/SMS switch buttons."""
+    handle = await email_input.element_handle()
+    if not handle:
+        return False
+    result = await page.evaluate(
+        r"""(input) => {
+            const visible = (el) => {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const label = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+            const meta = (el) => [
+                label(el),
+                el?.getAttribute?.('aria-label') || '',
+                el?.getAttribute?.('title') || '',
+                el?.getAttribute?.('data-testid') || '',
+                el?.getAttribute?.('data-provider') || '',
+                el?.getAttribute?.('name') || '',
+                el?.getAttribute?.('type') || '',
+                el?.outerHTML || ''
+            ].join(' ').toLowerCase();
+            const hasEmailValue = () => String(input.value || '').includes('@');
+            const isSocial = (el) => /google|apple|microsoft|github|sso|oauth|social|provider/.test(meta(el));
+            const isPhoneSwitch = (el) => /phone|mobile|sms|tel|\u7535\u8bdd\u53f7\u7801|\u624b\u673a\u53f7|\u624b\u673a|\u96fb\u8a71\u756a\u53f7|\u643a\u5e2f/.test(meta(el));
+            const isEmailSwitch = (el) => /continue with email|email address|\u7535\u5b50\u90ae\u4ef6|\u90ae\u7bb1/.test(meta(el));
+            const isWanted = (el) => {
+                if (isSocial(el) || isPhoneSwitch(el) || isEmailSwitch(el)) return false;
+                const value = label(el).toLowerCase();
+                if (/^(continue|next|submit|log in|sign in|sign up|create)$/.test(value)) return true;
+                if (/^(\u7ee7\u7eed|\u4e0b\u4e00\u6b65|\u767b\u5f55|\u6ce8\u518c)$/.test(value)) return true;
+                return /\b(continue|next)\b/.test(value) || /\u7ee7\u7eed|\u4e0b\u4e00\u6b65/.test(value);
+            };
+            const activate = (target) => {
+                target.scrollIntoView({ block: 'center', inline: 'nearest' });
+                target.focus?.();
+                target.click();
+            };
+            const form = input.closest('form');
+            const scopes = [
+                form,
+                input.closest('[data-testid]'),
+                input.closest('section'),
+                input.closest('main'),
+                input.closest('[role="main"]')
+            ].filter(Boolean);
+            for (const scope of scopes) {
+                const buttons = [...scope.querySelectorAll('button, input[type=submit]')]
+                    .filter((el) => visible(el) && !el.disabled);
+                const wanted = buttons.find(isWanted);
+                if (wanted) {
+                    activate(wanted);
+                    return { ok: true, mode: 'button', label: label(wanted) };
+                }
+                const safeSubmit = buttons.filter((el) => {
+                    const type = String(el.getAttribute?.('type') || '').toLowerCase();
+                    return !isSocial(el) && !isPhoneSwitch(el) && !isEmailSwitch(el) && (type === 'submit' || el.tagName === 'BUTTON');
+                });
+                if (form && scope === form && safeSubmit.length === 1) {
+                    activate(safeSubmit[0]);
+                    return { ok: true, mode: 'single-form-button', label: label(safeSubmit[0]) };
+                }
+            }
+            input.focus();
+            input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter' }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter', code: 'Enter' }));
+            if (form && typeof form.requestSubmit === 'function' && hasEmailValue()) {
+                try {
+                    form.requestSubmit();
+                    return { ok: true, mode: 'form-request-submit' };
+                } catch (e) {}
+            }
+            return { ok: false, mode: 'not-found' };
+        }""",
+        handle,
+    )
+    if isinstance(result, dict) and result.get("ok"):
         await settle(page)
         return True
     return False

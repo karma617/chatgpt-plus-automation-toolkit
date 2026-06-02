@@ -10,9 +10,10 @@ from typing import Any
 from .storage import MailAccount
 from .utils import load_config, load_env, log, resolve_path
 from .paypal_register import run_paypal_register, LINK_POOL_FILE, register_one
-from .paypal_pay import run_paypal_pay, PENDING_AUTH_FILE, PAYPAL_OUTPUT_ROOT, is_local_random_card_mode
+from .paypal_pay import load_link_pool, run_paypal_pay, PENDING_AUTH_FILE, PAYPAL_OUTPUT_ROOT, is_local_random_card_mode
 from .paypal_card_pool import CardPool
 from .paypal_card_redeem import ensure_card_supply
+from .proxy_config import paypal_register_local_proxy_url, paypal_register_proxy_enabled, paypal_register_proxy_file
 from .paypal_phone_pool import PhonePool
 from .proxy_pool import ProxyPool
 from .storage import parse_mail_line
@@ -109,8 +110,7 @@ def _count_lines(path: str) -> int:
 def _normalize_mail_source(value: str) -> str:
     source = (value or "").strip().lower()
     aliases = {
-        "hotmail": "hotmail_graph",
-        "hotmail_graph": "hotmail_graph",
+        "hotmail": "hotmail",
         "icloud": "icloud_query",
         "icloud_query": "icloud_query",
         "moemail": "moemail",
@@ -121,7 +121,7 @@ def _normalize_mail_source(value: str) -> str:
 def _mail_source_label(source: str) -> str:
     labels = {
         "moemail": "自建邮箱池 (MoeMail)",
-        "hotmail_graph": "微软邮箱 (Hotmail / Outlook)",
+        "hotmail": "微软邮箱 (Hotmail / Outlook)",
         "icloud_query": "iCloud 查询邮箱",
     }
     return labels.get(source, source)
@@ -223,7 +223,7 @@ def interactive_paypal(config_path: str = "config.yaml", cfg: dict[str, Any] | N
         accounts_file = str(mail_cfg.get("accounts_file") or "")
         source_pool_count = _count_accounts_file(accounts_file) if accounts_file else 0
 
-        link_count = _count_lines(str(LINK_POOL_FILE))
+        link_count = len(load_link_pool())
         pending_count = _count_authorizable_pending(str(PENDING_AUTH_FILE), str(PAYPAL_OUTPUT_ROOT / "授权成功"))
         card_count = CardPool(cards_file).count()
         local_random_mode = is_local_random_card_mode(env)
@@ -295,61 +295,57 @@ def interactive_paypal(config_path: str = "config.yaml", cfg: dict[str, Any] | N
 
         elif choice in {"5", "6"}:
             use_local_random_mode = choice == "6"
-            if phone_pool.count() <= 0:
-                ui_error("手机号池为空，请在 data/paypal/phones.txt 添加手机号")
-                continue
-
-            if source_pool_count > 0:
-                max_count = max(1, min(source_pool_count, phone_pool.count()))
-            else:
-                max_count = max(1, phone_pool.count())
+            resume_link_count = len(load_link_pool())
+            resume_pending_count = pending_count
+            max_count = max(1, source_pool_count, resume_link_count, resume_pending_count, phone_pool.count())
             count = ask_positive_int("全自动处理几个", default=1, max_value=max_count)
             workers_reg = ask_positive_int("流程1并发数", default=1, max_value=count)
-            workers_pay = ask_positive_int("流程2并发数", default=1, max_value=min(count, phone_pool.count()))
+            workers_pay = ask_positive_int("流程2并发数", default=1, max_value=max(1, min(count, max(1, phone_pool.count()))))
             workers_auth = ask_positive_int("流程3并发数", default=1, max_value=count)
 
             # 流程1：生成长链接
             reg_success = asyncio.run(run_paypal_register(cfg, count=count, workers=workers_reg))
-            if reg_success <= 0:
-                ui_error("流程1未生成可用长链接，全自动已停止")
-                continue
 
             # 刷新资源计数
-            link_count_after = _count_lines(str(LINK_POOL_FILE))
+            link_count_after = len(load_link_pool())
+            pending_after = _count_authorizable_pending(str(PENDING_AUTH_FILE), str(PAYPAL_OUTPUT_ROOT / "授权成功"))
             phone_count_after = PhonePool(phones_file, max_uses=int(env.get("PAYPAL_PHONE_MAX_USES") or 5)).count()
-            if link_count_after <= 0:
+            if reg_success <= 0 and link_count_after <= 0 and pending_after <= 0:
                 ui_error("流程1后长链接池仍为空，全自动已停止")
-                continue
-            if phone_count_after <= 0:
-                ui_error("流程2前手机号池为空，全自动已停止")
                 continue
 
             # 流程2：PayPal 支付
-            if not use_local_random_mode:
-                desired_cards = min(link_count_after, phone_count_after, count)
-                ensure_card_supply(env, desired_cards, log_prefix="PayPal 流程2")
-                card_count_after = CardPool(cards_file).count()
-                if card_count_after <= 0:
-                    ui_error("流程2前卡池为空，且自动兑换未获取到可用卡，全自动已停止")
+            pay_success = 0
+            if link_count_after > 0:
+                if phone_count_after <= 0:
+                    ui_error("流程2前手机号池为空，全自动已停止")
                     continue
-                pay_target = min(count, link_count_after, card_count_after, phone_count_after)
-            else:
-                pay_target = min(count, link_count_after, phone_count_after)
-            pay_workers = min(workers_pay, pay_target, phone_count_after)
-            pay_mode = "local_random" if use_local_random_mode else "real"
-            pay_success = asyncio.run(
-                run_paypal_pay(cfg, count=pay_target, workers=max(1, pay_workers), card_source_mode=pay_mode)
-            )
-            if pay_success <= 0:
-                ui_error("流程2未产生待授权账号，全自动已停止")
-                continue
+                if not use_local_random_mode:
+                    desired_cards = min(link_count_after, phone_count_after, count)
+                    ensure_card_supply(env, desired_cards, log_prefix="PayPal 流程2")
+                    card_count_after = CardPool(cards_file).count()
+                    if card_count_after <= 0:
+                        ui_error("流程2前卡池为空，且自动兑换未获取到可用卡，全自动已停止")
+                        continue
+                    pay_target = min(count, link_count_after, card_count_after, phone_count_after)
+                else:
+                    pay_target = min(count, link_count_after, phone_count_after)
+                pay_workers = min(workers_pay, pay_target, phone_count_after)
+                pay_mode = "local_random" if use_local_random_mode else "real"
+                pay_success = asyncio.run(
+                    run_paypal_pay(cfg, count=pay_target, workers=max(1, pay_workers), card_source_mode=pay_mode)
+                )
 
             # 流程3：授权落盘
             pending_after = _count_authorizable_pending(str(PENDING_AUTH_FILE), str(PAYPAL_OUTPUT_ROOT / "授权成功"))
+            if pay_success <= 0 and pending_after <= 0:
+                ui_error("流程2未产生待授权账号，全自动已停止")
+                continue
+
             if pending_after <= 0:
                 ui_error("流程2后待授权池为空，全自动已停止")
                 continue
-            auth_target = min(pay_success, pending_after)
+            auth_target = min(count, pending_after if pending_after > 0 else pay_success)
             auth_workers = min(workers_auth, auth_target)
             return _run_paypal_authorize(count=auth_target, workers=max(1, auth_workers))
 
@@ -396,21 +392,23 @@ def _run_paypal_session_export(cfg: dict[str, Any] | None = None) -> int:
     PAYPAL_SESSIOND_DIR.mkdir(parents=True, exist_ok=True)
     env = load_env(".env")
 
-    # 复用流程1（日本代理）开关与代理池来源
-    use_proxy = (env.get("PAYPAL_REGISTER_USE_PROXY") or env.get("PAYPAL_USE_PROXY") or "").strip().lower() in ("true", "1", "yes")
+    # 复用流程1（日本代理）开关与代理池来源；未启用时走本地代理。
+    use_proxy = paypal_register_proxy_enabled(env)
     proxy_pool: ProxyPool | None = None
+    fallback_proxy = ""
     if use_proxy:
-        proxy_file = (
-            env.get("PAYPAL_REGISTER_PROXY_FILE")
-            or env.get("PAYPAL_PROXY_FILE")
-            or env.get("PROXY_FILE")
-            or "data/proxies/proxies.txt"
-        )
+        proxy_file = paypal_register_proxy_file(env)
         proxy_pool = ProxyPool(proxy_file)
         if proxy_pool.count() <= 0:
-            log(f"PayPal 流程3 Session 导出：流程1代理已开启但代理池为空: {proxy_file}")
+            fallback_proxy = paypal_register_local_proxy_url(env)
+            proxy_pool = None
+            log(f"PayPal 流程3 Session 导出：流程1代理池为空，改用本地代理: {proxy_file} -> {fallback_proxy or 'direct'}")
         else:
-            log(f"PayPal 流程3 Session 导出：已启用流程1代理，代理数={proxy_pool.count()}")
+            log(f"PayPal 流程3 Session 导出：已启用流程1代理，代理池={proxy_file}，代理数={proxy_pool.count()}")
+    else:
+        fallback_proxy = paypal_register_local_proxy_url(env)
+        if fallback_proxy:
+            log(f"PayPal 流程3 Session 导出：流程1代理关闭，使用本地代理: {fallback_proxy}")
 
     paid_records = session_export.read_paid_records(str(PENDING_AUTH_FILE))
     cache_records = session_export.load_session_cache(cache_path)
@@ -425,7 +423,7 @@ def _run_paypal_session_export(cfg: dict[str, Any] | None = None) -> int:
         lookup = _build_account_lookup(cfg)
         hydrated = 0
         for idx, record in enumerate(missing, 1):
-            proxy = proxy_pool.pick(idx) if proxy_pool else None
+            proxy = proxy_pool.pick(idx) if proxy_pool else fallback_proxy or None
             ok = asyncio.run(
                 _hydrate_session_via_flow1_login(
                     record,
@@ -458,6 +456,12 @@ def _run_paypal_session_export(cfg: dict[str, Any] | None = None) -> int:
     success = int(result.get("success", 0) or 0)
     total = int(result.get("total", 0) or 0)
     skipped = int(len(result.get("skipped") or []))
+    if success > 0:
+        from . import paypal_flow_state
+
+        paypal_flow_state.mark_completed_many(
+            {str(item.get("email") or "").strip().lower() for item in result.get("outputs") or []}
+        )
     log(f"PayPal 流程3 Session 导出完成: 成功={success}/{total}，跳过={skipped}，输出={output_root}")
     if success > 0:
         log(f"PayPal 流程3 Session 单账号 SUB 目录: {output_root / 'sub2api_session'}")

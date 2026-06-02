@@ -20,6 +20,8 @@ def test_get_panel_files_resolves_known_paths(tmp_path: Path) -> None:
         "hotmail_accounts": "data/hotmail/accounts.txt",
         "register_only_sessions": "output/register_only/registered_sessions.txt",
         "register_only_used": "output/register_only/used_emails.txt",
+        "paypal_flow_state": "output/register_only/paypal_flow_state.json",
+        "paypal_flow_discarded": "output/register_only/paypal_flow_discarded_emails.txt",
         "paypal_links": "output/paypal注册/长链接账号/account.txt",
         "paypal_pending_auth": "output/paypal注册/待授权账号/account.txt",
     }
@@ -44,8 +46,14 @@ def test_register_only_files_have_stable_keys_paths_and_labels(tmp_path: Path) -
 
     sessions = files["register_only_sessions"]
     used = files["register_only_used"]
+    state = files["paypal_flow_state"]
+    discarded = files["paypal_flow_discarded"]
 
     assert sessions.path == tmp_path / "output" / "register_only" / "registered_sessions.txt"
     assert used.path == tmp_path / "output" / "register_only" / "used_emails.txt"
+    assert state.path == tmp_path / "output" / "register_only" / "paypal_flow_state.json"
+    assert discarded.path == tmp_path / "output" / "register_only" / "paypal_flow_discarded_emails.txt"
     assert sessions.label == _u(r"\u4ec5\u6ce8\u518c Session \u6e05\u5355")
     assert used.label == _u(r"\u4ec5\u6ce8\u518c\u5df2\u7528\u90ae\u7bb1")
+    assert state.label == _u(r"PayPal \u6d41\u7a0b\u72b6\u6001")
+    assert discarded.label == _u(r"PayPal \u624b\u52a8\u5f03\u7f6e")

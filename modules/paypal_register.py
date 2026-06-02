@@ -17,7 +17,9 @@ from .checkout import create_plus_checkout_link, get_chatgpt_session
 from .free_browser_flow import FreeBrowserFlow
 from .free_register import FreeProfile, FreeRegisterError, generate_free_profile, random_birth_date
 from .mail_provider import MailProvider
+from .proxy_config import paypal_register_local_proxy_url, paypal_register_proxy_enabled, paypal_register_proxy_file
 from .proxy_pool import ProxyPool
+from . import paypal_flow_state
 from . import session_export
 from .storage import MailAccount, parse_mail_line
 from .utils import load_env, log, now_utc, resolve_path, safe_filename
@@ -31,6 +33,23 @@ PAYPAL_SESSIOND_DIR = PAYPAL_OUTPUT_ROOT / "sessiond"
 PAYPAL_SESSION_CACHE_FILE = PAYPAL_SESSIOND_DIR / "session_cache.jsonl"
 ICLOUD_DEFAULT_FILE = resolve_path("data/paypal/icloud_accounts.txt")
 EXTERNAL_MAIL_FETCH_MODE_IMAP163 = {"desktop_imap163", "external_imap163", "imap163"}
+REGISTER_ONLY_SUMMARY_FILE = resolve_path("output/register_only/registered_sessions.txt")
+REGISTER_ONLY_FLOW1_USED_FILE = resolve_path("output/register_only/paypal_flow1_used_emails.txt")
+PAYPAL_PENDING_AUTH_FILE = PAYPAL_OUTPUT_ROOT / "\u5f85\u6388\u6743\u8d26\u53f7" / "account.txt"
+_LAST_RUN_DETAIL: dict[str, str] = {"message": "", "account": "", "path": ""}
+
+
+def _set_last_run_detail(message: str = "", *, account: str = "", path: str = "") -> None:
+    _LAST_RUN_DETAIL.clear()
+    _LAST_RUN_DETAIL.update({"message": message, "account": account, "path": path})
+
+
+def get_last_run_detail() -> dict[str, str]:
+    return dict(_LAST_RUN_DETAIL)
+
+
+def reset_last_run_detail() -> None:
+    _set_last_run_detail()
 
 
 def _is_network_navigation_error(exc: Exception) -> bool:
@@ -102,6 +121,29 @@ def already_in_link_pool() -> set[str]:
     }
 
 
+def _load_register_only_flow1_used_emails() -> set[str]:
+    if not REGISTER_ONLY_FLOW1_USED_FILE.exists():
+        return set()
+    used: set[str] = set()
+    for line in REGISTER_ONLY_FLOW1_USED_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        email = line.split("\t", 1)[0].strip().lower()
+        if email and "@" in email:
+            used.add(email)
+    return used
+
+
+def _mark_register_only_flow1_used(email: str) -> None:
+    value = (email or "").strip().lower()
+    if not value or "@" not in value:
+        return
+    REGISTER_ONLY_FLOW1_USED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    existing = _load_register_only_flow1_used_emails()
+    if value in existing:
+        return
+    with REGISTER_ONLY_FLOW1_USED_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(value + "\n")
+
+
 def _load_domain163_used_emails() -> set[str]:
     if not DOMAIN163_USED_FILE.exists():
         return set()
@@ -125,10 +167,13 @@ def _mark_domain163_email_used(email: str) -> None:
         fh.write(value + "\n")
 
 
-def save_to_link_pool(email: str, query_code: str, payment_link: str) -> None:
+def save_to_link_pool(email: str, query_code: str, payment_link: str, account_line: str | None = None) -> None:
     LINK_POOL_DIR.mkdir(parents=True, exist_ok=True)
+    raw = str(account_line or "").strip()
+    prefix = raw if raw and raw.split("----", 1)[0].strip().lower() == email.strip().lower() else f"{email}----{query_code}"
     with LINK_POOL_FILE.open("a", encoding="utf-8") as f:
-        f.write(f"{email}----{query_code}----{payment_link}\n")
+        f.write(f"{prefix}----{payment_link}\n")
+    paypal_flow_state.mark_link_ready(email, account_line=prefix, payment_link=payment_link)
 
 
 def remove_from_icloud_file(email: str, path: Path | None = None) -> None:
@@ -177,8 +222,7 @@ def _generate_imap163_pending(count: int, done: set[str], domain: str) -> list[t
 def _normalize_mail_source(value: str) -> str:
     source = (value or "").strip().lower()
     aliases = {
-        "hotmail": "hotmail_graph",
-        "hotmail_graph": "hotmail_graph",
+        "hotmail": "hotmail",
         "icloud": "icloud_query",
         "icloud_query": "icloud_query",
         "moemail": "moemail",
@@ -217,6 +261,34 @@ def _load_accounts_from_file(path: Path, done: set[str]) -> list[MailAccount]:
             continue
         accounts.append(account)
     return accounts
+
+
+def _merge_accounts(*groups: list[MailAccount], done: set[str] | None = None) -> list[MailAccount]:
+    blocked = done or set()
+    seen: set[str] = set()
+    merged: list[MailAccount] = []
+    for group in groups:
+        for account in group:
+            email = account.email.strip().lower()
+            if not email or email in blocked or email in seen:
+                continue
+            seen.add(email)
+            merged.append(account)
+    return merged
+
+
+def _load_registered_flow1_accounts(done: set[str]) -> list[MailAccount]:
+    return _load_accounts_from_file(REGISTER_ONLY_SUMMARY_FILE, done)
+
+
+def _mail_source_for_registered_account(account: MailAccount, fallback: str) -> str:
+    if account.client_id and account.refresh_token:
+        return "hotmail"
+    if str(account.mail_url or "").strip().lower() == "imap163":
+        return "domain163"
+    if account.email.strip().lower().endswith("@icloud.com"):
+        return "icloud_query"
+    return fallback
 
 
 def _append_mail_accounts(path: Path, accounts: list[MailAccount]) -> int:
@@ -424,11 +496,7 @@ async def register_one(
             billing_country = env.get("PAYPAL_BILLING_COUNTRY") or "US"
             chatgpt_cfg = {**cfg["chatgpt"], "billing_country": billing_country, "currency": "USD"}
             payment_link = await create_plus_checkout_link(page, access_token, chatgpt_cfg)
-        source_format = (
-            "hotmail_graph"
-            if account.client_id and account.refresh_token
-            else ("icloud_query" if email.lower().endswith("@icloud.com") else "code_address")
-        )
+        source_format = "hotmail" if account.client_id and account.refresh_token else ("icloud_query" if email.lower().endswith("@icloud.com") else "code_address")
         code_address = (account.code_address or account.mail_url or "").strip()
         session_record = session_export.extract_session_record(
             chatgpt_session,
@@ -477,110 +545,96 @@ async def run_paypal_register(
     selected_email: str | None = None,
 ) -> int:
     """Batch run flow-1 (register + payment link)."""
+    reset_last_run_detail()
     env = load_env(".env")
     active_source = _active_mail_source(cfg)
     mail_cfg = cfg.get("mail", {})
     accounts_file = resolve_path(str(mail_cfg.get("accounts_file") or ""))
     raw_pool_file = resolve_path(str(mail_cfg.get("raw_pool_file") or ""))
     icloud_file = resolve_path(env.get("PAYPAL_ICLOUD_FILE") or "data/paypal/icloud_accounts.txt")
-    done = already_in_link_pool()
+    paypal_flow_state.sync_from_files(
+        registered_file=REGISTER_ONLY_SUMMARY_FILE,
+        link_file=LINK_POOL_FILE,
+        pending_file=PAYPAL_PENDING_AUTH_FILE,
+    )
+    existing_links = paypal_flow_state.active_link_emails(LINK_POOL_FILE, selected_email=selected_email or "")
+    done = paypal_flow_state.flow1_blocked_emails(link_file=LINK_POOL_FILE, pending_file=PAYPAL_PENDING_AUTH_FILE)
     if active_source == "domain163":
         done |= _load_domain163_used_emails()
-    pending_accounts: list[MailAccount] = []
-
-    if active_source in {"hotmail_graph", "moemail", "domain163"}:
-        pending_accounts = _load_accounts_from_file(accounts_file, done)
-    elif active_source == "icloud_query":
-        pending_accounts = _load_accounts_from_file(accounts_file, done)
-        if not pending_accounts:
-            # Backward-compatible fallback for old PayPal iCloud file.
-            legacy_accounts = load_icloud_accounts(icloud_file)
-            pending_accounts = [
-                MailAccount(email=e, mail_url=q, raw=f"{e}----{q}")
-                for e, q in legacy_accounts
-                if e.lower() not in done
-            ]
-    else:
-        pending_accounts = _load_accounts_from_file(accounts_file, done)
-
-    if active_source == "domain163":
-        domain = _domain163_fixed_domain()
-        before_filter = len(pending_accounts)
-        pending_accounts = [item for item in pending_accounts if _is_domain163_account(item, domain)]
-        dropped = before_filter - len(pending_accounts)
-        if dropped > 0:
-            log(f"PayPal flow1: source=domain163, dropped {dropped} non-domain or non-imap163 accounts")
-        if not selected_email:
-            need = max(0, int(count) - len(pending_accounts))
-            if need > 0:
-                generated = [
-                    MailAccount(email=e, mail_url=q, raw=f"{e}----{q}")
-                    for e, q in _generate_imap163_pending(need, done, domain)
-                ]
-                written_accounts = _append_mail_accounts(accounts_file, generated)
-                written_pool = _append_mail_accounts(raw_pool_file, generated)
-                pending_accounts.extend(generated)
-                log(
-                    "PayPal flow1: source=domain163, auto-generated and persisted "
-                    f"{len(generated)} accounts (accounts+{written_accounts}, pool+{written_pool})"
-                )
+    pending_accounts = _load_registered_flow1_accounts(done)
 
     if selected_email:
         before_count = len(pending_accounts)
         pending_accounts = filter_accounts_by_email(pending_accounts, selected_email)
         if not pending_accounts:
-            log(
-                f"PayPal flow1: selected email not found or already used: "
+            if existing_links:
+                reused = min(count, len(existing_links))
+                message = (
+                    f"selected email already has unfinished payment link; "
+                    f"reused existing unfinished links={reused}/{len(existing_links)}; "
+                    "next=paypal-flow2/paypal-auto"
+                )
+                log(
+                    f"PayPal flow1: selected email already has unfinished payment link; "
+                    f"reuse existing links {reused}/{len(existing_links)}"
+                )
+                _set_last_run_detail(message, account=selected_email, path=str(LINK_POOL_FILE))
+                return reused
+            message = (
+                f"selected email not found or already used: "
                 f"{selected_email} | source={active_source} | pool_count={before_count}"
             )
+            log(
+                f"PayPal flow1: {message}"
+            )
+            _set_last_run_detail(message, account=selected_email, path=str(REGISTER_ONLY_SUMMARY_FILE))
             return 0
 
     if not pending_accounts:
-        if active_source in {"moemail", "domain163"} and (
-            active_source == "domain163" or _external_imap163_enabled(env)
-        ):
-            domain = _domain163_fixed_domain() if active_source == "domain163" else _resolve_imap163_domain(env)
-            if domain:
-                pending_accounts = [
-                    MailAccount(email=e, mail_url=q, raw=f"{e}----{q}")
-                    for e, q in _generate_imap163_pending(count, done, domain)
-                ]
-                log(f"PayPal flow1: source={active_source}, pool empty, auto-generated {len(pending_accounts)} imap163 emails")
-            else:
-                log("PayPal flow1: source=moemail, pool empty and IMAP163_FORWARD_DOMAIN is not configured")
-                return 0
-        else:
-            log(f"PayPal flow1: no pending accounts for source={active_source}")
-            return 0
+        if existing_links:
+            reused = min(count, len(existing_links))
+            message = (
+                f"no new registered accounts; reused existing unfinished links="
+                f"{reused}/{len(existing_links)}; next=paypal-flow2/paypal-auto"
+            )
+            log(
+                f"PayPal flow1: no new registered accounts; reuse existing unfinished links "
+                f"{reused}/{len(existing_links)} from {LINK_POOL_FILE}"
+            )
+            _set_last_run_detail(message, path=str(LINK_POOL_FILE))
+            return reused
+        message = f"no pending registered accounts in {REGISTER_ONLY_SUMMARY_FILE}"
+        log(f"PayPal flow1: {message}")
+        _set_last_run_detail(message, path=str(REGISTER_ONLY_SUMMARY_FILE))
+        return 0
 
-    use_proxy = (env.get("PAYPAL_REGISTER_USE_PROXY") or env.get("PAYPAL_USE_PROXY") or "").strip().lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    use_proxy = paypal_register_proxy_enabled(env)
     proxy_pool: ProxyPool | None = None
+    fallback_proxy = ""
     if use_proxy:
-        proxy_file = (
-            env.get("PAYPAL_REGISTER_PROXY_FILE")
-            or env.get("PAYPAL_PROXY_FILE")
-            or env.get("PROXY_FILE")
-            or "data/proxies/proxies.txt"
-        )
+        proxy_file = paypal_register_proxy_file(env)
         proxy_pool = ProxyPool(proxy_file)
         if proxy_pool.count() == 0:
-            log(f"PayPal flow1: proxy is enabled but pool is empty: {proxy_file}")
-            return 0
-        log(f"PayPal flow1: proxy enabled, pool size={proxy_pool.count()}")
-        # Preflight check first proxy to fail fast with actionable reason.
-        first_proxy = proxy_pool.pick(1)
-        if first_proxy:
-            ok, reason = _probe_proxy(first_proxy)
-            if not ok:
-                log(f"PayPal flow1: proxy precheck failed: {reason}")
-                log("PayPal flow1: cliproxy is required for JP region, stop this run")
-                return 0
-            else:
-                log("PayPal flow1: proxy precheck passed")
+            fallback_proxy = paypal_register_local_proxy_url(env)
+            proxy_pool = None
+            log(f"PayPal flow1: proxy pool empty, fallback local proxy: {proxy_file} -> {fallback_proxy or 'direct'}")
+        if proxy_pool is not None:
+            log(f"PayPal flow1: proxy enabled, pool size={proxy_pool.count()}, file={proxy_file}")
+            # Preflight check first proxy to fail fast with actionable reason.
+            first_proxy = proxy_pool.pick(1)
+            if first_proxy:
+                ok, reason = _probe_proxy(first_proxy)
+                if not ok:
+                    log(f"PayPal flow1: proxy precheck failed: {reason}")
+                    log("PayPal flow1: cliproxy is required for JP region, stop this run")
+                    _set_last_run_detail(f"proxy precheck failed: {reason}", path=str(proxy_file))
+                    return 0
+                else:
+                    log("PayPal flow1: proxy precheck passed")
+    else:
+        fallback_proxy = paypal_register_local_proxy_url(env)
+        if fallback_proxy:
+            log(f"PayPal flow1: proxy disabled, using local proxy: {fallback_proxy}")
 
     target = min(count, len(pending_accounts))
     log(f"PayPal flow1: source={active_source}, pending={len(pending_accounts)}, target={target}, workers={workers}")
@@ -591,22 +645,16 @@ async def run_paypal_register(
     async def worker(index: int, account: MailAccount) -> None:
         nonlocal success
         async with sem:
-            proxy = proxy_pool.pick(index) if proxy_pool else None
+            proxy = proxy_pool.pick(index) if proxy_pool else fallback_proxy or None
             if proxy:
                 log(f"[paypal-reg-{index:02d}] using proxy: {proxy}")
-            link = await register_one(account, active_source, cfg, worker_id=index, proxy=proxy)
+            account_mail_source = _mail_source_for_registered_account(account, active_source)
+            link = await register_one(account, account_mail_source, cfg, worker_id=index, proxy=proxy)
             if link:
                 code_address = account.code_address or "mail"
-                save_to_link_pool(account.email, code_address, link)
-                # Register success consumes one mailbox account from selected source pool.
+                save_to_link_pool(account.email, code_address, link, account_line=account.raw)
                 if active_source == "domain163":
                     _mark_domain163_email_used(account.email)
-                    if accounts_file and accounts_file.exists():
-                        _remove_from_account_file(account.email, accounts_file)
-                elif code_address != "imap163" and accounts_file and accounts_file.exists():
-                    _remove_from_account_file(account.email, accounts_file)
-                elif code_address != "imap163" and active_source == "icloud_query":
-                    remove_from_icloud_file(account.email, icloud_file)
                 success += 1
 
     tasks = [
@@ -614,5 +662,7 @@ async def run_paypal_register(
         for i, account in enumerate(pending_accounts[:target])
     ]
     await asyncio.gather(*tasks)
+    message = f"created payment links={success}/{target}; next=paypal-flow2/paypal-auto"
     log(f"PayPal flow1 done: success={success}/{target}")
+    _set_last_run_detail(message, path=str(LINK_POOL_FILE))
     return success

@@ -76,7 +76,7 @@ if (-not $ExistingDistRoot -and $ExistingDistCandidates.Count -gt 0) {
 
 $DistOutputRoot = Join-Path $ProjectRoot "dist"
 $DistRoot = Join-Path $DistOutputRoot "ChatGPTAssistantPanel"
-$RuntimeStateDirs = @("data")
+$RuntimeStateDirs = @("data", "output")
 $RuntimeStateFiles = @(".env", "config.yaml")
 $RuntimeBackupRoot = Join-Path $ProjectRoot "build\_dist_runtime_backup"
 
@@ -122,7 +122,7 @@ if (-not (Test-Path $DistRoot)) {
     throw "PyInstaller output not found: $DistRoot"
 }
 
-$CopyDirs = @("data")
+$CopyDirs = @("data", "output")
 foreach ($dir in $CopyDirs) {
     $src = Join-Path $ProjectRoot $dir
     $dst = Join-Path $DistRoot $dir
@@ -192,7 +192,7 @@ if ($IncludePlaywrightBrowsers) {
 }
 
 # Minimal package: do not bundle runtime artifacts that can grow very large.
-foreach ($name in @("profiles", "output", "logs")) {
+foreach ($name in @("profiles", "logs")) {
     $path = Join-Path $DistRoot $name
     if (Test-Path $path) {
         Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue

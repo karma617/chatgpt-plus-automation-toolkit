@@ -19,6 +19,7 @@ from modules.checkout import create_plus_checkout_link, get_chatgpt_session
 from modules.mail_provider import MailProvider
 from modules.moemail_factory import create_moemail_accounts, moemail_api_enabled, split_domains
 from modules.proxy_pool import ProxyPool
+from modules.proxy_config import register_local_proxy_url
 from modules.storage import AccountStore
 from modules.utils import (
     env_bool,
@@ -169,7 +170,6 @@ def configure_mail_source(cfg: dict, source_name: str) -> None:
     source_name = (source_name or "").strip().lower()
     aliases = {
         "hotmail": "hotmail",
-        "hotmail_graph": "hotmail",
         "moemail": "moemail",
         "domain163": "domain163",
         "domain": "domain163",
@@ -288,6 +288,10 @@ def create_proxy_pool(cfg: dict) -> ProxyPool | None:
     return proxy_pool
 
 
+def fallback_proxy_from_env() -> str:
+    return register_local_proxy_url(load_env(".env"))
+
+
 def display_proxy(proxy: str | None) -> str:
     if not proxy:
         return "not-set"
@@ -312,6 +316,10 @@ def make_sms_args(args: argparse.Namespace | None = None) -> argparse.Namespace:
         grizzly_service="",
         grizzly_country_top_n=None,
         grizzly_provider_threshold=None,
+        smsbower_api_key="",
+        smsbower_service="",
+        smsbower_country_top_n=None,
+        smsbower_provider_threshold=None,
     )
 
 
@@ -399,7 +407,7 @@ async def run_account(
             chatgpt_session,
             email=account.email,
             mail_source=cfg.get("mail", {}).get("active_source", cfg.get("mail", {}).get("source", "")),
-            source_format="hotmail_graph" if account.client_id and account.refresh_token else ("icloud_query" if account.email.lower().endswith("@icloud.com") else "code_address"),
+            source_format="hotmail" if account.client_id and account.refresh_token else ("icloud_query" if account.email.lower().endswith("@icloud.com") else "code_address"),
             code_address=account.code_address,
             payment_link=payment_link,
             profile_dir=str(profile_dir),
@@ -409,14 +417,28 @@ async def run_account(
         log(f"{prefix} 已缓存 Session: {cache_path}")
         await session.__aexit__(None, None, None)
         session = None
-        store.save_success(account.email, account.code_address, payment_link or str(cache_path))
+        register_only_account_line = account.raw or account.email
+        if not create_payment_link and account.client_id and account.refresh_token:
+            register_only_account_line = (
+                f"{account.email}----{account.password or ''}"
+                f"----{account.client_id}----{account.refresh_token}"
+            )
+        store.save_success(
+            account.email,
+            account.code_address,
+            payment_link or str(cache_path),
+            account_line=register_only_account_line if not create_payment_link else None,
+        )
         store.complete(account.email)
         if create_payment_link:
             log(f"{prefix} 成功，已写入 {output_file('flow1_success')}")
         else:
             log(f"{prefix} {LABEL_REGISTER_ONLY_SUCCESS}")
         print()
-        print(f"{account.email}----{account.code_address}----{payment_link or cache_path}")
+        if create_payment_link:
+            print(f"{account.email}----{account.code_address}----{payment_link}")
+        else:
+            print(register_only_account_line)
         return True
     except FatalAccountError as exc:
         await save_failure_artifacts(prefix, account.email, session)
@@ -479,7 +501,7 @@ async def worker_loop(
     while True:
         if not await counter.acquire_slot():
             return
-        proxy = proxy_pool.pick(worker_id) if proxy_pool else None
+        proxy = proxy_pool.pick(worker_id) if proxy_pool else fallback_proxy_from_env() or None
         result = await run_account(cfg, store, worker_id, proxy=proxy, sms_selection=sms_selection)
         if result is None:
             await counter.release_slot(success=False)
@@ -747,7 +769,7 @@ def main() -> int:
     parser.add_argument("--sms-provider", default="", help="流程二/三接码平台: herosms / grizzly")
     parser.add_argument(
         "--mail-source",
-        choices=["moemail", "hotmail", "hotmail_graph", "domain163"],
+        choices=["moemail", "hotmail", "domain163"],
         help="邮箱来源: moemail / hotmail / domain163",
     )
     parser.add_argument("--register-mode", choices=["phone", "email"], default="phone", help="Free 注册模式: phone(默认) / email")
@@ -801,7 +823,7 @@ def main() -> int:
                 cfg,
                 store,
                 worker_id=1,
-                proxy=proxy_pool.pick(1) if proxy_pool else None,
+                proxy=proxy_pool.pick(1) if proxy_pool else fallback_proxy_from_env() or None,
                 sms_selection=sms_selection,
             )
         )

@@ -29,6 +29,40 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
+## 桌面端打包与运行
+
+以下命令均在项目根目录执行。打包脚本会使用根目录的 `build_panel.ps1`，产物输出到 `dist\ChatGPTAssistantPanel`。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_panel.ps1
+```
+
+打包完成后，桌面端入口为：
+
+```powershell
+.\dist\ChatGPTAssistantPanel\ChatGPTAssistantPanel.exe
+```
+
+如果要直接从命令行调用桌面端 runner，可使用：
+
+```powershell
+.\dist\ChatGPTAssistantPanel\ChatGPTAssistantPanel.exe --runner check-config --mail-source hotmail
+.\dist\ChatGPTAssistantPanel\ChatGPTAssistantPanel.exe --runner register-only --count 1 --workers 1 --mail-source hotmail
+.\dist\ChatGPTAssistantPanel\ChatGPTAssistantPanel.exe --runner paypal-flow1 --count 1 --workers 1 --mail-source hotmail
+.\dist\ChatGPTAssistantPanel\ChatGPTAssistantPanel.exe --runner paypal-flow2 --count 1 --workers 1
+.\dist\ChatGPTAssistantPanel\ChatGPTAssistantPanel.exe --runner paypal-flow3 --count 1 --workers 1
+```
+
+`build_panel.ps1` 默认会把 Playwright 浏览器缓存复制进桌面端目录；如果只需要最小包，可在打包前关闭复制：
+
+```powershell
+$env:BUILD_INCLUDE_PLAYWRIGHT_BROWSERS="0"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_panel.ps1
+Remove-Item Env:\BUILD_INCLUDE_PLAYWRIGHT_BROWSERS
+```
+
+脚本会保留已有 `dist\ChatGPTAssistantPanel` 内的运行态文件，包括 `data`、`.env`、`config.yaml`，避免重打包时覆盖已消耗的账号池。如果需要强制使用根目录新的 `.env` / `config.yaml` / `data`，请先备份并删除旧的 `dist\ChatGPTAssistantPanel` 目录后再执行打包命令。
+
 ## 快速开始
 
 ```bash
@@ -106,14 +140,15 @@ cp .env.example .env
 #### 邮箱源配置
 
 ```ini
-# 邮箱源选择：moemail / hotmail / icloud_query
+# 邮箱源选择：moemail / hotmail / icloud_query / domain163
 MAIL_SOURCE=moemail
 
 # 各流程可单独指定邮箱源（覆盖全局）
-FLOW1_MAIL_SOURCE=icloud_query
+FLOW1_MAIL_SOURCE=hotmail
+FLOW3_MAIL_SOURCE=hotmail
 FREE_MAIL_SOURCE=moemail
 
-# 邮箱账号模式：pool（从文件读取）
+# 邮箱账号模式：pool（从文件读取）/ api（自动创建）
 MAIL_ACCOUNT_MODE=pool
 ```
 
@@ -216,14 +251,28 @@ CAPSOLVER_API_KEY=your-key
 # 或 2Captcha
 # CAPTCHA_API_PROVIDER=twocaptcha
 # TWOCAPTCHA_API_KEY=your-key
+# 或 YesCaptcha
+# CAPTCHA_API_PROVIDER=yescaptcha
+# YESCAPTCHA_API_KEY=your-key
 ```
 
 #### 授权服务器上传
 
 ```ini
 AUTH_SERVER_UPLOAD=false
-AUTH_SERVER_URL=http://127.0.0.1:8790
-AUTH_SERVER_API_KEY=your-key
+SESSION_EXPORT_SERVER_UPLOAD=false
+AUTH_UPLOAD_TARGET=cpa
+
+# CPA 仓管中心：只需要填写接口地址和 Key。
+# 对应 openai-cpa-wenfxl 的 cpa_mode.api_url / cpa_mode.api_token。
+CPA_SERVER_URL=http://127.0.0.1:8790
+CPA_SERVER_API_KEY=your-cpa-key
+
+# Sub2API 仓管：只需要填写接口地址和 Key。
+# 对应 openai-cpa-wenfxl 的 sub2api_mode.api_url / sub2api_mode.api_key。
+SUB2API_SERVER_URL=https://your-sub2api.example
+SUB2API_API_KEY=your-sub2api-key
+SUB2API_GROUP_IDS=
 ```
 
 ### config.yaml
@@ -333,7 +382,7 @@ python main.py [OPTIONS]
   --country COUNTRY     接码国家（ISO 代码或平台 ID）
   --sms-provider {herosms,grizzly,fivesim}
                         接码平台
-  --mail-source {moemail,hotmail,hotmail_graph}
+  --mail-source {moemail,hotmail,domain163}
                         邮箱源
   --register-mode {phone,email}
                         Free 注册方式（默认 phone）
@@ -391,3 +440,4 @@ ip:port
 - 群号：627501465
 
 ![QQ 群二维码（627501465）](docs/images/qq-group-627501465.jpg)
+

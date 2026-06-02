@@ -38,6 +38,8 @@ def get_panel_files(root: Path | str) -> dict[str, PanelFile]:
         _panel_file(root_path, "mail_pool", "通用邮箱池", "data/mail_pool.txt"),
         _panel_file(root_path, "register_only_sessions", "\u4ec5\u6ce8\u518c Session \u6e05\u5355", "output/register_only/registered_sessions.txt"),
         _panel_file(root_path, "register_only_used", "\u4ec5\u6ce8\u518c\u5df2\u7528\u90ae\u7bb1", "output/register_only/used_emails.txt"),
+        _panel_file(root_path, "paypal_flow_state", "PayPal \u6d41\u7a0b\u72b6\u6001", "output/register_only/paypal_flow_state.json"),
+        _panel_file(root_path, "paypal_flow_discarded", "PayPal \u624b\u52a8\u5f03\u7f6e", "output/register_only/paypal_flow_discarded_emails.txt"),
         _panel_file(root_path, "paypal_links", "PayPal 长链接账号", "output/paypal注册/长链接账号/account.txt"),
         _panel_file(root_path, "paypal_pending_auth", "PayPal 待授权账号", "output/paypal注册/待授权账号/account.txt"),
         _panel_file(root_path, "paypal_authorized_rt", "PayPal 授权 RT 输出", "output/paypal注册/授权成功/account-rt.txt"),
