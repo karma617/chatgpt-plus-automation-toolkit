@@ -207,13 +207,13 @@ def test_paypal_flow1_jp_delegates_to_register_with_jp_region(monkeypatch, capsy
     assert event["status"] == "success"
 
 
-def test_paypal_auto_reuses_existing_link_when_flow1_has_no_new_accounts(monkeypatch, capsys) -> None:
+def test_paypal_auto_reuses_existing_link_when_flow1_reports_reused_link(monkeypatch, capsys) -> None:
     args = panel_runner.parse_args(["paypal-auto-nocard", "--count", "1", "--workers", "1"])
     captured = {}
     pending_calls = {"count": 0}
 
     async def fake_register(*args, **kwargs):
-        return 0
+        return 1
 
     async def fake_pay(*args, **kwargs):
         captured.update(kwargs)
@@ -236,6 +236,74 @@ def test_paypal_auto_reuses_existing_link_when_flow1_has_no_new_accounts(monkeyp
     assert captured["card_source_mode"] == "local_random"
     assert captured["count"] == 1
     assert '"status":"success"' in capsys.readouterr().out
+
+
+def test_paypal_auto_stops_when_flow1_fails_even_if_old_pending_exists(monkeypatch, capsys) -> None:
+    args = panel_runner.parse_args(["paypal-auto-jp-nocard", "--count", "1", "--workers", "1"])
+    calls = []
+
+    async def fake_flow1(*args, **kwargs):
+        calls.append(("flow1", kwargs))
+        return 0
+
+    async def fail_flow2(*args, **kwargs):
+        calls.append(("flow2", kwargs))
+        raise AssertionError("flow2 should not run after flow1 failure")
+
+    def fail_authorize(**kwargs):
+        calls.append(("flow3", kwargs))
+        raise AssertionError("flow3 should not run after flow1 failure")
+
+    monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "run_register_tool_only", lambda *args, **kwargs: SimpleNamespace(ok=True, returncode=0, success_count=1, target_count=1, summary_file="registered.txt"))
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fake_flow1)
+    monkeypatch.setattr(panel_runner, "run_paypal_pay", fail_flow2)
+    monkeypatch.setattr(panel_runner, "_run_paypal_authorize", fail_authorize)
+    monkeypatch.setattr(panel_runner, "_count_flow1_ready_registered", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_payment_links", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_pending_auth", lambda selected_email="": 1)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 1
+    assert [name for name, _kwargs in calls] == ["flow1"]
+    event = json.loads(capsys.readouterr().out)
+    assert event["status"] == "failure"
+    assert "flow1 failed" in event["message"]
+
+
+def test_paypal_auto_stops_when_flow2_fails_even_if_old_pending_exists(monkeypatch, capsys) -> None:
+    args = panel_runner.parse_args(["paypal-auto-jp-nocard", "--count", "1", "--workers", "1"])
+    calls = []
+
+    async def fake_flow1(*args, **kwargs):
+        calls.append(("flow1", kwargs))
+        return 1
+
+    async def fake_flow2(*args, **kwargs):
+        calls.append(("flow2", kwargs))
+        return 0
+
+    def fail_authorize(**kwargs):
+        calls.append(("flow3", kwargs))
+        raise AssertionError("flow3 should not run after flow2 failure")
+
+    monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "run_register_tool_only", lambda *args, **kwargs: SimpleNamespace(ok=True, returncode=0, success_count=1, target_count=1, summary_file="registered.txt"))
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fake_flow1)
+    monkeypatch.setattr(panel_runner, "run_paypal_pay", fake_flow2)
+    monkeypatch.setattr(panel_runner, "_run_paypal_authorize", fail_authorize)
+    monkeypatch.setattr(panel_runner, "_count_flow1_ready_registered", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_payment_links", lambda selected_email="": 1)
+    monkeypatch.setattr(panel_runner, "_count_pending_auth", lambda selected_email="": 1)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 1
+    assert [name for name, _kwargs in calls] == ["flow1", "flow2"]
+    event = json.loads(capsys.readouterr().out)
+    assert event["status"] == "failure"
+    assert "flow2 failed" in event["message"]
 
 
 def test_paypal_auto_jp_nocard_runs_full_jp_chain(monkeypatch, tmp_path, capsys) -> None:

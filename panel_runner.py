@@ -379,13 +379,24 @@ def run_action(args: argparse.Namespace) -> int:
                 link_count = _count_payment_links(args.email)
                 pending_count = _count_pending_auth(args.email)
                 if ready_count <= 0 and link_count <= 0 and pending_count <= 0:
-                    run_register_tool_only(
+                    register_result = run_register_tool_only(
                         cfg,
                         count=target,
                         workers=workers,
                         mail_source=args.mail_source,
                         selected_email=args.email,
                     )
+                    if not register_result.ok:
+                        print(
+                            result_event(
+                                flow,
+                                "failure",
+                                f"register-only failed: completed success={register_result.success_count}/{register_result.target_count} code={register_result.returncode}",
+                                path=str(register_result.summary_file),
+                            ),
+                            flush=True,
+                        )
+                        return register_result.returncode or 1
             reg_success = asyncio.run(
                 run_with_playwright_noise_filter(
                     run_paypal_register(
@@ -398,8 +409,11 @@ def run_action(args: argparse.Namespace) -> int:
                 )
             )
             link_count = _count_payment_links(args.email)
-            pending_count = _count_pending_auth(args.email)
-            if reg_success <= 0 and link_count <= 0 and pending_count <= 0:
+            if reg_success <= 0:
+                detail = f" for selected email {args.email}" if args.email else ""
+                print(result_event(flow, "failure", f"flow1 failed or produced no payment links{detail}"), flush=True)
+                return 1
+            if link_count <= 0:
                 detail = f" for selected email {args.email}" if args.email else ""
                 print(result_event(flow, "failure", f"flow1 produced no payment links{detail}"), flush=True)
                 return 1
@@ -429,6 +443,9 @@ def run_action(args: argparse.Namespace) -> int:
                             )
                         )
                     )
+            if pay_success <= 0:
+                print(result_event(flow, "failure", "flow2 failed or produced no pending auth accounts"), flush=True)
+                return 1
             pending_count = _count_pending_auth(args.email)
             if pay_success <= 0 and pending_count <= 0:
                 print(result_event(flow, "failure", "flow2 produced no pending auth accounts"), flush=True)

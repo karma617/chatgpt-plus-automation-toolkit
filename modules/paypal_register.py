@@ -499,7 +499,7 @@ async def register_one(
             billing = checkout_billing_for_region(region)
             chatgpt_cfg = {**cfg["chatgpt"], "billing_country": billing["country"], "currency": billing["currency"]}
             log(f"{prefix} create Plus checkout link: mode={region.upper()} billing={billing['country']}/{billing['currency']}")
-            payment_link = await create_plus_checkout_link(page, access_token, chatgpt_cfg, checkout_region=region)
+            payment_link = await create_plus_checkout_link(page, access_token, chatgpt_cfg, checkout_region=region, proxy=proxy)
         source_format = "hotmail" if account.client_id and account.refresh_token else ("icloud_query" if email.lower().endswith("@icloud.com") else "code_address")
         code_address = (account.code_address or account.mail_url or "").strip()
         session_record = session_export.extract_session_record(
