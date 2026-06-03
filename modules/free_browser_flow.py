@@ -27,6 +27,211 @@ class FreeBrowserFlow:
     def say(self, message: str) -> None:
         log(f"{self.prefix} {message}")
 
+    async def _turnstile_state(self) -> dict[str, Any]:
+        try:
+            return dict(
+                await self.page.evaluate(
+                    """() => {
+                        const value = (node) => String((node && node.value) || '').trim();
+                        const input = document.querySelector('input[name="cf-turnstile-response"]');
+                        const text = String(document.body?.innerText || '').toLowerCase();
+                        const html = String(document.documentElement?.innerHTML || '').toLowerCase();
+                        const title = String(document.title || '').toLowerCase();
+                        const iframeCount = document.querySelectorAll('iframe[src*="turnstile"], iframe[title*="Cloudflare" i]').length;
+                        const widgetCount = document.querySelectorAll(
+                            'div.cf-turnstile, [data-sitekey], script[src*="turnstile"], input[name="cf-turnstile-response"]'
+                        ).length;
+                        const challengeText = (
+                            title.includes('just a moment') ||
+                            title.includes('cloudflare') ||
+                            text.includes('checking your browser') ||
+                            text.includes('verify you are human') ||
+                            text.includes('\\u8bf7\\u9a8c\\u8bc1\\u60a8\\u662f\\u771f\\u4eba') ||
+                            text.includes('cloudflare') ||
+                            html.includes('cf-turnstile') ||
+                            html.includes('challenges.cloudflare.com') ||
+                            html.includes('__cf_chl') ||
+                            html.includes('cf_chl')
+                        );
+                        const token = value(input);
+                        return {
+                            present: Boolean(input || iframeCount || widgetCount || challengeText),
+                            tokenLength: token.length,
+                            token,
+                            iframeCount,
+                            widgetCount,
+                            challengeText,
+                            title,
+                        };
+                    }"""
+                )
+            )
+        except Exception:
+            return {
+                "present": False,
+                "tokenLength": 0,
+                "token": "",
+                "iframeCount": 0,
+                "widgetCount": 0,
+                "challengeText": False,
+                "title": "",
+            }
+
+    async def has_turnstile_challenge(self) -> bool:
+        state = await self._turnstile_state()
+        return bool(state.get("present")) and int(state.get("tokenLength") or 0) < 80
+
+    async def _sync_turnstile_token(self, token: str) -> int:
+        token = str(token or "").strip()
+        if not token:
+            return 0
+        try:
+            return int(
+                await self.page.evaluate(
+                    """(token) => {
+                        const input = document.querySelector('input[name="cf-turnstile-response"]');
+                        if (!input) return 0;
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                        if (setter) setter.call(input, token);
+                        else input.value = token;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        return String(input.value || '').trim().length;
+                    }""",
+                    token,
+                )
+                or 0
+            )
+        except Exception:
+            return 0
+
+    async def _click_turnstile_widget(self) -> bool:
+        clicked = False
+        for frame in self.page.frames:
+            try:
+                frame_url = str(frame.url or "").lower()
+            except Exception:
+                frame_url = ""
+            if frame != self.page.main_frame and "turnstile" not in frame_url and "cloudflare" not in frame_url:
+                continue
+            selectors = [
+                "input[type='checkbox']",
+                "label",
+                "[role='checkbox']",
+                "button",
+                "body",
+            ]
+            for selector in selectors:
+                try:
+                    loc = frame.locator(selector).first
+                    if await loc.count() <= 0:
+                        continue
+                    await loc.scroll_into_view_if_needed(timeout=700)
+                    await loc.click(timeout=1200, force=True)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if clicked:
+                break
+        if clicked:
+            return True
+        try:
+            return bool(
+                await self.page.evaluate(
+                    """() => {
+                        const visible = (el) => {
+                            const r = el.getBoundingClientRect();
+                            const s = getComputedStyle(el);
+                            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                        };
+                        const nodes = Array.from(document.querySelectorAll(
+                            'div.cf-turnstile, [data-sitekey], iframe[src*="turnstile"], input[name="cf-turnstile-response"]'
+                        ));
+                        for (const node of nodes) {
+                            const target = node.closest('label, div, form') || node;
+                            if (!visible(target)) continue;
+                            target.scrollIntoView({ block: 'center', inline: 'center' });
+                            ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+                                target.dispatchEvent(new MouseEvent(type, {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window,
+                                    screenX: 800 + Math.floor(Math.random() * 400),
+                                    screenY: 400 + Math.floor(Math.random() * 300),
+                                    clientX: Math.max(1, Math.floor(target.getBoundingClientRect().left + 8)),
+                                    clientY: Math.max(1, Math.floor(target.getBoundingClientRect().top + 8)),
+                                }));
+                            });
+                            return true;
+                        }
+                        return false;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def solve_turnstile_if_present(self, timeout_ms: int = 30_000, *, reason: str = "") -> bool:
+        deadline = time.monotonic() + timeout_ms / 1000
+        logged = False
+        last_retry = 0.0
+        while time.monotonic() < deadline:
+            state = await self._turnstile_state()
+            token_len = int(state.get("tokenLength") or 0)
+            if not state.get("present"):
+                return True
+            if token_len >= 80:
+                self.say(f"[Cloudflare] Turnstile passed token_len={token_len}")
+                return True
+            if not logged:
+                suffix = f" ({reason})" if reason else ""
+                self.say(f"[Cloudflare] Turnstile challenge detected{suffix}, waiting token_len={token_len}")
+                logged = True
+            now = time.monotonic()
+            if now - last_retry >= 3:
+                last_retry = now
+                try:
+                    await self.page.evaluate(
+                        """() => {
+                            try {
+                                if (window.turnstile && typeof window.turnstile.reset === 'function') window.turnstile.reset();
+                            } catch {}
+                        }"""
+                    )
+                except Exception:
+                    pass
+                token = str(
+                    await self.page.evaluate(
+                        """() => {
+                            try {
+                                const input = document.querySelector('input[name="cf-turnstile-response"]');
+                                const byInput = String((input && input.value) || '').trim();
+                                if (byInput) return byInput;
+                                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                                    return String(window.turnstile.getResponse() || '').trim();
+                                }
+                            } catch {}
+                            return '';
+                        }"""
+                    )
+                    or ""
+                ).strip()
+                if len(token) >= 80:
+                    synced = await self._sync_turnstile_token(token)
+                    self.say(f"[Cloudflare] Turnstile token synced len={synced}")
+                    return True
+                await self._click_turnstile_widget()
+            await self.sleep(900)
+        state = await self._turnstile_state()
+        return int(state.get("tokenLength") or 0) >= 80 or not state.get("present")
+
+    async def wait_before_cloudflare_submit(self, timeout_ms: int = 30_000, *, reason: str = "") -> None:
+        solved = await self.solve_turnstile_if_present(timeout_ms, reason=reason)
+        if not solved:
+            state = await self._turnstile_state()
+            raise RuntimeError(f"Cloudflare Turnstile not solved before submit token_len={state.get('tokenLength', 0)}")
+
     async def screenshot(self, filename: str) -> None:
         out = resolve_path("output/free_register/debug")
         out.mkdir(parents=True, exist_ok=True)
@@ -59,9 +264,17 @@ class FreeBrowserFlow:
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
             try:
+                await self.solve_turnstile_if_present(min(8_000, max(1_000, timeout_ms)), reason="page-load")
                 title = (await self.page.title()).lower()
                 text = (await self.page.evaluate("() => (document.body?.innerText || '').toLowerCase()"))[:2000]
-                if "just a moment" not in title and "checking your browser" not in text and "cloudflare" not in title:
+                if (
+                    "just a moment" not in title
+                    and "checking your browser" not in text
+                    and "verify you are human" not in text
+                    and "\u8bf7\u9a8c\u8bc1\u60a8\u662f\u771f\u4eba" not in text
+                    and "cloudflare" not in title
+                    and not await self.has_turnstile_challenge()
+                ):
                     return
             except Exception:
                 pass
@@ -221,6 +434,7 @@ class FreeBrowserFlow:
         raise RuntimeError(f"button not found: {'/'.join(candidates)}")
 
     async def click_submit_button(self) -> None:
+        await self.wait_before_cloudflare_submit(30_000, reason="submit")
         clicked = await self.page.evaluate(
             """() => {
                 const visible = (el) => {
@@ -336,6 +550,7 @@ class FreeBrowserFlow:
             if refreshed is not None:
                 email_input = refreshed
             try:
+                await self.wait_before_cloudflare_submit(18_000, reason="email-submit")
                 clicked_form_submit = await asyncio.wait_for(
                     email_input.evaluate(
                         """(el) => {
@@ -800,6 +1015,7 @@ class FreeBrowserFlow:
 
             before = self.page.url
             await self.sleep(120)
+            await self.wait_before_cloudflare_submit(30_000, reason=f"{tag}-profile-submit")
             try:
                 await self.click_button_by_text(["Continue", "继续", "下一步", "Submit", "提交"], timeout_ms=1_500)
             except Exception:

@@ -81,8 +81,8 @@ $DistRoot = Join-Path $DistOutputRoot "ChatGPTAssistantPanel"
 if (Test-Path $DistOutputRoot) {
     Remove-Item -LiteralPath $DistOutputRoot -Recurse -Force -ErrorAction Stop
 }
-$RuntimeStateDirs = @("data", "output")
-$RuntimeStateFiles = @(".env", "config.yaml")
+$RuntimeStateDirs = @("data", "output", "profiles")
+$RuntimeStateFiles = @(".env")
 $RuntimeBackupRoot = Join-Path $ProjectRoot "build\_dist_runtime_backup"
 
 # Preserve runtime state in existing dist so rebuild does not re-import consumed pools.
@@ -127,7 +127,7 @@ if (-not (Test-Path $DistRoot)) {
     throw "PyInstaller output not found: $DistRoot"
 }
 
-$CopyDirs = @("data", "output")
+$CopyDirs = @("data", "output", "profiles")
 foreach ($dir in $CopyDirs) {
     $src = Join-Path $ProjectRoot $dir
     $dst = Join-Path $DistRoot $dir
@@ -146,7 +146,7 @@ $CopyFiles = @(".env", "config.yaml", "recaptcha_solver.py", "get_oauth_rt.py", 
 foreach ($file in $CopyFiles) {
     $src = Join-Path $ProjectRoot $file
     $runtimeBackup = Join-Path $RuntimeBackupRoot $file
-    if (($file -eq ".env" -or $file -eq "config.yaml") -and (Test-Path $runtimeBackup)) {
+    if (($file -eq ".env") -and (Test-Path $runtimeBackup)) {
         Write-Host "[build] Skip source file $file (runtime backup exists)"
         continue
     }
@@ -197,7 +197,7 @@ if ($IncludePlaywrightBrowsers) {
 }
 
 # Minimal package: do not bundle runtime artifacts that can grow very large.
-foreach ($name in @("profiles", "logs")) {
+foreach ($name in @("logs")) {
     $path = Join-Path $DistRoot $name
     if (Test-Path $path) {
         Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
@@ -211,11 +211,9 @@ if (-not (Test-Path $FinalDistOutputRoot)) {
 
 $publishReady = $true
 if (Test-Path $FinalDistRoot) {
-    $previousRoot = Join-Path $ProjectRoot ("dist_build_previous_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
-    New-Item -ItemType Directory -Path $previousRoot -Force | Out-Null
     try {
-        Move-Item -LiteralPath $FinalDistRoot -Destination (Join-Path $previousRoot "ChatGPTAssistantPanel") -Force -ErrorAction Stop
-        Write-Host "[build] Move previous dist to $previousRoot"
+        Remove-Item -LiteralPath $FinalDistRoot -Recurse -Force -ErrorAction Stop
+        Write-Host "[build] Removed previous dist after runtime-only backup"
     } catch {
         $publishReady = $false
         Write-Warning "Final dist is locked and cannot be replaced: $FinalDistRoot"

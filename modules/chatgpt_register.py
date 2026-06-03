@@ -16,6 +16,9 @@ from .storage import MailAccount
 from .utils import log, random_profile
 
 
+UNKNOWN_PAGE_RETRY_WAIT_MS = 5000
+
+
 class FatalAccountError(RuntimeError):
     pass
 
@@ -122,7 +125,7 @@ class ChatGPTRegister:
                     if self.unknown_count >= 4:
                         raise ManualInterventionNeeded("连续检测到未知页/人工验证，账号已退回号池")
                     self.log(f"检测到未知页/人工验证，等待页面自动推进后重试 | 次数={self.unknown_count}/4")
-                    await self.page.wait_for_timeout(3000)
+                    await self.page.wait_for_timeout(UNKNOWN_PAGE_RETRY_WAIT_MS)
                     continue
                 self.unknown_count = 0
             except FatalAccountError:

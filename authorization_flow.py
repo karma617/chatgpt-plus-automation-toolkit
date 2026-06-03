@@ -687,6 +687,8 @@ def build_auth_command(
         "--remove-after-success",
         "--invalid-state-retries",
         "2",
+        "--account-timeout-seconds",
+        "360",
         ]
     )
     if sms_selection:
@@ -976,19 +978,9 @@ def interactive_authorize(args: argparse.Namespace | None = None) -> int:
         log(f"已从待授权账号池移除手机号必填弃置账号: {removed_phone_required} 个；记录: {discarded_path}")
 
     no_valid_org_accounts = accounts_by_error_type(output_root / "auth_tasks.db", "no_valid_organizations")
-    no_valid_org_selected = [selected_by_email[email] for email in no_valid_org_accounts if email in selected_by_email]
-    removed_no_valid_org = remove_accounts_from_paid_file(
-        paid_file,
-        {selected_by_email[email]["account"].lower() for email in no_valid_org_accounts if email in selected_by_email},
-    )
-    if removed_no_valid_org:
-        mark_paypal_flow_state_if_applicable(
-            paid_file,
-            discarded={selected_by_email[email]["account"].lower() for email in no_valid_org_accounts if email in selected_by_email},
-            reason="auth_no_valid_organizations",
-        )
-        discarded_path = append_discarded_accounts(no_valid_org_selected, "授权阶段 no_valid_organizations 当前页重试2次仍失败", output_root)
-        log(f"已从待授权账号池移除 no_valid_organizations 弃置账号: {removed_no_valid_org} 个；记录: {discarded_path}")
+    kept_no_valid_org = sorted(email for email in no_valid_org_accounts if email in selected_by_email)
+    if kept_no_valid_org:
+        log(f"no_valid_organizations 账号暂不移除，保留在待授权池等待下次重跑: {', '.join(kept_no_valid_org)}")
 
     invalid_state_accounts = accounts_by_invalid_state_count(output_root / "auth_tasks.db", 2)
     invalid_state_accounts -= no_valid_org_accounts

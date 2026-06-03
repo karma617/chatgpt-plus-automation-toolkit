@@ -443,6 +443,15 @@ AUTH_INVALID_STATE_HINTS = (
     "糟糕，出错了",
     "请重试",
 )
+AUTH_CLOUDFLARE_TEXT_HINTS = (
+    "just a moment",
+    "checking your browser",
+    "verify you are human",
+    "cloudflare",
+    "\u6b63\u5728\u8fdb\u884c\u5b89\u5168\u9a8c\u8bc1",
+    "\u672c\u7f51\u7ad9\u4f7f\u7528\u5b89\u5168\u670d\u52a1",
+    "\u9a8c\u8bc1\u60a8\u4e0d\u662f\u81ea\u52a8\u7a0b\u5e8f",
+)
 OTP_SWITCH_SELECTORS = (
     'button:has-text("一次性验证码"), button:has-text("邮箱验证码"), '
     'button:has-text("Email login"), button:has-text("email login"), '
@@ -3258,6 +3267,152 @@ def maybe_visible(page, selector: str, timeout: int = 1000):
     return None
 
 
+def auth_cloudflare_state(page) -> dict[str, object]:
+    try:
+        return dict(
+            page.evaluate(
+                """() => {
+                    const input = document.querySelector('input[name="cf-turnstile-response"]');
+                    const text = String(document.body?.innerText || '').toLowerCase();
+                    const html = String(document.documentElement?.innerHTML || '').toLowerCase();
+                    const title = String(document.title || '').toLowerCase();
+                    const token = String((input && input.value) || '').trim();
+                    const iframeCount = document.querySelectorAll(
+                        'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare" i]'
+                    ).length;
+                    const widgetCount = document.querySelectorAll(
+                        'div.cf-turnstile, [data-sitekey], script[src*="turnstile"], input[name="cf-turnstile-response"], [id^="cf-chl-widget"]'
+                    ).length;
+                    const challengeText = (
+                        title.includes('just a moment') ||
+                        title.includes('cloudflare') ||
+                        text.includes('checking your browser') ||
+                        text.includes('verify you are human') ||
+                        text.includes('\\u6b63\\u5728\\u8fdb\\u884c\\u5b89\\u5168\\u9a8c\\u8bc1') ||
+                        text.includes('\\u672c\\u7f51\\u7ad9\\u4f7f\\u7528\\u5b89\\u5168\\u670d\\u52a1') ||
+                        text.includes('\\u9a8c\\u8bc1\\u60a8\\u4e0d\\u662f\\u81ea\\u52a8\\u7a0b\\u5e8f') ||
+                        html.includes('cf-chl-widget') ||
+                        html.includes('cf-turnstile') ||
+                        html.includes('challenges.cloudflare.com') ||
+                        html.includes('__cf_chl') ||
+                        html.includes('cf_chl')
+                    );
+                    return {
+                        present: Boolean(input || iframeCount || widgetCount || challengeText),
+                        tokenLength: token.length,
+                        iframeCount,
+                        widgetCount,
+                        challengeText,
+                        title,
+                    };
+                }"""
+            )
+        )
+    except Exception:
+        return {"present": False, "tokenLength": 0, "iframeCount": 0, "widgetCount": 0, "challengeText": False, "title": ""}
+
+
+def click_auth_turnstile_widget(page) -> bool:
+    clicked = False
+    try:
+        frames = [page.main_frame]
+        frames.extend(frame for frame in page.frames if frame != page.main_frame)
+        for frame in frames:
+            try:
+                frame_url = str(frame.url or "").lower()
+            except Exception:
+                frame_url = ""
+            if frame != page.main_frame and not any(key in frame_url for key in ("turnstile", "cloudflare", "challenge")):
+                continue
+            for selector in ("input[type='checkbox']", "[role='checkbox']", "label", "button", "body"):
+                try:
+                    loc = frame.locator(selector).first
+                    if loc.count() <= 0:
+                        continue
+                    if not loc.is_visible(timeout=500):
+                        continue
+                    loc.click(timeout=1200, force=True)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if clicked:
+                return True
+    except Exception:
+        pass
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 1 || r.height < 1) return false;
+                        const s = getComputedStyle(el);
+                        return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || '1') > 0.01;
+                    };
+                    const nodes = Array.from(document.querySelectorAll(
+                        'div.cf-turnstile, [data-sitekey], [id^="cf-chl-widget"], iframe[src*="turnstile"], input[name="cf-turnstile-response"]'
+                    ));
+                    for (const node of nodes) {
+                        const target = node.closest('label, div, form') || node;
+                        if (!visible(target)) continue;
+                        target.scrollIntoView({ block: 'center', inline: 'center' });
+                        const rect = target.getBoundingClientRect();
+                        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+                            target.dispatchEvent(new MouseEvent(type, {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                                screenX: 800 + Math.floor(Math.random() * 400),
+                                screenY: 400 + Math.floor(Math.random() * 300),
+                                clientX: Math.max(1, Math.floor(rect.left + Math.max(8, rect.width / 2))),
+                                clientY: Math.max(1, Math.floor(rect.top + Math.max(8, rect.height / 2))),
+                            }));
+                        });
+                        return true;
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def wait_auth_cloudflare(page, timeout: int = 90, *, label: str = "") -> bool:
+    deadline = time.time() + max(1, timeout)
+    logged = False
+    last_click = 0.0
+    prefix = f"[{label}] " if label else ""
+    while time.time() < deadline:
+        state = auth_cloudflare_state(page)
+        token_len = int(state.get("tokenLength") or 0)
+        if not state.get("present"):
+            return True
+        if token_len >= 80:
+            print(f"[login] {prefix}Cloudflare/Turnstile 已通过 token_len={token_len}")
+            return True
+        if not logged:
+            print(f"[login] {prefix}检测到 Cloudflare/Turnstile 安全验证，等待/尝试点击 token_len={token_len}")
+            logged = True
+        now = time.time()
+        if now - last_click >= 3:
+            last_click = now
+            try:
+                page.evaluate("() => { try { if (window.turnstile?.reset) window.turnstile.reset(); } catch {} }")
+            except Exception:
+                pass
+            click_auth_turnstile_widget(page)
+        time.sleep(1)
+    state = auth_cloudflare_state(page)
+    token_len = int(state.get("tokenLength") or 0)
+    if token_len >= 80 or not state.get("present"):
+        return True
+    print(f"[login] {prefix}Cloudflare/Turnstile 等待超时 token_len={token_len}")
+    return False
+
+
 def detect_otp_error(page) -> str:
     try:
         body = page.locator("body").inner_text(timeout=1000).lower().replace("\n", " ")
@@ -5259,11 +5414,17 @@ def cmd_gopay_manual_login(args) -> int:
             set_auth_stage(args, "open_chatgpt_home")
             page.goto(CHATGPT_HOME_URL, wait_until="domcontentloaded", timeout=min(60000, max(10000, int(remaining_seconds() * 1000))))
             time.sleep(3)
+            wait_auth_cloudflare(page, timeout=min(90, max(10, int(remaining_seconds()))), label=email)
 
             for step in range(1, int(getattr(args, "max_steps", 60) or 60) + 1):
                 if timed_out():
                     mark_failure(args, f"单账号登录超过 {account_timeout_seconds}s，已主动结束。", error_type="account_timeout")
                     break
+                if auth_cloudflare_state(page).get("present"):
+                    set_auth_stage(args, "cloudflare_turnstile")
+                    wait_auth_cloudflare(page, timeout=min(90, max(10, int(remaining_seconds()))), label=email)
+                    time.sleep(1)
+                    continue
                 if is_phone_required_page(page):
                     mark_failure(args, "登录阶段出现手机号必填页，已弃置当前账号并继续后续账号", error_type="phone_required")
                     break
@@ -5278,7 +5439,10 @@ def cmd_gopay_manual_login(args) -> int:
                         label=email,
                     ):
                         invalid_state_retry_count += 1
-                        time.sleep(2)
+                        delay = 30 if invalid_state == "no_valid_organizations" else 2
+                        if delay > 2:
+                            print(f"[gopay] [{email}] no_valid_organizations 重试后等待 {delay}s 再继续，避免过早判定失败。")
+                        time.sleep(delay)
                         continue
                     error_type = "no_valid_organizations" if invalid_state == "no_valid_organizations" else "invalid_state"
                     mark_failure(args, f"验证过程中出错({invalid_state})，当前页重试耗尽，弃置当前账号", error_type=error_type)
@@ -5672,11 +5836,17 @@ def cmd_login(args) -> int:
             set_auth_stage(args, "open_auth_url")
             page.goto(auth_url, wait_until="domcontentloaded", timeout=min(60000, max(10000, int(remaining_seconds() * 1000))))
             time.sleep(3)
+            wait_auth_cloudflare(page, timeout=min(90, max(10, int(remaining_seconds()))), label=email)
 
             for step in range(1, args.max_steps + 1):
                 if timed_out():
                     mark_failure(args, f"单账号授权超过 {account_timeout_seconds}s，已主动结束，避免占住并发线程。", error_type="account_timeout")
                     break
+                if auth_cloudflare_state(page).get("present"):
+                    set_auth_stage(args, "cloudflare_turnstile")
+                    wait_auth_cloudflare(page, timeout=min(90, max(10, int(remaining_seconds()))), label=email)
+                    time.sleep(1)
+                    continue
                 if is_phone_required_page(page):
                     if sms_enabled(args):
                         try:
@@ -5710,7 +5880,10 @@ def cmd_login(args) -> int:
                         label=email,
                     ):
                         invalid_state_retry_count += 1
-                        time.sleep(2)
+                        delay = 30 if invalid_state == "no_valid_organizations" else 2
+                        if delay > 2:
+                            print(f"[login] [{email}] no_valid_organizations 重试后等待 {delay}s 再继续，避免过早判定失败。")
+                        time.sleep(delay)
                         continue
                     error_type = "no_valid_organizations" if invalid_state == "no_valid_organizations" else "invalid_state"
                     mark_failure(args, f"验证过程中出错({invalid_state})，当前页重试耗尽，弃置当前账号", error_type=error_type)
@@ -5726,7 +5899,8 @@ def cmd_login(args) -> int:
                     set_auth_stage(args, "fill_email")
                     print("[login] 填入邮箱")
                     if not fill_auth_field(email_input, email, label="邮箱"):
-                        time.sleep(2)
+                        wait_auth_cloudflare(page, timeout=min(30, max(5, int(remaining_seconds()))), label=email)
+                        time.sleep(3)
                         continue
                     _click_primary_auth_button(page, email_input, ["Continue", "继续", "Log in"])
                     time.sleep(3)

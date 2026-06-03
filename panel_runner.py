@@ -62,6 +62,7 @@ VALID_ACTIONS = (
     "paypal-flow3",
     "paypal-auto",
     "paypal-auto-nocard",
+    "paypal-auto-jp-nocard",
     "paypal-auto-filler",
     "oauth-login",
     "check-config",
@@ -179,6 +180,7 @@ def flow_key_for_action(action: str) -> str:
         "paypal-flow2-filler",
         "paypal-auto",
         "paypal-auto-nocard",
+        "paypal-auto-jp-nocard",
         "paypal-auto-filler",
         "check-config",
     }:
@@ -331,9 +333,18 @@ def run_action(args: argparse.Namespace) -> int:
                 return 0
             print(result_event(flow, "failure", f"flow3 failed code={auth_code}"), flush=True)
             return auth_code
-        elif flow in {"paypal-auto", "paypal-auto-nocard", "paypal-auto-filler"}:
+        elif flow in {"paypal-auto", "paypal-auto-nocard", "paypal-auto-jp-nocard", "paypal-auto-filler"}:
             use_filler_flow2 = flow == "paypal-auto-filler"
-            use_local_random_mode = flow == "paypal-auto-nocard"
+            use_local_random_mode = flow in {"paypal-auto-nocard", "paypal-auto-jp-nocard"}
+            use_jp_region = flow == "paypal-auto-jp-nocard"
+            if use_jp_region:
+                run_register_tool_only(
+                    cfg,
+                    count=target,
+                    workers=workers,
+                    mail_source=args.mail_source,
+                    selected_email=args.email,
+                )
             reg_success = asyncio.run(
                 run_with_playwright_noise_filter(
                     run_paypal_register(
@@ -341,6 +352,7 @@ def run_action(args: argparse.Namespace) -> int:
                         count=target,
                         workers=workers,
                         selected_email=args.email,
+                        checkout_region="jp" if use_jp_region else "us",
                     )
                 )
             )
@@ -371,6 +383,7 @@ def run_action(args: argparse.Namespace) -> int:
                                 count=pay_target,
                                 workers=workers,
                                 card_source_mode=pay_mode,
+                                flow2_region_mode="jp" if use_jp_region else None,
                                 selected_email=args.email,
                             )
                         )

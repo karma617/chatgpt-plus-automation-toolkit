@@ -672,6 +672,7 @@ class RunPage(ttk.Frame):
 
         ttk.Button(button_row_3, text="全自动 真实卡", command=lambda: self.start("paypal-auto")).pack(side=LEFT, padx=4)
         ttk.Button(button_row_3, text="全自动 无卡", command=lambda: self.start("paypal-auto-nocard")).pack(side=LEFT, padx=4)
+        ttk.Button(button_row_3, text=_u(r"\u5168\u81ea\u52a8 \u65e5\u533a\u65e0\u5361"), command=lambda: self.start("paypal-auto-jp-nocard")).pack(side=LEFT, padx=4)
         ttk.Button(button_row_3, text="全自动 Filler脚本", command=lambda: self.start("paypal-auto-filler")).pack(side=LEFT, padx=4)
         ttk.Button(button_row_3, text="停止任务", command=self.stop).pack(side=RIGHT, padx=8)
 
