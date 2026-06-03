@@ -52,8 +52,8 @@ def test_build_auth_command_passes_sms_rescue_controls(tmp_path) -> None:
             "operator": authorization_flow.OperatorQuote("", "any", None, None),
             "poll_interval": 5,
             "max_attempts": 60,
-            "phone_retry_limit": 50,
-            "phone_retry_interval": 5,
+            "phone_retry_limit": 7,
+            "phone_retry_interval": 6,
             "code_timeout": 60,
             "code_page_retry_limit": 5,
             "reuse_ttl_seconds": 1200,
@@ -63,8 +63,8 @@ def test_build_auth_command_passes_sms_rescue_controls(tmp_path) -> None:
 
     assert "--save-store" in command
     assert command[command.index("--auth-sms-state-file") + 1] == str(tmp_path / "sms_state.json")
-    assert command[command.index("--sms-phone-retry-limit") + 1] == "50"
-    assert command[command.index("--sms-phone-retry-interval") + 1] == "5"
+    assert command[command.index("--sms-phone-retry-limit") + 1] == "7"
+    assert command[command.index("--sms-phone-retry-interval") + 1] == "6"
     assert command[command.index("--sms-code-timeout") + 1] == "60"
     assert command[command.index("--sms-code-page-retry-limit") + 1] == "5"
     assert command[command.index("--auth-sms-reuse-ttl-seconds") + 1] == "1200"

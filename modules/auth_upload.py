@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import time
@@ -26,6 +26,13 @@ def _env_first(env: dict[str, str], *keys: str) -> str:
     return ""
 
 
+def _env_int(env: dict[str, str], key: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(str(env.get(key) or "").strip()))
+    except ValueError:
+        return default
+
+
 def normalize_base_url(value: str) -> str:
     raw = str(value or "").strip().rstrip("/")
     if not raw:
@@ -34,8 +41,15 @@ def normalize_base_url(value: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return raw
     path = parsed.path.rstrip("/")
+    lower_path = path.lower()
+    for marker in ("/admin/", "/dashboard", "/login"):
+        index = lower_path.find(marker)
+        if index >= 0:
+            path = path[:index]
+            lower_path = path.lower()
+            break
     for marker in ("/api/v1", "/api"):
-        index = path.lower().find(marker)
+        index = lower_path.find(marker)
         if index >= 0:
             path = path[:index]
             break
@@ -65,13 +79,27 @@ def normalize_cpa_auth_files_url(api_url: str) -> str:
 
 
 def parse_upload_targets(env: dict[str, str]) -> tuple[str, ...]:
-    raw = (
+    configured_target = (
         env.get("AUTH_UPLOAD_TARGET")
         or env.get("AUTH_SERVER_TARGET")
         or env.get("AUTH_UPLOAD_PROVIDER")
+    )
+    if configured_target is None or not str(configured_target).strip():
+        has_sub2api = bool(_env_first(env, "SUB2API_SERVER_URL", "SUB2API_API_URL")) and bool(
+            _env_first(env, "SUB2API_API_KEY", "SUB2API_API_TOKEN", "SUB2API_TOKEN")
+        )
+        has_cpa = bool(_env_first(env, "CPA_SERVER_URL", "AUTH_SERVER_URL")) and bool(
+            _env_first(env, "CPA_SERVER_API_KEY", "AUTH_SERVER_API_KEY", "ACCOUNT_POOL_API_KEY")
+        )
+        if has_sub2api and not has_cpa:
+            return ("sub2api",)
+        if has_sub2api and has_cpa:
+            return ("cpa", "sub2api")
+    raw = (
+        configured_target
         or "cpa"
     )
-    text = str(raw or "").strip().lower().replace("，", ",").replace("+", ",")
+    text = str(raw or "").strip().lower().replace("\uff0c", ",").replace("+", ",")
     aliases = {
         "": (),
         "none": (),
@@ -103,7 +131,16 @@ def parse_upload_targets(env: dict[str, str]) -> tuple[str, ...]:
 
 
 def auth_upload_enabled(env: dict[str, str]) -> bool:
-    return env_bool(env.get("AUTH_SERVER_UPLOAD"), default=False)
+    raw_switch = str(env.get("AUTH_SERVER_UPLOAD") or "").strip()
+    if raw_switch:
+        return env_bool(raw_switch, default=False)
+
+    targets = parse_upload_targets(env)
+    if "sub2api" in targets and _env_first(env, "SUB2API_SERVER_URL", "SUB2API_API_URL") and _env_first(env, "SUB2API_API_KEY", "SUB2API_API_TOKEN", "SUB2API_TOKEN"):
+        return True
+    if "cpa" in targets and _env_first(env, "CPA_SERVER_URL", "AUTH_SERVER_URL") and _env_first(env, "CPA_SERVER_API_KEY", "AUTH_SERVER_API_KEY", "ACCOUNT_POOL_API_KEY"):
+        return True
+    return False
 
 
 def session_upload_enabled(env: dict[str, str]) -> bool:
@@ -122,6 +159,14 @@ def _auth_headers(api_key: str, header_name: str, auth_scheme: str) -> dict[str,
         return headers
     headers["X-API-Key"] = key
     return headers
+
+
+def _sub2api_auth_headers(env: dict[str, str], api_key: str) -> dict[str, str]:
+    return _auth_headers(
+        api_key,
+        env.get("SUB2API_API_KEY_HEADER") or "x-api-key",
+        env.get("SUB2API_AUTH_SCHEME") or "",
+    )
 
 
 @dataclass(frozen=True)
@@ -146,12 +191,14 @@ def sub2api_upload_payload(
     *,
     default_priority: int = 1,
     default_concurrency: int = 10,
+    group_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     email = str(bundle.get("email") or "").strip()
     credentials = {
         "access_token": bundle.get("access_token", ""),
         "chatgpt_account_id": bundle.get("account_id", ""),
         "client_id": bundle.get("client_id", ""),
+        "email": email,
         "expires_at": _sub2api_expires_timestamp(bundle),
         "expires_in": 863999,
         "organization_id": bundle.get("workspace_id", ""),
@@ -168,9 +215,14 @@ def sub2api_upload_payload(
         "rate_multiplier": 1.0,
         "auto_pause_on_expired": True,
     }
-    group_ids = _parse_int_list(env.get("SUB2API_GROUP_IDS") or env.get("SUB2API_GROUP_ID"))
-    if group_ids:
-        account_item["group_ids"] = group_ids
+    resolved_group_ids = list(group_ids or _parse_int_list(env.get("SUB2API_GROUP_IDS") or env.get("SUB2API_GROUP_ID")))
+    priority = _env_int(env, "SUB2API_PRIORITY", default_priority, 1)
+    concurrency = _env_int(env, "SUB2API_CONCURRENCY", default_concurrency, 1)
+    if resolved_group_ids:
+        account_item["group_ids"] = resolved_group_ids
+    account_item["priority"] = priority
+    account_item["concurrency"] = concurrency
+    account_item["auto_pause_on_expired"] = env_bool(env.get("SUB2API_AUTO_PAUSE_ON_EXPIRED"), default=True)
     return {
         "data": {
             "type": "sub2api-data",
@@ -179,7 +231,7 @@ def sub2api_upload_payload(
             "proxies": [],
             "accounts": [account_item],
         },
-        "skip_default_group_bind": not bool(group_ids),
+        "skip_default_group_bind": not bool(resolved_group_ids),
     }
 
 
@@ -216,13 +268,66 @@ def upload_sub2api(bundle: dict[str, Any], env: dict[str, str]) -> UploadResult:
     api_key = _env_first(env, "SUB2API_API_KEY", "SUB2API_API_TOKEN", "SUB2API_TOKEN")
     if not base_url or not api_key:
         return UploadResult("sub2api", ok=False, skipped=True, error="missing_sub2api_url_or_api_key")
+    import_path = _env_first(env, "SUB2API_IMPORT_PATH") or "/api/v1/admin/accounts/data"
+    timeout = _env_int(env, "SUB2API_TIMEOUT", 30, 1)
+    headers = _sub2api_auth_headers(env, api_key)
+    headers["Idempotency-Key"] = f"import-{int(time.time())}"
+    group_ids = resolve_sub2api_group_ids(env, base_url, api_key, timeout)
     return _post_json(
         "sub2api",
-        join_url(base_url, "/api/v1/admin/accounts/data"),
-        sub2api_upload_payload(bundle, env),
-        {"Accept": "application/json", "Content-Type": "application/json", "x-api-key": api_key},
-        30,
+        join_url(base_url, import_path),
+        sub2api_upload_payload(bundle, env, group_ids=group_ids),
+        headers,
+        timeout,
     )
+
+
+def resolve_sub2api_group_ids(env: dict[str, str], base_url: str, api_key: str, timeout: int) -> list[int]:
+    raw = str(env.get("SUB2API_GROUP_IDS") or env.get("SUB2API_GROUP_ID") or "").strip()
+    if not raw:
+        return []
+    numeric = _parse_int_list(raw)
+    normalized_raw = raw.replace("\uff0c", ",")
+    parts = [item.strip() for item in normalized_raw.split(",") if item.strip()]
+    unresolved = [item for item in parts if not item.isdigit()]
+    if not unresolved:
+        return numeric
+    by_name = fetch_sub2api_group_id_map(base_url, api_key, env, timeout)
+    result = list(numeric)
+    for item in unresolved:
+        group_id = by_name.get(item.lower())
+        if group_id and group_id not in result:
+            result.append(group_id)
+    return result
+
+
+def fetch_sub2api_group_id_map(base_url: str, api_key: str, env: dict[str, str], timeout: int) -> dict[str, int]:
+    try:
+        import requests
+
+        resp = requests.get(
+            join_url(
+                base_url,
+                "/api/v1/admin/groups?page=1&page_size=200&status=&sort_by=sort_order&sort_order=asc&timezone=Asia%2FShanghai",
+            ),
+            headers=_sub2api_auth_headers(env, api_key),
+            timeout=timeout,
+        )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            return {}
+        data = resp.json()
+        items = (((data or {}).get("data") or {}).get("items") or []) if isinstance(data, dict) else []
+        result: dict[str, int] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().lower()
+            group_id = _as_int(item.get("id"))
+            if name and group_id > 0:
+                result[name] = group_id
+        return result
+    except Exception:
+        return {}
 
 
 def _post_json(target: str, url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int) -> UploadResult:
@@ -277,7 +382,7 @@ def _as_int(value: Any, default: int = 0) -> int:
 
 def _parse_int_list(value: Any) -> list[int]:
     result: list[int] = []
-    for item in str(value or "").replace("，", ",").split(","):
+    for item in str(value or "").replace("\uff0c", ",").split(","):
         number = _as_int(item, 0)
         if number > 0:
             result.append(number)

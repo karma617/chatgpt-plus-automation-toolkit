@@ -23,7 +23,7 @@ from modules.terminal_theme import install_print_theme
 install_print_theme()
 
 
-DEFAULT_ENDPOINT = "https://smsbower.app/stubs/handler_api.php"
+DEFAULT_ENDPOINT = "https://smsbower.page/stubs/handler_api.php"
 DEFAULT_SERVICE = "dr"
 
 SERVICE_ALIASES = {

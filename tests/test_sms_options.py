@@ -45,7 +45,7 @@ def test_allowed_sms_country_filter_excludes_non_whitelist_country() -> None:
 
 
 def test_smsbower_endpoint_is_code_default() -> None:
-    assert DEFAULT_ENDPOINT == "https://smsbower.app/stubs/handler_api.php"
+    assert DEFAULT_ENDPOINT == "https://smsbower.page/stubs/handler_api.php"
 
 
 def test_herosms_provider_get_services_uses_services_list_action(monkeypatch) -> None:
@@ -101,18 +101,41 @@ def test_smsbower_country_dropdown_parses_provider_price_map(monkeypatch) -> Non
     assert [item.display() for item in options] == ["12 - \u7f8e\u56fd / +1 / US / $0.02 / \u5e93\u5b58 320"]
 
 
-def test_sub2api_groups_use_x_api_key_and_keep_openai_groups(monkeypatch) -> None:
+def test_smsbower_service_dropdown_uses_custom_api_url(monkeypatch) -> None:
+    captured: list[dict] = []
+
+    class FakeSmsBowerProvider:
+        def __init__(self, api_key: str, **kwargs) -> None:
+            self.api_key = api_key
+            captured.append(kwargs)
+
+        def get_services(self) -> dict[str, str]:
+            return {"dr": "OpenAI"}
+
+    monkeypatch.setattr(sms_options, "SmsBowerProvider", FakeSmsBowerProvider)
+
+    options = dynamic_env_options(
+        "SMSBOWER_SERVICE",
+        {"SMSBOWER_API_KEY": "sms-key", "SMSBOWER_API_URL": "https://smsbower.page/stubs/handler_api.php"},
+    )
+
+    assert captured[0]["base_url"] == "https://smsbower.page/stubs/handler_api.php"
+    assert [item.display() for item in options] == ["auto - \u81ea\u52a8\u8bc6\u522b OpenAI/ChatGPT", "dr - OpenAI"]
+
+
+def test_sub2api_groups_use_bearer_paginated_endpoint_and_keep_openai_groups(monkeypatch) -> None:
     calls: list[dict] = []
 
-    def fake_get(url: str, headers: dict, timeout: int):
-        calls.append({"url": url, "headers": headers, "timeout": timeout})
+    def fake_get(url: str, headers: dict, params: dict, timeout: int):
+        calls.append({"url": url, "headers": headers, "params": params, "timeout": timeout})
         return SimpleNamespace(
             status_code=200,
             json=lambda: {
-                "data": [
+                "data": {"items": [
                     {"id": 5, "name": "codex", "platform": "openai"},
                     {"id": 6, "name": "claude", "platform": "anthropic"},
-                ]
+                    {"groupId": 8, "group_name": "no-platform"},
+                ]}
             },
         )
 
@@ -124,18 +147,61 @@ def test_sub2api_groups_use_x_api_key_and_keep_openai_groups(monkeypatch) -> Non
         {"SUB2API_SERVER_URL": "https://sub.example/api/v1", "SUB2API_API_KEY": "sub-key"},
     )
 
-    assert calls[0]["url"] == "https://sub.example/api/v1/admin/groups/all"
-    assert calls[0]["headers"]["x-api-key"] == "sub-key"
+    assert calls[0]["url"] == "https://sub.example/api/v1/admin/groups"
+    assert calls[0]["headers"]["authorization"] == "Bearer sub-key"
+    assert calls[0]["params"] == {
+        "page": 1,
+        "page_size": 50,
+        "status": "",
+        "sort_by": "sort_order",
+        "sort_order": "asc",
+        "timezone": "Asia/Shanghai",
+    }
     assert calls[0]["timeout"] == 15
-    assert [item.display() for item in options] == ["5 - codex / openai"]
+    assert [item.display() for item in options] == ["5 - codex / openai", "8 - no-platform / openai"]
 
 
-def test_sub2api_groups_fallback_to_bearer(monkeypatch) -> None:
+def test_sub2api_groups_parse_real_admin_groups_payload(monkeypatch) -> None:
+    def fake_get(url: str, headers: dict, params: dict, timeout: int):
+        assert url == "https://sub.example/api/v1/admin/groups"
+        assert headers["authorization"] == "Bearer sub-key"
+        assert params["page_size"] == 50
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "code": 0,
+                "message": "success",
+                "data": {
+                    "items": [
+                        {"id": 2, "name": "codex", "platform": "openai", "status": "active"},
+                        {"id": 3, "name": "image2", "platform": "openai", "status": "active"},
+                        {"id": 5, "name": "openai-plus", "platform": "openai", "status": "active"},
+                        {"id": 7, "name": "fofa\u4e2d\u8f6c\u7684\u4e2d\u8f6c", "platform": "openai", "status": "active"},
+                    ],
+                    "total": 7,
+                    "page": 1,
+                    "page_size": 50,
+                    "pages": 1,
+                },
+            },
+        )
+
+    monkeypatch.setitem(__import__("sys").modules, "requests", SimpleNamespace(get=fake_get))
+
+    options = dynamic_env_options(
+        "SUB2API_GROUP_IDS",
+        {"SUB2API_SERVER_URL": "https://sub.example", "SUB2API_API_KEY": "sub-key"},
+    )
+
+    assert [item.value for item in options] == ["2", "7", "3", "5"]
+
+
+def test_sub2api_groups_fallback_to_x_api_key(monkeypatch) -> None:
     calls: list[dict] = []
 
-    def fake_get(_url: str, headers: dict, timeout: int):
+    def fake_get(_url: str, headers: dict, params: dict, timeout: int):
         calls.append(headers)
-        if "x-api-key" in headers:
+        if "authorization" in headers:
             return SimpleNamespace(status_code=401, json=lambda: {})
         return SimpleNamespace(status_code=200, json=lambda: [{"id": 7, "name": "codex", "platform": "openai"}])
 
@@ -146,5 +212,26 @@ def test_sub2api_groups_fallback_to_bearer(monkeypatch) -> None:
         {"SUB2API_SERVER_URL": "https://sub.example", "SUB2API_API_KEY": "sub-key"},
     )
 
-    assert calls[1]["Authorization"] == "Bearer sub-key"
+    assert calls[1]["x-api-key"] == "sub-key"
     assert [item.value for item in options] == ["7"]
+
+
+def test_sub2api_groups_fallback_to_groups_all_endpoint(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    def fake_get(url: str, headers: dict, params: dict, timeout: int):
+        calls.append({"url": url, "headers": headers, "params": params, "timeout": timeout})
+        if url.endswith("/groups"):
+            return SimpleNamespace(status_code=404, json=lambda: {})
+        return SimpleNamespace(status_code=200, json=lambda: {"data": {"items": [{"id": 9, "name": "codex"}], "total": 1}})
+
+    monkeypatch.setitem(__import__("sys").modules, "requests", SimpleNamespace(get=fake_get))
+
+    options = dynamic_env_options(
+        "SUB2API_GROUP_IDS",
+        {"SUB2API_SERVER_URL": "https://sub.example", "SUB2API_API_KEY": "sub-key"},
+    )
+
+    assert calls[-1]["url"] == "https://sub.example/api/v1/admin/groups/all"
+    assert calls[-1]["params"] == {"platform": "openai"}
+    assert [item.display() for item in options] == ["9 - codex / openai"]

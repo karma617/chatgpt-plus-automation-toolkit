@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Any
@@ -12,6 +13,10 @@ from modules.terminal_theme import install_print_theme
 
 
 install_print_theme()
+
+
+def _u(text: str) -> str:
+    return text.encode("ascii").decode("unicode_escape")
 
 
 DEFAULT_PHONE_COUNTRIES = [
@@ -91,6 +96,148 @@ class SmsActivation:
     activation_id: int
     phone_number: str
     activation_cost: float | None = None
+
+
+@dataclass
+class _PendingHeroSmsCancel:
+    api_key: str
+    base_url: str
+    timeout: int
+    activation_id: int
+    next_at: float
+    queued_at: float
+    sequence: int
+    attempts: int = 0
+
+
+_HERO_SMS_CANCEL_RETRY_INTERVAL_SECONDS = 30.0
+_HERO_SMS_CANCEL_QUEUE: dict[tuple[str, str, int], _PendingHeroSmsCancel] = {}
+_HERO_SMS_CANCEL_CONDITION = threading.Condition()
+_HERO_SMS_CANCEL_RETRY_LOCK = threading.Lock()
+_HERO_SMS_CANCEL_THREAD_STARTED = False
+_HERO_SMS_CANCEL_SEQUENCE = 0
+
+
+def _hero_sms_cancel_key(api_key: str, base_url: str, activation_id: int) -> tuple[str, str, int]:
+    return (str(api_key or ""), str(base_url or ""), int(activation_id))
+
+
+def _start_hero_sms_cancel_retry_worker() -> None:
+    global _HERO_SMS_CANCEL_THREAD_STARTED
+    with _HERO_SMS_CANCEL_CONDITION:
+        if _HERO_SMS_CANCEL_THREAD_STARTED:
+            return
+        _HERO_SMS_CANCEL_THREAD_STARTED = True
+        thread = threading.Thread(
+            target=_hero_sms_cancel_retry_worker,
+            name="hero-sms-cancel-retry",
+            daemon=True,
+        )
+        thread.start()
+
+
+def _enqueue_hero_sms_cancel_retry(
+    *,
+    api_key: str,
+    base_url: str,
+    timeout: int,
+    activation_id: int,
+    reason: Exception | str,
+) -> None:
+    global _HERO_SMS_CANCEL_SEQUENCE
+    now = time.time()
+    with _HERO_SMS_CANCEL_CONDITION:
+        _HERO_SMS_CANCEL_SEQUENCE += 1
+        item = _PendingHeroSmsCancel(
+            api_key=str(api_key or ""),
+            base_url=str(base_url or ""),
+            timeout=int(timeout or 30),
+            activation_id=int(activation_id),
+            next_at=now + _HERO_SMS_CANCEL_RETRY_INTERVAL_SECONDS,
+            queued_at=now,
+            sequence=_HERO_SMS_CANCEL_SEQUENCE,
+        )
+        key = _hero_sms_cancel_key(item.api_key, item.base_url, item.activation_id)
+        old = _HERO_SMS_CANCEL_QUEUE.get(key)
+        if old:
+            old.next_at = min(old.next_at, item.next_at)
+        else:
+            _HERO_SMS_CANCEL_QUEUE[key] = item
+        _HERO_SMS_CANCEL_CONDITION.notify_all()
+    _start_hero_sms_cancel_retry_worker()
+    print(
+        "[SMS] "
+        + _u(r"\u5df2\u52a0\u5165 HeroSMS \u540e\u53f0\u91ca\u653e\u961f\u5217")
+        + f": activation={activation_id}, retry_interval={int(_HERO_SMS_CANCEL_RETRY_INTERVAL_SECONDS)}s, reason={str(reason).splitlines()[0]}",
+        flush=True,
+    )
+
+
+def _remove_hero_sms_cancel_retry(api_key: str, base_url: str, activation_id: int) -> None:
+    key = _hero_sms_cancel_key(api_key, base_url, activation_id)
+    with _HERO_SMS_CANCEL_CONDITION:
+        _HERO_SMS_CANCEL_QUEUE.pop(key, None)
+        _HERO_SMS_CANCEL_CONDITION.notify_all()
+
+
+def _retry_pending_hero_sms_cancel_once(now: float | None = None) -> int:
+    with _HERO_SMS_CANCEL_RETRY_LOCK:
+        current = time.time() if now is None else now
+        with _HERO_SMS_CANCEL_CONDITION:
+            due = sorted(
+                (item for item in _HERO_SMS_CANCEL_QUEUE.values() if item.next_at <= current),
+                key=lambda item: (item.queued_at, item.sequence),
+            )
+        attempted = 0
+        for item in due:
+            key = _hero_sms_cancel_key(item.api_key, item.base_url, item.activation_id)
+            attempted += 1
+            try:
+                HeroSMSProvider(item.api_key, base_url=item.base_url, timeout=item.timeout).request(
+                    "setStatus",
+                    id=item.activation_id,
+                    status=8,
+                )
+                with _HERO_SMS_CANCEL_CONDITION:
+                    _HERO_SMS_CANCEL_QUEUE.pop(key, None)
+                    _HERO_SMS_CANCEL_CONDITION.notify_all()
+                print(
+                    "[SMS] "
+                    + _u(r"HeroSMS \u540e\u53f0\u91ca\u653e\u6210\u529f")
+                    + f": activation={item.activation_id}, attempts={item.attempts + 1}",
+                    flush=True,
+                )
+            except Exception as exc:
+                with _HERO_SMS_CANCEL_CONDITION:
+                    queued = _HERO_SMS_CANCEL_QUEUE.get(key)
+                    if queued:
+                        queued.attempts += 1
+                        queued.next_at = time.time() + _HERO_SMS_CANCEL_RETRY_INTERVAL_SECONDS
+                        attempts = queued.attempts
+                    else:
+                        attempts = item.attempts + 1
+                    _HERO_SMS_CANCEL_CONDITION.notify_all()
+                if attempts == 1 or attempts % 10 == 0:
+                    print(
+                        "[SMS] "
+                        + _u(r"HeroSMS \u540e\u53f0\u91ca\u653e\u4ecd\u5931\u8d25")
+                        + f": activation={item.activation_id}, attempts={attempts}, error={str(exc).splitlines()[0]}",
+                        flush=True,
+                    )
+        return attempted
+
+
+def _hero_sms_cancel_retry_worker() -> None:
+    while True:
+        with _HERO_SMS_CANCEL_CONDITION:
+            while not _HERO_SMS_CANCEL_QUEUE:
+                _HERO_SMS_CANCEL_CONDITION.wait()
+            now = time.time()
+            next_at = min(item.next_at for item in _HERO_SMS_CANCEL_QUEUE.values())
+            if next_at > now:
+                _HERO_SMS_CANCEL_CONDITION.wait(timeout=max(1.0, next_at - now))
+                continue
+        _retry_pending_hero_sms_cancel_once()
 
 
 def parse_number(value: Any) -> float | None:
@@ -372,12 +519,27 @@ class HeroSMSProvider:
     def complete(self, activation_id: int) -> None:
         print(f"[SMS] 确认验证码已使用，完成激活: activation={activation_id}", flush=True)
         self.request("setStatus", id=activation_id, status=6)
+        _remove_hero_sms_cancel_retry(self.api_key, self.base_url, activation_id)
         print("[SMS] 激活已完成", flush=True)
+
+    def _cancel_request_with_retry(self, activation_id: int) -> None:
+        try:
+            self.request("setStatus", id=activation_id, status=8)
+        except Exception as exc:
+            _enqueue_hero_sms_cancel_retry(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+                activation_id=activation_id,
+                reason=exc,
+            )
+            raise
 
     def cancel(self, activation_id: int) -> None:
         try:
             print(f"[SMS] 取消激活并尝试退款: activation={activation_id}", flush=True)
-            self.request("setStatus", id=activation_id, status=8)
+            self._cancel_request_with_retry(activation_id)
+            _remove_hero_sms_cancel_retry(self.api_key, self.base_url, activation_id)
             print("[SMS] 激活已取消（退款）", flush=True)
         except Exception as exc:
             print(f"[SMS] 取消失败: {exc}（号码将在超时后自动退款）", flush=True)
@@ -636,8 +798,8 @@ def enrich_countries_with_api(catalog: list[PhoneCountry], api_countries: list[d
         base = (
             by_id.get(hero_id)
             or (by_iso.get(api_iso) if api_iso else None)
-            or by_iso.get(sms_activate_ids.get(hero_id, ""))
             or by_name.get(api_name.lower())
+            or by_iso.get(sms_activate_ids.get(hero_id, ""))
         )
         if base:
             enriched.append(replace(base, hero_sms_country=hero_id))
@@ -693,3 +855,9 @@ def local_phone_number(phone: str, country: PhoneCountry) -> str:
     if dial and digits.startswith(dial):
         return digits[len(dial):]
     return digits
+
+
+def phone_matches_country(phone: str, country: PhoneCountry) -> bool:
+    digits = re.sub(r"\D+", "", phone or "")
+    dial = re.sub(r"\D+", "", country.dial_code)
+    return bool(not dial or digits.startswith(dial))

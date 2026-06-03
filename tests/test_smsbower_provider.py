@@ -50,6 +50,24 @@ def test_smsbower_provider_lists_services_countries_and_operators() -> None:
     assert operators[0].label == "Provider 12"
 
 
+def test_smsbower_provider_parses_status_services_list_payload() -> None:
+    class ListSmsBowerProvider(SmsBowerProvider):
+        def __init__(self) -> None:
+            super().__init__("key")
+
+        def request(self, action: str, **_params):
+            assert action == "getServicesList"
+            return {
+                "status": "success",
+                "services": [
+                    {"code": "kt", "name": "KakaoTalk"},
+                    {"code": "dr", "name": "OpenAI"},
+                ],
+            }
+
+    assert ListSmsBowerProvider().get_services() == {"kt": "KakaoTalk", "dr": "OpenAI"}
+
+
 def test_smsbower_provider_parses_v3_provider_price_map() -> None:
     provider = FakeSmsBowerProvider()
     country = PhoneCountry("ZA", "27", "South Africa", 31)

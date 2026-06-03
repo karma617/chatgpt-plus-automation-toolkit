@@ -29,7 +29,7 @@ PAYPAL_OUTPUT_ROOT = resolve_path("output/paypal注册")
 LINK_POOL_FILE = PAYPAL_OUTPUT_ROOT / "长链接账号" / "account.txt"
 PENDING_AUTH_DIR = PAYPAL_OUTPUT_ROOT / "待授权账号"
 PENDING_AUTH_FILE = PENDING_AUTH_DIR / "account.txt"
-PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_NONZERO_AMOUNT_DOM_WAIT_2026-06-03_03"
+PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_SMS_FAST_AGREE_WHATSAPP_REJECT_2026-06-03_01"
 PAYPAL_FLOW2_NONZERO_AMOUNT = "nonzero_checkout_amount"
 
 
@@ -3487,6 +3487,7 @@ async def fill_sms_code(
     prefix: str = "[PayPal]",
 ) -> bool:
     """等待并填入 PayPal 手机验证码（复刻 source4 逻辑）。"""
+    stage_started_at = time.perf_counter()
     await page.wait_for_timeout(800)
     if not await _is_paypal_verification_stage(page):
         log(f"{prefix} 未检测到短信验证码页，跳过自动填码")
@@ -3500,7 +3501,8 @@ async def fill_sms_code(
         await _wait_captcha_cleared(page, timeout_seconds=30)
 
     code = poll_sms_code(api_url, timeout=120, interval=5)
-    log(f"[PayPal] 验证码: {code}")
+    code_received_at = time.perf_counter()
+    log(f"[PayPal] 验证码: {code} (wait={code_received_at - stage_started_at:.1f}s)")
 
     # 优先使用直填，避免 click 被遮挡导致输入中断。
     typed = False
@@ -3531,6 +3533,8 @@ async def fill_sms_code(
                 break
     if not typed:
         raise RuntimeError("短信验证码输入失败：未找到可填写的 OTP 输入框")
+    typed_at = time.perf_counter()
+    log(f"{prefix} PayPal OTP filled (elapsed={typed_at - code_received_at:.1f}s)")
 
     # 快速路径：验证码写入后先短暂等待，尽快进入提交/确认点击
     await page.wait_for_timeout(500)
@@ -3557,9 +3561,21 @@ async def fill_sms_code(
     except Exception:
         pass
 
-    # 提交后立刻尝试点击确认，缩短“收到验证码 -> 点击 Agree and Continue”耗时。
-    await _click_paypal_agree_and_continue_if_present(page, solver_proxy=solver_proxy, prefix=prefix)
-    await page.wait_for_timeout(900)
+    submitted_at = time.perf_counter()
+    log(f"{prefix} PayPal OTP submit checked (elapsed={submitted_at - typed_at:.1f}s)")
+
+    # 提交后用短间隔轮询 review 页按钮，避免外层等待 60s 后才点到 Agree。
+    agree_clicked = await _wait_and_click_paypal_agree_after_sms(
+        page,
+        solver_proxy=solver_proxy,
+        prefix=prefix,
+        timeout_seconds=12.0,
+    )
+    if agree_clicked:
+        log(f"{prefix} PayPal agree clicked after OTP (elapsed={time.perf_counter() - submitted_at:.1f}s)")
+        return True
+
+    await page.wait_for_timeout(500)
     still_verify = await _is_paypal_verification_stage(page)
     if still_verify:
         log(f"{prefix} 短信验证码阶段仍在，判定未完成提交")
@@ -3585,11 +3601,37 @@ async def check_phone_rejected(page) -> bool:
     return False
 
 
+async def _wait_and_click_paypal_agree_after_sms(
+    page,
+    *,
+    solver_proxy: str | None = None,
+    prefix: str = "[PayPal]",
+    timeout_seconds: float = 12.0,
+) -> bool:
+    """Poll the PayPal review button shortly after OTP submit."""
+    deadline = asyncio.get_event_loop().time() + max(1.0, timeout_seconds)
+    attempt = 0
+    while asyncio.get_event_loop().time() < deadline:
+        attempt += 1
+        if await _click_paypal_agree_and_continue_if_present(
+            page,
+            solver_proxy=solver_proxy,
+            prefix=prefix,
+            visible_timeout_ms=350,
+        ):
+            return True
+        if attempt == 1 or attempt % 6 == 0:
+            log(f"{prefix} PayPal agree button not visible yet after OTP (attempt={attempt})")
+        await page.wait_for_timeout(500)
+    return False
+
+
 async def _click_paypal_agree_and_continue_if_present(
     page,
     *,
     solver_proxy: str | None = None,
     prefix: str = "[PayPal]",
+    visible_timeout_ms: int = 1200,
 ) -> bool:
     """若出现 PayPal review 页的 Agree and Continue，则自动点击。"""
     selectors = [
@@ -3605,10 +3647,10 @@ async def _click_paypal_agree_and_continue_if_present(
     for sel in selectors:
         try:
             btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1200):
+            if await btn.is_visible(timeout=visible_timeout_ms):
                 # 页面常在底部，先滚动到按钮再点击
                 try:
-                    await btn.scroll_into_view_if_needed(timeout=1200)
+                    await btn.scroll_into_view_if_needed(timeout=800)
                 except Exception:
                     pass
                 try:

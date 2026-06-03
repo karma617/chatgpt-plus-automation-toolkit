@@ -38,8 +38,9 @@ import state_db
 from error_classifier import classify_error, classify_exit
 from mail_adapters.service import wait_code as wait_mail_adapter_code
 from modules.grizzly_sms_provider import GrizzlySMSProvider
-from modules.hero_sms_provider import HeroSMSProvider, PhoneCountry, local_phone_number
+from modules.hero_sms_provider import HeroSMSProvider, PhoneCountry, local_phone_number, phone_matches_country
 from modules.fivesim_sms_provider import FiveSimProvider
+from modules.smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
 from modules.smsbower_provider import SmsBowerProvider
 from modules.auth_upload import auth_upload_enabled, upload_bundle
 from modules.terminal_theme import install_print_theme
@@ -745,6 +746,7 @@ def load_root_env() -> dict:
         "SUB2API_AUTO_PAUSE_ON_EXPIRED",
         "SUB2API_UPDATE_EXISTING",
         "SUB2API_TIMEOUT",
+        "SMSBOWER_API_URL",
         "INBOX_LOUCER_BASE_URL",
         "INBOX_LOUCER_USERNAME",
         "INBOX_LOUCER_PASSWORD",
@@ -2712,8 +2714,27 @@ def is_phone_number_rejected_page(page) -> bool:
         "请使用其他手机号",
         "请更换手机号",
         "手机号无效",
+        "电话号码无效",
         "电话号码不可用",
     ]
+    whatsapp_reject_markers = (
+        "we couldn't send a text message to this phone number",
+        "we could not send a text message to this phone number",
+        "we switched to whatsapp",
+        "continue to send a verification code on whatsapp",
+        "send a verification code on whatsapp",
+    )
+
+    def _looks_like_whatsapp_fallback(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(text or "").lower()).strip()
+        if any(marker in normalized for marker in whatsapp_reject_markers):
+            return True
+        return (
+            "whatsapp" in normalized
+            and "verification code" in normalized
+            and ("text message" in normalized or "switched" in normalized)
+        )
+
     for txt in reject_texts:
         try:
             if page.locator(f"text={txt}").first.is_visible(timeout=300):
@@ -2731,11 +2752,19 @@ def is_phone_number_rejected_page(page) -> bool:
                     return True
             except Exception:
                 pass
+        try:
+            frame_body = frame.locator("body").inner_text(timeout=500)
+            if _looks_like_whatsapp_fallback(frame_body):
+                return True
+        except Exception:
+            pass
     try:
-        body = page.locator("body").inner_text(timeout=1200).lower()
+        body = page.locator("body").inner_text(timeout=1200)
     except Exception:
         return False
-    normalized = re.sub(r"\s+", " ", body).strip()
+    normalized = re.sub(r"\s+", " ", body.lower()).strip()
+    if _looks_like_whatsapp_fallback(body):
+        return True
     return any(hint.lower() in normalized for hint in reject_texts)
 
 
@@ -2794,6 +2823,17 @@ def sms_provider_name(args) -> str:
     return name
 
 
+def smsbower_base_url(args) -> str:
+    explicit = str(getattr(args, "sms_api_url", "") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        env = load_root_env()
+    except Exception:
+        env = {}
+    return str(env.get("SMSBOWER_API_URL") or SMSBOWER_DEFAULT_ENDPOINT).strip() or SMSBOWER_DEFAULT_ENDPOINT
+
+
 def sms_enabled(args) -> bool:
     return local_auth_phone_pool_enabled(args) or sms_provider_enabled(args)
 
@@ -2831,18 +2871,9 @@ def select_phone_country(page, country: PhoneCountry) -> None:
         return
     print(f"[SMS] 选择手机号国家: {country.name} +{country.dial_code}")
     try:
-        already = page.evaluate(
-            """(code) => {
-                for (const node of document.querySelectorAll('button, select')) {
-                    const text = (node.innerText || node.textContent || '').trim();
-                    if (text.includes(`+${code}`) || text.includes(`(${code})`)) return text;
-                }
-                return '';
-            }""",
-            country.dial_code,
-        )
-        if already:
-            print(f"[SMS] 页面国家已匹配: {already}")
+        already = current_phone_country_code(page)
+        if already and already == country.dial_code:
+            print(f"[SMS] 页面国家已匹配: +{already}")
             return
     except Exception:
         pass
@@ -2874,7 +2905,8 @@ def select_phone_country(page, country: PhoneCountry) -> None:
         if changed:
             print(f"[SMS] 已选择国家: {changed}")
             time.sleep(0.8)
-            return
+            if current_phone_country_code(page) == country.dial_code:
+                return
     except Exception as exc:
         print(f"[SMS] select 国家选择失败，继续尝试备用方式: {str(exc).splitlines()[0]}")
 
@@ -2897,6 +2929,72 @@ def select_phone_country(page, country: PhoneCountry) -> None:
                 return
     except Exception as exc:
         print(f"[SMS] 下拉国家选择失败，继续使用完整号码兜底: {str(exc).splitlines()[0]}")
+
+
+def current_phone_country_code(page) -> str:
+    try:
+        current = page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const candidates = Array.from(document.querySelectorAll('button[aria-haspopup="listbox"], button, .react-aria-SelectValue'))
+                    .filter(visible);
+                for (const node of candidates) {
+                    const text = (node.innerText || node.textContent || '').trim();
+                    const match = text.match(/\+(\d+)/);
+                    if (match) return match[1];
+                }
+                const select = document.querySelector('select');
+                if (select) {
+                    const selected = select.options[select.selectedIndex];
+                    const text = (selected?.text || selected?.textContent || '').trim();
+                    const match = text.match(/\+(\d+)/);
+                    if (match) return match[1];
+                }
+                return '';
+            }"""
+        )
+        return str(current or "").strip()
+    except Exception:
+        return ""
+
+
+def ensure_sms_channel_selected(page) -> None:
+    try:
+        changed = page.evaluate(
+            """() => {
+                const input = document.querySelector('input[type="radio"][value="sms"], input[name="channel"][value="sms"]');
+                if (!input) return false;
+                if (input.checked) return true;
+                const label = input.closest('label');
+                const target = label || input;
+                target.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                if (!input.checked) {
+                    input.checked = true;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                const hidden = document.querySelector('input[name="channel"]');
+                if (hidden && hidden.value !== 'sms') {
+                    hidden.value = 'sms';
+                    hidden.dispatchEvent(new Event('input', { bubbles: true }));
+                    hidden.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                return true;
+            }"""
+        )
+        if changed:
+            print("[SMS] 已切换验证码发送方式为短信", flush=True)
+            time.sleep(0.5)
+    except Exception as exc:
+        print(f"[SMS] 短信通道切换失败，继续提交: {str(exc).splitlines()[0]}", flush=True)
 
 
 def click_phone_submit(page, field=None) -> bool:
@@ -2934,36 +3032,27 @@ def fill_phone_and_wait_sms_page(page, phone: str, country: PhoneCountry) -> Non
     if not phone_input:
         raise RuntimeError("未找到手机号输入框")
     print("[SMS] 已找到手机号输入框", flush=True)
-    current_country = ""
-    try:
-        current_country = str(
-            page.evaluate(
-                r"""() => {
-                    for (const node of document.querySelectorAll('button, select')) {
-                        const text = (node.innerText || node.textContent || '').trim();
-                        const match = text.match(/\+(\d+)/);
-                        if (match) return match[1];
-                    }
-                    return '';
-                }"""
-            )
-            or ""
-        )
-    except Exception:
-        current_country = ""
+    current_country = current_phone_country_code(page)
+    if country.dial_code and current_country and current_country != country.dial_code:
+        raise RuntimeError(f"PHONE_COUNTRY_MISMATCH: page=+{current_country}, target=+{country.dial_code}")
     full_digits = re.sub(r"\D+", "", phone)
-    value = local_phone_number(phone, country) if country.dial_code and current_country == country.dial_code else full_digits
+    if not phone_matches_country(phone, country):
+        raise RuntimeError(f"PHONE_COUNTRY_MISMATCH: phone={phone}, target=+{country.dial_code}")
+    value = local_phone_number(phone, country)
     number_kind = "本地号码" if value != full_digits else "完整号码"
     print(f"[SMS] 准备填入手机号: 接码号码={phone}, 页面国家=+{current_country or '-'}, 输入类型={number_kind}, 输入值={value}", flush=True)
     if not fill_auth_field(phone_input, value, label="手机号"):
         raise RuntimeError("手机号填写失败")
     print("[SMS] 手机号已填入页面", flush=True)
+    ensure_sms_channel_selected(page)
     if not click_phone_submit(page, phone_input):
         raise RuntimeError("手机号提交按钮点击失败")
     print("[SMS] 已点击手机号页面继续/提交按钮，等待验证码页面", flush=True)
     time.sleep(4)
     if is_phone_link_limit_page(page):
         raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
+    if is_phone_number_rejected_page(page):
+        raise RuntimeError("PHONE_REJECTED: phone rejected by page after submit")
 
 
 def find_sms_code_input(page):
@@ -3232,7 +3321,7 @@ def complete_auth_sms_state(args) -> None:
         elif provider_name == "fivesim":
             provider = FiveSimProvider(api_key)
         elif provider_name == "smsbower":
-            provider = SmsBowerProvider(api_key, base_url=str(getattr(args, "sms_api_url", "") or "").strip() or "https://smsbower.app/stubs/handler_api.php")
+            provider = SmsBowerProvider(api_key, base_url=smsbower_base_url(args))
         else:
             provider = HeroSMSProvider(api_key)
         provider.complete(activation_id)
@@ -3292,12 +3381,19 @@ def handle_phone_required_with_hero_sms(page, args, remaining_seconds) -> bool:
             country.hero_sms_country,
             operator=operator,
         )
+        if not phone_matches_country(activation.phone_number, country):
+            provider.cancel(activation.activation_id)
+            raise RuntimeError(f"PHONE_COUNTRY_MISMATCH: phone={activation.phone_number}, target=+{country.dial_code}")
         provider.mark_ready(activation.activation_id)
         fill_phone_and_wait_sms_page(page, activation.phone_number, country)
         deadline = time.time() + min(max(30, int(remaining_seconds())), int(float(getattr(args, "hero_sms_poll_interval", 5.0) or 5.0) * int(getattr(args, "hero_sms_max_attempts", 60) or 60)) + 10)
         wait_round = 0
         while time.time() < deadline:
             wait_round += 1
+            if is_phone_link_limit_page(page):
+                raise RuntimeError("PHONE_LINK_LIMIT: phone linked to maximum accounts")
+            if is_phone_number_rejected_page(page):
+                raise RuntimeError("PHONE_REJECTED: phone rejected by page")
             if page_looks_like_sms_verification(page):
                 print(f"[SMS] 页面已进入短信验证码阶段，开始向 HeroSMS 拉取验证码", flush=True)
                 break
@@ -3350,6 +3446,8 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
                 wait_round += 1
                 if is_phone_link_limit_page(page):
                     raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
+                if is_phone_number_rejected_page(page):
+                    raise RuntimeError("PHONE_REJECTED: phone rejected by page")
                 if page_looks_like_sms_verification(page):
                     print("[SMS][POOL] 页面已进入短信验证码阶段，开始从手机号池取码 URL 拉取验证码", flush=True)
                     break
@@ -3366,7 +3464,7 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
                 if is_phone_link_limit_page(page):
                     raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
                 if is_phone_number_rejected_page(page):
-                    raise RuntimeError("PHONE_LINK_LIMIT: 手机号被页面拒绝，请更换其他手机号")
+                    raise RuntimeError("PHONE_REJECTED: phone rejected by page")
                 try:
                     resp = requests.get(sms_api_url, timeout=10)
                     text = (resp.text or "").strip()
@@ -3385,7 +3483,7 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
                 if is_phone_link_limit_page(page):
                     raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
                 if is_phone_number_rejected_page(page):
-                    raise RuntimeError("PHONE_LINK_LIMIT: 手机号被页面拒绝，请更换其他手机号")
+                    raise RuntimeError("PHONE_REJECTED: phone rejected by page")
                 hint = phone_page_text_hint(page)
                 raise RuntimeError(f"PHONE_POOL_TIMEOUT: 手机号池验证码超时 ({timeout}s) | page_hint={hint}")
 
@@ -3419,7 +3517,7 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
         provider = FiveSimProvider(api_key)
         label = "5sim"
     elif provider_name == "smsbower":
-        provider = SmsBowerProvider(api_key, base_url=str(getattr(args, "sms_api_url", "") or "").strip() or "https://smsbower.app/stubs/handler_api.php")
+        provider = SmsBowerProvider(api_key, base_url=smsbower_base_url(args))
         label = "SMSBower"
     else:
         provider = HeroSMSProvider(api_key)
@@ -3572,6 +3670,16 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
                 if sms_no_number_error(exc):
                     raise RuntimeError(f"AUTH_SMS_COUNTRY_NO_NUMBER: country={country.name}({country.hero_sms_country}), last={last_error}") from exc
                 raise
+            if not phone_matches_country(activation.phone_number, country):
+                last_error = f"PHONE_COUNTRY_MISMATCH: phone={activation.phone_number}, target=+{country.dial_code}"
+                print(f"[SMS] {label} 接码平台返回号码国家不匹配，取消并换号: {last_error}", flush=True)
+                try:
+                    provider.cancel(activation.activation_id)
+                except Exception:
+                    pass
+                activation = None
+                time.sleep(phone_retry_interval)
+                continue
             provider.mark_ready(activation.activation_id)
             fill_phone_and_wait_sms_page(page, activation.phone_number, country)
             sms_page_started_at = wait_sms_verification_page(page, remaining_seconds, label=label)

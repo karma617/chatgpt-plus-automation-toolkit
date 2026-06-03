@@ -60,12 +60,14 @@ def test_known_env_fields_include_api_keys() -> None:
     assert "MOEMAIL_BASE_URL" in fields
     assert "MAIL_ACCOUNT_MODE" in fields
     assert "HERO_SMS_POLL_INTERVAL" in fields
+    assert "SMS_PHONE_RETRY_LIMIT" in fields
+    assert "SMS_PHONE_RETRY_INTERVAL" in fields
     assert "GRIZZLY_PROMPT_PROVIDER_SELECTION" in fields
     assert "FIVESIM_OPERATOR_THRESHOLD" in fields
     assert "SMSBOWER_API_KEY" in fields
+    assert "SMSBOWER_API_URL" in fields
     assert "SMSBOWER_SERVICE" in fields
     assert "SMSBOWER_COUNTRY_SELECT" in fields
-    assert "SMSBOWER_API_URL" not in fields
     assert "YESCAPTCHA_API_KEY" in fields
     assert "HERO_SMS_API_KEY" in fields
     assert "PAYPAL_CARD_REDEEM_API_KEY" in fields
@@ -120,11 +122,14 @@ def test_known_env_fields_keep_chinese_label_separate_from_env_key() -> None:
 def test_sms_fields_include_human_readable_tooltips() -> None:
     top_n = _field_by_key("SMSBOWER_COUNTRY_TOP_N")
     threshold = _field_by_key("GRIZZLY_PROVIDER_THRESHOLD")
+    retry_limit = _field_by_key("SMS_PHONE_RETRY_LIMIT")
 
     assert _u(r"\u663e\u793a\u5ec9\u4ef7\u56fd\u5bb6\u6570") in top_n.label
     assert _u(r"\u53ea\u5f71\u54cd\u5019\u9009\u5217\u8868\u957f\u5ea6") in top_n.tooltip
     assert _u(r"\u5e93\u5b58\u4f4e\u4e8e\u6b64\u503c") in threshold.label
     assert _u(r"\u4e8c\u6b21\u9009\u62e9") in threshold.tooltip
+    assert _u(r"\u540c\u56fd\u5bb6\u6362\u53f7\u91cd\u8bd5\u6b21\u6570") in retry_limit.label
+    assert _u(r"\u624b\u673a\u53f7\u8868\u5355") in retry_limit.tooltip
 
 
 def test_sms_provider_fields_are_grouped_by_platform() -> None:

@@ -518,7 +518,7 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
         api_key = (getattr(args, "smsbower_api_key", "") or env.get("SMSBOWER_API_KEY") or env.get("SMS_API_KEY") or "").strip()
         api_key_name = "SMSBOWER_API_KEY"
         provider_label = "SMSBower"
-        base_url = SMSBOWER_DEFAULT_ENDPOINT
+        base_url = (env.get("SMSBOWER_API_URL") or SMSBOWER_DEFAULT_ENDPOINT).strip() or SMSBOWER_DEFAULT_ENDPOINT
         provider = SmsBowerProvider(api_key, base_url=base_url) if api_key else None
         raw_service = (getattr(args, "smsbower_service", "") or env.get("SMSBOWER_SERVICE") or "auto").strip() or "auto"
         service = provider.resolve_openai_service(raw_service) if provider else "dr"
@@ -910,7 +910,7 @@ def run_one(
                 output_lines: list[str] = []
                 assert process.stdout is not None
                 for line in process.stdout:
-                    print(line, end="")
+                    print(line, end="", flush=True)
                     output_lines.append(line)
                 process.wait()
                 final_returncode = int(process.returncode or 0)

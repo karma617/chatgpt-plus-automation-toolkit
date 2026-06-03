@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,7 +53,7 @@ def _api_key(env: dict[str, str], key: str) -> str:
 def _smsbower(env: dict[str, str]) -> SmsBowerProvider:
     return SmsBowerProvider(
         _api_key(env, "SMSBOWER_API_KEY"),
-        base_url=SMSBOWER_DEFAULT_ENDPOINT,
+        base_url=(env.get("SMSBOWER_API_URL") or SMSBOWER_DEFAULT_ENDPOINT).strip() or SMSBOWER_DEFAULT_ENDPOINT,
     )
 
 
@@ -127,25 +128,76 @@ def _sub2api_groups(env: dict[str, str]) -> list[OptionItem]:
     api_key = (env.get("SUB2API_API_KEY") or env.get("SUB2API_API_TOKEN") or env.get("SUB2API_TOKEN") or "").strip()
     if not base_url or not api_key:
         return []
-    url = join_url(base_url, "/api/v1/admin/groups/all")
-    headers_list = (
-        {"Accept": "application/json", "x-api-key": api_key},
-        {"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
-    )
-    for headers in headers_list:
-        try:
-            import requests
+    for path in _sub2api_group_paths(env):
+        url = join_url(base_url, path)
+        params = _sub2api_group_params(path)
+        for headers in _sub2api_header_candidates(env, api_key):
+            try:
+                import requests
 
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code < 200 or response.status_code >= 300:
+                response = requests.get(url, headers=headers, params=params, timeout=15)
+                if response.status_code < 200 or response.status_code >= 300:
+                    continue
+                groups = _extract_group_list(response.json())
+                options = _group_options(groups)
+                if options:
+                    return options
+            except Exception:
                 continue
-            groups = _extract_group_list(response.json())
-            options = _group_options(groups)
-            if options:
-                return options
-        except Exception:
-            continue
     return []
+
+
+def _sub2api_group_paths(env: dict[str, str]) -> tuple[str, ...]:
+    configured = str(env.get("SUB2API_GROUPS_PATH") or "").strip()
+    paths = [configured] if configured else []
+    paths.extend(("/api/v1/admin/groups", "/api/v1/admin/groups/all"))
+    result: list[str] = []
+    for path in paths:
+        if path and path not in result:
+            result.append(path)
+    return tuple(result)
+
+
+def _sub2api_group_params(path: str) -> dict[str, object]:
+    if str(path or "").rstrip("/").endswith("/all"):
+        return {"platform": "openai"}
+    return {
+        "page": 1,
+        "page_size": 50,
+        "status": "",
+        "sort_by": "sort_order",
+        "sort_order": "asc",
+        "timezone": "Asia/Shanghai",
+    }
+
+
+def _sub2api_header_candidates(env: dict[str, str], api_key: str) -> tuple[dict[str, str], ...]:
+    configured_header = str(env.get("SUB2API_API_KEY_HEADER") or "").strip()
+    configured_scheme = str(env.get("SUB2API_AUTH_SCHEME") or "").strip()
+    candidates: list[dict[str, str]] = []
+    if configured_header:
+        candidates.append(
+            {
+                "Accept": "application/json",
+                configured_header: f"{configured_scheme} {api_key}".strip() if configured_scheme else api_key,
+            }
+        )
+    candidates.extend(
+        (
+            {"Accept": "application/json", "authorization": f"Bearer {api_key}"},
+            {"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+            {"Accept": "application/json", "x-api-key": api_key},
+        )
+    )
+    result: list[dict[str, str]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for headers in candidates:
+        marker = tuple(sorted((key.lower(), value) for key, value in headers.items()))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(headers)
+    return tuple(result)
 
 
 def _extract_group_list(payload: Any) -> list[Any]:
@@ -153,7 +205,7 @@ def _extract_group_list(payload: Any) -> list[Any]:
         return payload
     if not isinstance(payload, dict):
         return []
-    for key in ("data", "groups", "items", "results"):
+    for key in ("data", "groups", "items", "results", "list", "rows", "records", "result"):
         value = payload.get(key)
         if isinstance(value, list):
             return value
@@ -169,16 +221,59 @@ def _group_options(groups: list[Any]) -> list[OptionItem]:
     for item in groups:
         if not isinstance(item, dict):
             continue
-        group_id = item.get("id")
+        group_id = _first_present(item, "id", "group_id", "groupId", "gid", "value")
         if group_id is None or str(group_id).strip() == "":
             continue
-        platform = str(item.get("platform") or "").strip()
-        if platform and platform.lower() != "openai":
+        if not _group_supports_openai(item):
             continue
-        name = str(item.get("name") or item.get("display_name") or group_id).strip()
+        name = str(_first_present(item, "name", "display_name", "group_name", "title", "label") or group_id).strip()
+        platform = _platform_label(item)
         label = f"{name} / {platform or 'openai'}"
         options.append(OptionItem(str(group_id), label))
     return sorted(options, key=lambda option: option.label.lower())
+
+
+def _first_present(item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _group_supports_openai(item: dict[str, Any]) -> bool:
+    platforms = _platform_tokens(item)
+    if not platforms:
+        return True
+    return "openai" in platforms
+
+
+def _platform_label(item: dict[str, Any]) -> str:
+    platforms = _platform_tokens(item)
+    return ",".join(sorted(platforms))
+
+
+def _platform_tokens(item: dict[str, Any]) -> set[str]:
+    raw_values: list[Any] = []
+    for key in ("platform", "platforms", "allowed_platforms", "provider", "providers"):
+        value = item.get(key)
+        if value is not None:
+            raw_values.append(value)
+    tokens: set[str] = set()
+    for value in raw_values:
+        if isinstance(value, list):
+            iterable = value
+        elif isinstance(value, tuple):
+            iterable = list(value)
+        elif isinstance(value, dict):
+            iterable = list(value.values()) + list(value.keys())
+        else:
+            iterable = re.split(r"[,/| ]+", str(value))
+        for part in iterable:
+            text = str(part or "").strip().lower()
+            if text:
+                tokens.add(text)
+    return tokens
 
 
 def _country_label(country: Any) -> str:

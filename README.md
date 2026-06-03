@@ -262,6 +262,7 @@ CAPSOLVER_API_KEY=your-key
 AUTH_SERVER_UPLOAD=false
 SESSION_EXPORT_SERVER_UPLOAD=false
 AUTH_UPLOAD_TARGET=cpa
+# 若只配置 SUB2API_SERVER_URL / SUB2API_API_KEY 且 AUTH_UPLOAD_TARGET 留空，会自动按 sub2api 上传。
 
 # CPA 仓管中心：只需要填写接口地址和 Key。
 # 对应 openai-cpa-wenfxl 的 cpa_mode.api_url / cpa_mode.api_token。

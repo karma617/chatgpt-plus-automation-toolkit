@@ -9,8 +9,9 @@ from typing import Awaitable, Callable
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
 from .grizzly_sms_provider import GrizzlySMSProvider
-from .hero_sms_provider import HeroSMSProvider, PhoneCountry, SmsActivation, local_phone_number
+from .hero_sms_provider import HeroSMSProvider, PhoneCountry, SmsActivation, local_phone_number, phone_matches_country
 from .mail_provider import MailProvider
+from .smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
 from .smsbower_provider import SmsBowerProvider
 from .storage import MailAccount
 from .utils import log, random_profile
@@ -386,7 +387,7 @@ class ChatGPTRegister:
 
             provider = FiveSimProvider(api_key)
         elif provider_name == "smsbower":
-            provider = SmsBowerProvider(api_key, base_url=str(selection.get("base_url") or "").strip() or "https://smsbower.app/stubs/handler_api.php")
+            provider = SmsBowerProvider(api_key, base_url=str(selection.get("base_url") or "").strip() or SMSBOWER_DEFAULT_ENDPOINT)
         else:
             provider = HeroSMSProvider(api_key)
         # 5sim 用 slug；HeroSMS/Grizzly 用 hero_sms_country int
@@ -404,6 +405,11 @@ class ChatGPTRegister:
                 operator=operator_value,
             )
             self.log(f"手机号页: 已获取手机号 {activation.phone_number}，activation={activation.activation_id}")
+            if not phone_matches_country(activation.phone_number, country):
+                bad_phone = activation.phone_number
+                await asyncio.to_thread(provider.cancel, activation.activation_id)
+                activation = None
+                raise RuntimeError(f"PHONE_COUNTRY_MISMATCH: phone={bad_phone}, target=+{country.dial_code}")
             await asyncio.to_thread(provider.mark_ready, activation.activation_id)
             await fill_phone_and_wait_sms_page(self.page, activation.phone_number, country, self.log)
             if await page_looks_like_create_password(self.page):
@@ -468,7 +474,7 @@ async def select_phone_country(page: Page, country: PhoneCountry, logger: Callab
     try:
         already = await page.evaluate(
             """(code) => {
-                for (const node of document.querySelectorAll('button, select')) {
+                for (const node of document.querySelectorAll('button[aria-haspopup="listbox"], button, .react-aria-SelectValue')) {
                     const text = (node.innerText || node.textContent || '').trim();
                     if (text.includes(`+${code}`) || text.includes(`(${code})`)) return text;
                 }
@@ -621,6 +627,40 @@ async def click_phone_submit(page: Page, field: Locator | None = None) -> bool:
     return False
 
 
+async def ensure_sms_channel_selected(page: Page, logger: Callable[[str], None]) -> None:
+    try:
+        changed = await page.evaluate(
+            """() => {
+                const input = document.querySelector('input[type="radio"][value="sms"], input[name="channel"][value="sms"]');
+                if (!input) return false;
+                if (input.checked) return true;
+                const label = input.closest('label');
+                const target = label || input;
+                target.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                if (!input.checked) {
+                    input.checked = true;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                const hidden = document.querySelector('input[name="channel"]');
+                if (hidden && hidden.value !== 'sms') {
+                    hidden.value = 'sms';
+                    hidden.dispatchEvent(new Event('input', { bubbles: true }));
+                    hidden.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                return true;
+            }"""
+        )
+        if changed:
+            logger("鎵嬫満鍙烽〉: 宸插垏鎹㈤獙璇佺爜鍙戦€佹柟寮忎负鐭俊")
+            await page.wait_for_timeout(500)
+    except Exception as exc:
+        logger(f"鎵嬫満鍙烽〉: 鐭俊閫氶亾鍒囨崲澶辫触锛岀户缁彁浜? {short_error_text(exc)}")
+
+
 async def fill_phone_and_wait_sms_page(page: Page, phone: str, country: PhoneCountry, logger: Callable[[str], None]) -> None:
     logger(f"手机号页: 准备填入手机号 | 国家={country.name}, ISO={country.iso_code or '-'}, 区号=+{country.dial_code or '-'}")
     await select_phone_country(page, country, logger)
@@ -631,14 +671,19 @@ async def fill_phone_and_wait_sms_page(page: Page, phone: str, country: PhoneCou
     current_country = await current_phone_country_code(page)
     if country.dial_code and current_country != country.dial_code:
         raise RuntimeError(f"国家选择未生效：页面=+{current_country or '-'}，目标=+{country.dial_code}")
+    if not phone_matches_country(phone, country):
+        raise RuntimeError(f"PHONE_COUNTRY_MISMATCH: phone={phone}, target=+{country.dial_code}")
     value = local_phone_number(phone, country)
     logger(f"手机号页: 接码号码={phone}，页面国家=+{current_country or '-'}，输入本地号码={value}")
     await human_fill(phone_input, value, force_mouse=True)
+    await ensure_sms_channel_selected(page, logger)
     logger("手机号页: 手机号已填入页面")
     if not await click_phone_submit(page, phone_input):
         raise RuntimeError("手机号提交按钮点击失败")
     logger("手机号页: 已点击继续/提交，等待短信验证码页")
     await page.wait_for_timeout(3000)
+    if await page_looks_like_phone_rejected(page):
+        raise RuntimeError("PHONE_REJECTED: phone rejected by page after submit")
 
 
 async def find_sms_code_input(page: Page) -> Locator | None:
@@ -674,6 +719,23 @@ async def page_looks_like_sms_verification(page: Page) -> bool:
         return True
     text = (await body_text(page)).lower()
     return bool(await find_sms_code_input(page) and any(hint in text for hint in ("sms", "text message", "verification code", "验证码", "短信")))
+
+
+async def page_looks_like_phone_rejected(page: Page) -> bool:
+    text = (await body_text(page)).lower()
+    return any(
+        hint in text
+        for hint in (
+            "invalid phone number",
+            "phone number is not valid",
+            "this phone number is not supported",
+            "try a different phone number",
+            "use a different phone number",
+            "手机号无效",
+            "电话号码无效",
+            "电话号码不可用",
+        )
+    )
 
 
 async def wait_for_sms_verification_page(page: Page, logger: Callable[[str], None], timeout: int = 45) -> bool:
@@ -762,7 +824,7 @@ async def current_phone_country_code(page: Page) -> str:
         return str(
             await page.evaluate(
                 r"""() => {
-                    for (const node of document.querySelectorAll('button, select')) {
+                    for (const node of document.querySelectorAll('button[aria-haspopup="listbox"], button, .react-aria-SelectValue')) {
                         const text = (node.innerText || node.textContent || '').trim();
                         const match = text.match(/\+(\d+)/);
                         if (match) return match[1];

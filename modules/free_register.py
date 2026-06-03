@@ -399,7 +399,7 @@ async def run_free_register_once(
 
 
 async def phase1_phone_register(flow: FreeBrowserFlow, sms_selection: dict[str, object], profile: FreeProfile, prefix: str) -> None:
-    from .hero_sms_provider import PhoneCountry
+    from .hero_sms_provider import PhoneCountry, phone_matches_country
 
     log(f"{prefix}\n=========================================")
     log(f"{prefix} [阶段1] 开始 ChatGPT 手机号注册流程")
@@ -427,6 +427,12 @@ async def phase1_phone_register(flow: FreeBrowserFlow, sms_selection: dict[str, 
         activation = await asyncio.to_thread(provider.get_number, service, country_arg, operator=operator_value)
         sms_selection["last_phone"] = activation.phone_number
         sms_selection["last_activation"] = activation
+        if not phone_matches_country(activation.phone_number, country):
+            bad_phone = activation.phone_number
+            await asyncio.to_thread(provider.cancel, activation.activation_id)
+            sms_selection.pop("last_activation", None)
+            activation = None
+            raise FreeRegisterError(f"PHONE_COUNTRY_MISMATCH: phone={bad_phone}, target=+{country.dial_code}")
         await asyncio.to_thread(provider.mark_ready, activation.activation_id)
 
         await flow.select_country(country.dial_code, country.name, country.iso_code)
@@ -690,7 +696,7 @@ async def phase1_email_register(
     prefix: str,
 ) -> None:
     """邮箱优先注册：邮箱 → 邮箱验证码 → 设密码 → about-you → 手机号+SMS → 完成帐户创建。"""
-    from .hero_sms_provider import PhoneCountry
+    from .hero_sms_provider import PhoneCountry, phone_matches_country
 
     log(f"{prefix}\n=========================================")
     log(f"{prefix} [阶段1] 邮箱优先注册 ChatGPT")
@@ -752,6 +758,11 @@ async def phase1_email_register(
     activation = await asyncio.to_thread(provider.get_number, service, country_arg, operator=operator_value)
     sms_selection["last_phone"] = activation.phone_number
     sms_selection["last_activation"] = activation
+    if not phone_matches_country(activation.phone_number, country):
+        bad_phone = activation.phone_number
+        await asyncio.to_thread(provider.cancel, activation.activation_id)
+        sms_selection.pop("last_activation", None)
+        raise FreeRegisterError(f"PHONE_COUNTRY_MISMATCH: phone={bad_phone}, target=+{country.dial_code}")
     await asyncio.to_thread(provider.mark_ready, activation.activation_id)
     number_used = False
 
@@ -790,7 +801,7 @@ async def phase2_email_oauth_token(
 
     OAuth 阶段可能要求绑手机号（/add-phone），此时才 lazy 拉号。
     """
-    from .hero_sms_provider import PhoneCountry
+    from .hero_sms_provider import PhoneCountry, phone_matches_country
 
     log(f"{prefix}\n=========================================")
     log(f"{prefix} [阶段2] Codex OAuth（邮箱+密码登录获取 Token）")
@@ -818,6 +829,11 @@ async def phase2_email_oauth_token(
             activation = await asyncio.to_thread(provider.get_number, service, country_arg, operator=operator_value)
             sms_selection["last_phone"] = activation.phone_number
             sms_selection["last_activation"] = activation
+            if not phone_matches_country(activation.phone_number, country):
+                bad_phone = activation.phone_number
+                await asyncio.to_thread(provider.cancel, activation.activation_id)
+                sms_selection.pop("last_activation", None)
+                raise FreeRegisterError(f"PHONE_COUNTRY_MISMATCH: phone={bad_phone}, target=+{country.dial_code}")
             await asyncio.to_thread(provider.mark_ready, activation.activation_id)
             oauth_opts["phone"] = activation.phone_number
 
