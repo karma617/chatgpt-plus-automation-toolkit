@@ -29,7 +29,12 @@ PAYPAL_OUTPUT_ROOT = resolve_path("output/paypal注册")
 LINK_POOL_FILE = PAYPAL_OUTPUT_ROOT / "长链接账号" / "account.txt"
 PENDING_AUTH_DIR = PAYPAL_OUTPUT_ROOT / "待授权账号"
 PENDING_AUTH_FILE = PENDING_AUTH_DIR / "account.txt"
-PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_JP_PREFECTURE_FIX_2026-05-31_01"
+PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_NONZERO_AMOUNT_DOM_WAIT_2026-06-03_03"
+PAYPAL_FLOW2_NONZERO_AMOUNT = "nonzero_checkout_amount"
+
+
+def _zh(text: str) -> str:
+    return text.encode("ascii").decode("unicode_escape")
 
 _RANDOM_CARD_PROFILES: list[tuple[str, str, str, str, str]] = [
     ("New York", "NY", "10001", "W 34th St", "US"),
@@ -562,6 +567,276 @@ def remove_from_link_pool(email: str) -> None:
     lines = LINK_POOL_FILE.read_text(encoding="utf-8").splitlines()
     remaining = [l for l in lines if not l.strip().lower().startswith(email.lower())]
     LINK_POOL_FILE.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
+
+
+def discard_flow2_link(email: str, *, reason: str) -> None:
+    remove_from_link_pool(email)
+    paypal_flow_state.append_discarded_emails([email], reason=reason)
+    paypal_flow_state.mark_discarded_many([email], reason=reason)
+
+
+_CHECKOUT_AMOUNT_KEYWORDS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        0,
+        (
+            "due today",
+            "total due",
+            "amount due",
+            "due now",
+            "today's total",
+            "today total",
+            _zh(r"\u672c\u65e5"),
+            _zh(r"\u4eca\u65e5"),
+            _zh(r"\u304a\u652f\u6255\u3044"),
+            _zh(r"\u652f\u6255\u3044"),
+            _zh(r"\u652f\u6255"),
+            _zh(r"\u8acb\u6c42"),
+            _zh(r"\u5e94\u4ed8"),
+            _zh(r"\u61c9\u4ed8"),
+            _zh(r"\u652f\u4ed8"),
+        ),
+    ),
+    (
+        1,
+        (
+            "total",
+            "amount",
+            _zh(r"\u5408\u8a08"),
+            _zh(r"\u603b\u8ba1"),
+            _zh(r"\u7e3d\u8a08"),
+            _zh(r"\u5408\u8ba1"),
+            _zh(r"\u91d1\u989d"),
+            _zh(r"\u91d1\u984d"),
+        ),
+    ),
+    (
+        2,
+        (
+            "pay now",
+            "pay ",
+            "pay\n",
+        ),
+    ),
+)
+
+_MONEY_RE = re.compile(
+    r"(?i)(?:US\$|CA\$|AU\$|[$\uFFE5\u00A5]|USD|JPY|EUR|GBP)\s*[-+]?\d[\d,]*(?:\.\d{1,2})?"
+    r"|[-+]?\d[\d,]*(?:\.\d{1,2})?\s*(?:USD|JPY|EUR|GBP|\u5186)"
+)
+
+
+def _money_value(raw: str) -> float | None:
+    text = str(raw or "").strip()
+    number = re.sub(r"(?i)(US\$|CA\$|AU\$|USD|JPY|EUR|GBP|\u5186|[$\uFFE5\u00A5]|\s)", "", text)
+    number = re.sub(r"[^0-9,.\-+]", "", number)
+    if not number or not re.search(r"\d", number):
+        return None
+    if "," in number and "." not in number:
+        last = number.rsplit(",", 1)[-1]
+        if len(last) in {1, 2}:
+            number = number.replace(".", "").replace(",", ".")
+        else:
+            number = number.replace(",", "")
+    else:
+        number = number.replace(",", "")
+    try:
+        return float(number)
+    except ValueError:
+        return None
+
+
+def _money_candidates(text: str, *, limit: int = 8) -> list[str]:
+    seen: set[str] = set()
+    values: list[str] = []
+    for match in _MONEY_RE.finditer(str(text or "")):
+        item = re.sub(r"\s+", " ", match.group(0)).strip()
+        if item and item not in seen:
+            seen.add(item)
+            values.append(item)
+        if len(values) >= limit:
+            break
+    return values
+
+
+def classify_checkout_amount_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    parsed: list[dict[str, Any]] = []
+    raw_candidates: list[str] = []
+    for idx, candidate in enumerate(candidates or []):
+        text = str(candidate.get("text") or "").strip()
+        selector = str(candidate.get("selector") or "").strip()
+        if not text:
+            continue
+        for raw_amount in _money_candidates(text, limit=3):
+            value = _money_value(raw_amount)
+            if value is None:
+                continue
+            priority_value = candidate.get("priority")
+            priority = priority_value if isinstance(priority_value, int) else 50
+            if raw_amount not in raw_candidates:
+                raw_candidates.append(raw_amount)
+            parsed.append(
+                {
+                    "priority": priority,
+                    "index": idx,
+                    "amount_text": raw_amount,
+                    "amount_value": value,
+                    "selector": selector,
+                    "source_text": text[:500],
+                }
+            )
+            break
+
+    if not parsed:
+        return {
+            "status": "unknown",
+            "reason": "no_dom_amount_candidate",
+            "amount_candidates": raw_candidates[:8],
+        }
+
+    parsed.sort(key=lambda item: (int(item["priority"]), int(item["index"])))
+    selected = parsed[0]
+    status = "nonzero" if abs(float(selected["amount_value"])) > 0.000001 else "zero"
+    return {
+        "status": status,
+        "amount_text": selected["amount_text"],
+        "amount_value": selected["amount_value"],
+        "source_text": selected["source_text"],
+        "selector": selected["selector"],
+        "amount_candidates": raw_candidates[:8],
+    }
+
+
+def classify_checkout_due_amount(text: str) -> dict[str, Any]:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in str(text or "").splitlines()]
+    lines = [line for line in lines if line]
+    candidates: list[dict[str, Any]] = []
+    for idx, line in enumerate(lines):
+        lower = line.lower()
+        priority = None
+        for candidate_priority, keywords in _CHECKOUT_AMOUNT_KEYWORDS:
+            if any(keyword in lower or keyword in line for keyword in keywords):
+                priority = candidate_priority
+                break
+        if priority is None:
+            continue
+        for amount_idx in range(idx, min(idx + 4, len(lines))):
+            matches = list(_MONEY_RE.finditer(lines[amount_idx]))
+            if not matches:
+                continue
+            raw_amount = matches[0].group(0)
+            value = _money_value(raw_amount)
+            if value is None:
+                continue
+            candidates.append(
+                {
+                    "priority": priority,
+                    "line": idx,
+                    "amount_line": amount_idx,
+                    "amount_text": raw_amount,
+                    "amount_value": value,
+                    "source_text": " | ".join(lines[idx : amount_idx + 1])[:500],
+                }
+            )
+            break
+
+    if not candidates:
+        return {
+            "status": "unknown",
+            "reason": "no_due_amount_candidate",
+            "amount_candidates": _money_candidates(text),
+        }
+
+    candidates.sort(key=lambda item: (int(item["priority"]), int(item["line"]), int(item["amount_line"])))
+    selected = candidates[0]
+    status = "nonzero" if abs(float(selected["amount_value"])) > 0.000001 else "zero"
+    return {
+        "status": status,
+        "amount_text": selected["amount_text"],
+        "amount_value": selected["amount_value"],
+        "source_text": selected["source_text"],
+    }
+
+
+async def inspect_checkout_due_amount(page) -> dict[str, Any]:
+    wait_error = ""
+    try:
+        await page.wait_for_selector(
+            "#OrderDetails-TotalAmount .CurrencyAmount, "
+            "#OrderDetails-TotalAmount, "
+            "#ProductSummary-totalAmount .CurrencyAmount, "
+            "[data-testid=\"product-summary-total-amount\"] .CurrencyAmount, "
+            ".CurrencyAmount",
+            state="attached",
+            timeout=10000,
+        )
+    except Exception as exc:
+        wait_error = str(exc)[:160]
+
+    try:
+        dom_candidates = await page.evaluate(
+            """() => {
+                const textOf = (el) => (el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width >= 0 && rect.height >= 0;
+                };
+                const out = [];
+                const push = (selector, priority, label) => {
+                    for (const el of document.querySelectorAll(selector)) {
+                        const text = textOf(el);
+                        if (!text || !visible(el)) continue;
+                        out.push({ selector, priority, label, text });
+                    }
+                };
+                push('#OrderDetails-TotalAmount .CurrencyAmount, #OrderDetails-TotalAmount', 0, 'order_total');
+                push('[data-testid="order-details-total-amount"] .CurrencyAmount, [data-testid="order-details-total-amount"]', 0, 'order_total_testid');
+                push('.OrderDetails-total .CurrencyAmount, .OrderDetails-total', 0, 'order_total_class');
+                push('button[type="submit"] .CurrencyAmount, button[type="submit"], [data-testid*="submit"] .CurrencyAmount', 1, 'submit_amount');
+                push('[data-testid="order-details-footer-subtotal-amount"] .CurrencyAmount, [data-testid="order-details-footer-subtotal-amount"]', 4, 'subtotal');
+                push('#ProductSummary-totalAmount .CurrencyAmount, #ProductSummary-totalAmount', 6, 'product_summary');
+                push('[data-testid="product-summary-total-amount"] .CurrencyAmount, [data-testid="product-summary-total-amount"]', 6, 'product_summary_testid');
+                push('[data-testid="line-item-total-amount"] .CurrencyAmount, [data-testid="line-item-total-amount"]', 8, 'line_item');
+                for (const el of document.querySelectorAll('.CurrencyAmount, [class*="CurrencyAmount"]')) {
+                    const text = textOf(el);
+                    if (!text || !visible(el)) continue;
+                    const ctx = el.closest('[id], [data-testid], .OrderDetails-total, .LineItem, .ProductSummary, .YGErOEoF__Subtotal');
+                    const ctxText = textOf(ctx).slice(0, 500);
+                    let priority = 20;
+                    const hay = `${ctx?.id || ''} ${ctx?.getAttribute('data-testid') || ''} ${ctx?.className || ''} ${ctxText}`.toLowerCase();
+                    if (/orderdetails-totalamount|orderdetails-total|order-details-total/.test(hay)) priority = 0;
+                    else if (/subtotal|tax|fee/.test(hay)) priority = 7;
+                    else if (/productsummary|product-summary|line-item/.test(hay)) priority = 8;
+                    out.push({ selector: 'currency_amount_scan', priority, label: 'scan', text: ctxText || text });
+                }
+                return out.slice(0, 80);
+            }"""
+        )
+        dom_result = classify_checkout_amount_candidates(dom_candidates if isinstance(dom_candidates, list) else [])
+        if dom_result.get("status") != "unknown":
+            dom_result["source"] = "dom"
+            return dom_result
+        if wait_error:
+            dom_result["wait_error"] = wait_error
+    except Exception:
+        dom_result = {
+            "status": "unknown",
+            "reason": "dom_amount_probe_failed",
+            "wait_error": wait_error,
+            "amount_candidates": [],
+        }
+
+    try:
+        text = await page.locator("body").inner_text(timeout=5000)
+    except Exception as exc:
+        return {"status": "unknown", "reason": f"read_body_failed:{exc}"}
+    text_result = classify_checkout_due_amount(text)
+    if text_result.get("status") == "unknown" and dom_result.get("amount_candidates"):
+        text_result["amount_candidates"] = dom_result.get("amount_candidates")
+    if text_result.get("status") == "unknown" and dom_result.get("wait_error"):
+        text_result["wait_error"] = dom_result.get("wait_error")
+    return text_result
 
 
 def generate_paypal_password(email: str) -> str:
@@ -3416,6 +3691,7 @@ async def pay_one(
         slow_mo=int(browser_cfg.get("slow_mo", 80)),
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
+        isolated=True,
         fingerprint_seed=email,
     )
 
@@ -3444,6 +3720,38 @@ async def pay_one(
         except Exception:
             pass
         await page.wait_for_timeout(1200)
+        due_amount = await inspect_checkout_due_amount(page)
+        if due_amount.get("status") == "nonzero":
+            reason = (
+                f"{PAYPAL_FLOW2_NONZERO_AMOUNT}: "
+                f"{due_amount.get('amount_text') or due_amount.get('amount_value')} | "
+                f"{due_amount.get('source_text') or ''}"
+            )
+            log(
+                f"{prefix} "
+                + _zh(r"\u68c0\u6d4b\u5230\u652f\u4ed8\u9875\u5e94\u4ed8\u91d1\u989d\u975e 0\uff0c\u4f5c\u5e9f\u8be5\u8d26\u53f7\u5e76\u8df3\u5230\u4e0b\u4e00\u4e2a: ")
+                + f"{due_amount.get('amount_text') or due_amount.get('amount_value')}"
+            )
+            discard_flow2_link(email, reason=reason)
+            if last_error is not None:
+                last_error["reason"] = PAYPAL_FLOW2_NONZERO_AMOUNT
+            return False
+        if due_amount.get("status") == "zero":
+            log(
+                f"{prefix} "
+                + _zh(r"\u652f\u4ed8\u9875\u5e94\u4ed8\u91d1\u989d\u786e\u8ba4\u4e3a 0\uff0c\u7ee7\u7eed\u6d41\u7a0b: ")
+                + f"{due_amount.get('amount_text') or due_amount.get('amount_value')}"
+                + f" source={due_amount.get('source') or 'text'} selector={due_amount.get('selector') or ''}"
+            )
+        else:
+            candidates_text = ", ".join(str(item) for item in (due_amount.get("amount_candidates") or [])[:8])
+            log(
+                f"{prefix} "
+                + _zh(r"\u672a\u8bc6\u522b\u652f\u4ed8\u9875\u5e94\u4ed8\u91d1\u989d\uff0c\u6309\u539f\u6d41\u7a0b\u7ee7\u7eed: ")
+                + str(due_amount.get("reason") or "unknown")
+                + (f" wait={due_amount.get('wait_error')}" if due_amount.get("wait_error") else "")
+                + (f" candidates={candidates_text}" if candidates_text else "")
+            )
 
         # Stripe
         log(f"{prefix} Stripe 填充...")
@@ -3614,55 +3922,104 @@ async def run_paypal_pay(
         log("PayPal 流程2：手机号池为空")
         return 0
 
-    target = min(count, len(pool), phone_pool.count()) if local_random_mode else min(count, len(pool), card_pool.count())
+    capacity = min(len(pool), phone_pool.count()) if local_random_mode else min(len(pool), card_pool.count())
+    target = min(count, capacity)
     card_desc = "本地随机" if local_random_mode else str(card_pool.count())
     log(f"PayPal 流程2：长链接 {len(pool)} 个，卡 {card_desc} 张，手机号 {phone_pool.count()} 个，本次目标 {target}，并发 {workers}")
 
     success = 0
+    skipped_nonzero = 0
+    attempted = 0
+    active_slots = 0
+    failed_slots = 0
+    next_index = 0
     sem = asyncio.Semaphore(workers)
+    queue_lock = asyncio.Lock()
 
-    async def worker(index: int, item: dict[str, str]) -> None:
-        nonlocal success
+    async def next_item() -> tuple[int, dict[str, str]] | None:
+        nonlocal active_slots, next_index
+        async with queue_lock:
+            if success + failed_slots + active_slots >= target:
+                return None
+            if next_index >= len(pool):
+                return None
+            index = next_index
+            next_index += 1
+            active_slots += 1
+            return index + 1, pool[index]
+
+    async def worker(index: int) -> None:
+        nonlocal active_slots, attempted, failed_slots, skipped_nonzero, success
         async with sem:
-            if local_random_mode:
-                card = _generate_local_random_card(index, item["email"], env, region_mode=resolved_region_mode)
-            else:
-                card = card_pool.take_one()
-                if not card:
-                    log(f"[paypal-pay-{index:02d}] 卡池已空")
+            while True:
+                picked = await next_item()
+                if not picked:
                     return
-            proxies = proxy_pool.sequence(index) if proxy_pool else [fallback_proxy or None]
-            ok = False
-            for proxy_attempt, proxy in enumerate(proxies, start=1):
-                last_error: dict[str, str] = {}
-                ok = await pay_one(
-                    item,
-                    card,
-                    phone_pool,
-                    cfg,
-                    worker_id=index,
-                    max_phone_retries=max_retries,
-                    proxy=proxy,
-                    flow2_region_mode=resolved_region_mode,
-                    last_error=last_error,
-                )
+                item_number, item = picked
+                attempted += 1
+                if local_random_mode:
+                    card = _generate_local_random_card(item_number, item["email"], env, region_mode=resolved_region_mode)
+                else:
+                    card = card_pool.take_one()
+                    if not card:
+                        log(f"[paypal-pay-{index:02d}] 卡池已空")
+                        async with queue_lock:
+                            active_slots = max(0, active_slots - 1)
+                            failed_slots += 1
+                        return
+                proxies = proxy_pool.sequence(item_number) if proxy_pool else [fallback_proxy or None]
+                ok = False
+                flow2_discarded = False
+                for proxy_attempt, proxy in enumerate(proxies, start=1):
+                    last_error: dict[str, str] = {}
+                    ok = await pay_one(
+                        item,
+                        card,
+                        phone_pool,
+                        cfg,
+                        worker_id=index,
+                        max_phone_retries=max_retries,
+                        proxy=proxy,
+                        flow2_region_mode=resolved_region_mode,
+                        last_error=last_error,
+                    )
+                    reason = last_error.get("reason", "")
+                    if ok:
+                        break
+                    if reason == PAYPAL_FLOW2_NONZERO_AMOUNT:
+                        skipped_nonzero += 1
+                        flow2_discarded = True
+                        async with queue_lock:
+                            active_slots = max(0, active_slots - 1)
+                        break
+                    if not proxy_pool or proxy_attempt >= len(proxies) or not _is_proxy_failure(reason):
+                        break
+                    log(
+                        f"[paypal-pay-{index:02d}][{item['email']}] "
+                        f"代理失败，切换下一条代理 ({proxy_attempt}/{len(proxies)}): {_display_proxy(proxy)}"
+                    )
+                if ok and not local_random_mode:
+                    card_pool.remove(card)
                 if ok:
-                    break
-                reason = last_error.get("reason", "")
-                if not proxy_pool or proxy_attempt >= len(proxies) or not _is_proxy_failure(reason):
-                    break
-                log(
-                    f"[paypal-pay-{index:02d}][{item['email']}] "
-                    f"代理失败，切换下一条代理 ({proxy_attempt}/{len(proxies)}): {_display_proxy(proxy)}"
-                )
-            if ok and not local_random_mode:
-                card_pool.remove(card)
-            if ok:
-                success += 1
+                    async with queue_lock:
+                        active_slots = max(0, active_slots - 1)
+                        success += 1
+                if not ok and not flow2_discarded:
+                    async with queue_lock:
+                        active_slots = max(0, active_slots - 1)
+                        failed_slots += 1
+                    return
 
-    tasks = [asyncio.create_task(worker(i + 1, item)) for i, item in enumerate(pool[:target])]
+    tasks = [asyncio.create_task(worker(i + 1)) for i in range(max(1, workers))]
     await asyncio.gather(*tasks)
-    log(f"PayPal 流程2 完成：成功 {success}/{target}")
+    if skipped_nonzero:
+        log(
+            f"PayPal 流程2 完成：成功 {success}/{target}，"
+            + _zh(r"\u975e 0 \u91d1\u989d\u4f5c\u5e9f ")
+            + f"{skipped_nonzero}，attempted={attempted}/{len(pool)}"
+        )
+    else:
+        log(f"PayPal 流程2 完成：成功 {success}/{target}")
     return success
 
 

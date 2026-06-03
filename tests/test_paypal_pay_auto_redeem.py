@@ -356,3 +356,50 @@ def test_run_paypal_pay_rotates_proxy_on_proxy_failure(monkeypatch, tmp_path: Pa
         "http://bad-proxy.example.test:1080",
         "http://good-proxy.example.test:1080",
     ]
+
+
+def test_run_paypal_pay_replaces_nonzero_discard_with_next_link(monkeypatch, tmp_path: Path) -> None:
+    phones_file = tmp_path / "phones.txt"
+    links_file = tmp_path / "links.txt"
+    phones_file.write_text("15555550123|https://sms.example.test/get\n", encoding="utf-8")
+    links_file.write_text(
+        "\n".join(
+            [
+                "bad@example.com----query-code----https://pay.example.test/nonzero",
+                "good@example.com----query-code----https://pay.example.test/zero",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                f"PAYPAL_PHONES_FILE={phones_file}",
+                "PAYPAL_USE_PROXY=false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    attempted: list[str] = []
+
+    async def fake_pay_one(item, *args, **kwargs):
+        attempted.append(item["email"])
+        if item["email"] == "bad@example.com":
+            paypal_pay.discard_flow2_link(item["email"], reason="nonzero_checkout_amount: US$20.00")
+            kwargs["last_error"]["reason"] = paypal_pay.PAYPAL_FLOW2_NONZERO_AMOUNT
+            return False
+        return True
+
+    monkeypatch.setattr(utils, "PROJECT_ROOT", tmp_path)
+    _use_paypal_files(monkeypatch, tmp_path, links_file)
+    monkeypatch.setattr(paypal_pay, "pay_one", fake_pay_one)
+
+    result = asyncio.run(paypal_pay.run_paypal_pay({}, count=1, workers=1, card_source_mode="local_random"))
+
+    assert result == 1
+    assert attempted == ["bad@example.com", "good@example.com"]
+    assert "bad@example.com" not in links_file.read_text(encoding="utf-8")
+    assert "good@example.com" in links_file.read_text(encoding="utf-8")
+    assert "bad@example.com" in (tmp_path / "paypal_flow_discarded_emails.txt").read_text(encoding="utf-8")

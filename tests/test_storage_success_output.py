@@ -26,3 +26,20 @@ def test_save_success_keeps_legacy_three_part_output_without_account_line(tmp_pa
     store.save_success("user@example.com", "code-address", "payment-link")
 
     assert (tmp_path / "success.txt").read_text(encoding="utf-8") == "user@example.com----code-address----payment-link\n"
+
+
+def test_account_store_skips_blocked_emails(tmp_path) -> None:
+    store = _store(tmp_path)
+    (tmp_path / "accounts.txt").write_text(
+        "blocked@example.com----pw\nnext@example.com----pw\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "raw.txt").write_text(
+        "blocked@example.com----pw\nnext@example.com----pw\n",
+        encoding="utf-8",
+    )
+    store.blocked_emails = {"blocked@example.com"}
+
+    assert store.pending_count() == 1
+    assert store.next_email() == "next@example.com"
+    assert store.claim_next(1).email == "next@example.com"

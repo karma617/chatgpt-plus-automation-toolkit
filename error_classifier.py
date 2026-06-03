@@ -27,8 +27,14 @@ def classify_error(text: str) -> str:
         return "oauth_consent_callback_missing"
     if "鏈崟鑾峰埌 oauth authorization code" in value or "oauth_callback_missing" in value:
         return "oauth_callback_missing"
+    if "auth_sms_country_exhausted" in value or "auth_sms_country_no_number" in value or "auth_sms_page_left_phone_form" in value:
+        return "auth_sms_country_exhausted"
+    if "auth_sms_code_page_retry_exhausted" in value or "auth_sms_reuse_phone_exhausted" in value or "sms_code_timeout_60s" in value:
+        return "phone_required"
     if "auth_phone_link_limit" in value or "phone_link_limit" in value or "最大账户" in value:
         return "auth_phone_link_limit"
+    if "[fail:phone_required]" in value or "phone_required" in value or "手机号必填" in value:
+        return "phone_required"
     if "token 浜ゆ崲澶辫触" in value or "exchange token" in value:
         return "token_exchange_failed"
     if "鏈嶅姟鍣ㄤ笂浼?" in value or "server upload" in value:

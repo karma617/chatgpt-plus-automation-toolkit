@@ -109,6 +109,10 @@ UTF8_READ_ENCODING = "utf-8-sig"
 UTF8_WRITE_ENCODING = "utf-8"
 
 
+def _u(text: str) -> str:
+    return text.encode("ascii").decode("unicode_escape")
+
+
 def mark_failure(args, message: str, *, error_type: str = "") -> str:
     category = error_type or classify_error(message)
     if args is not None:
@@ -116,6 +120,47 @@ def mark_failure(args, message: str, *, error_type: str = "") -> str:
         setattr(args, "error_type", category)
     print(f"[fail:{category}] {message}", file=sys.stderr)
     return category
+
+
+def auth_sms_state_path(args) -> Path | None:
+    value = str(getattr(args, "auth_sms_state_file", "") or "").strip()
+    if not value:
+        return None
+    return Path(value)
+
+
+def load_auth_sms_state(args) -> dict:
+    path = auth_sms_state_path(args)
+    if not path or not path.exists():
+        return {}
+    try:
+        data = json.loads(read_text(path))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_auth_sms_state(args, **updates) -> dict:
+    path = auth_sms_state_path(args)
+    if not path:
+        return {}
+    data = load_auth_sms_state(args)
+    data.update(updates)
+    data["updated_at"] = time.time()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+    return data
+
+
+def clear_auth_sms_reuse_state(args) -> None:
+    path = auth_sms_state_path(args)
+    if not path:
+        return
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
 
 
 def set_auth_stage(args, stage: str) -> None:
@@ -3028,6 +3073,206 @@ def fill_sms_code(page, code: str) -> None:
     time.sleep(4)
 
 
+def sms_no_number_error(exc: Exception | str) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "no_numbers",
+            "no numbers",
+            "no free phones",
+            "select country",
+            "no available",
+            "current no available",
+            "country exhausted",
+            "service_unavailable_region",
+            "no_num",
+            "鏃犲彲鐢",
+            "鏆傛棤",
+            "当前无可用",
+            "暂无可用",
+            "无可用号码",
+        )
+    )
+
+
+def poll_sms_code_with_timeout(provider, activation_id: int, *, interval: float, timeout: float, exclude_codes: set[str] | None = None) -> str:
+    deadline = time.time() + max(1.0, timeout)
+    attempt = 0
+    excluded = {str(item or "").strip() for item in (exclude_codes or set()) if str(item or "").strip()}
+    while time.time() < deadline:
+        attempt += 1
+        print(f"[SMS] " + _u(r"\u62c9\u53d6\u77ed\u4fe1\u9a8c\u8bc1\u7801") + f": activation={activation_id} ({attempt}, timeout={int(timeout)}s)", flush=True)
+        received, code = provider.get_status(activation_id)
+        if received and code:
+            code = str(code).strip()
+            if code in excluded:
+                print("[SMS] " + _u(r"\u62c9\u53d6\u5230\u65e7\u9a8c\u8bc1\u7801\uff0c\u7ee7\u7eed\u7b49\u5f85\u65b0\u9a8c\u8bc1\u7801"), flush=True)
+                time.sleep(max(1.0, min(interval, max(1.0, deadline - time.time()))))
+                continue
+            print(f"[SMS] " + _u(r"\u62c9\u53d6\u5230\u77ed\u4fe1\u9a8c\u8bc1\u7801") + f": {code}", flush=True)
+            return code
+        time.sleep(max(1.0, min(interval, max(1.0, deadline - time.time()))))
+    raise TimeoutError(f"SMS_CODE_TIMEOUT_60S: activation={activation_id}")
+
+
+def auth_sms_ttl_seconds(args) -> int:
+    return max(60, int(getattr(args, "auth_sms_reuse_ttl_seconds", 1200) or 1200))
+
+
+def auth_sms_code_timeout_seconds(args) -> float:
+    return max(5.0, float(getattr(args, "sms_code_timeout", 60.0) or 60.0))
+
+
+def auth_sms_code_page_retry_limit(args) -> int:
+    return max(1, int(getattr(args, "sms_code_page_retry_limit", 5) or 5))
+
+
+def auth_sms_country_payload(country: PhoneCountry) -> dict[str, object]:
+    return {
+        "iso_code": country.iso_code,
+        "dial_code": country.dial_code,
+        "name": country.name,
+        "hero_sms_country": country.hero_sms_country,
+    }
+
+
+def phone_country_from_payload(payload: dict | None, fallback: PhoneCountry) -> PhoneCountry:
+    data = payload if isinstance(payload, dict) else {}
+    try:
+        country_id = int(data.get("hero_sms_country") or fallback.hero_sms_country or 0)
+    except Exception:
+        country_id = fallback.hero_sms_country
+    return PhoneCountry(
+        iso_code=str(data.get("iso_code") or fallback.iso_code or "").strip().upper(),
+        dial_code=str(data.get("dial_code") or fallback.dial_code or "").strip().lstrip("+"),
+        name=str(data.get("name") or fallback.name or country_id or "").strip(),
+        hero_sms_country=country_id,
+    )
+
+
+def auth_sms_reuse_state(args, provider_name: str) -> dict:
+    state = load_auth_sms_state(args)
+    if not state:
+        return {}
+    if str(state.get("provider") or "").strip().lower() != provider_name:
+        return {}
+    activation_id = int(state.get("activation_id") or 0)
+    phone = str(state.get("phone_number") or "").strip()
+    code_received_at = float(state.get("code_received_at") or 0)
+    reuse_until = float(state.get("reuse_until") or 0)
+    if activation_id <= 0 or not phone or code_received_at <= 0:
+        return {}
+    if time.time() >= reuse_until:
+        print("[SMS] " + _u(r"\u4e0a\u4e00\u4e2a\u5df2\u6536\u7801\u624b\u673a\u53f7\u5df2\u8d85\u8fc7 20 \u5206\u949f\uff0c\u4e0d\u518d\u590d\u7528"), flush=True)
+        clear_auth_sms_reuse_state(args)
+        return {}
+    return state
+
+
+def save_auth_sms_page_state(
+    args,
+    *,
+    provider_name: str,
+    label: str,
+    service: str,
+    country: PhoneCountry,
+    country_arg: object,
+    operator: str,
+    activation_id: int,
+    phone_number: str,
+    sms_page_started_at: float,
+) -> None:
+    save_auth_sms_state(
+        args,
+        provider=provider_name,
+        label=label,
+        service=service,
+        country_arg=str(country_arg),
+        operator=operator,
+        activation_id=int(activation_id),
+        phone_number=phone_number,
+        country=auth_sms_country_payload(country),
+        sms_page_started_at=sms_page_started_at,
+        reuse_until=sms_page_started_at + auth_sms_ttl_seconds(args),
+    )
+
+
+def save_auth_sms_code_state(args, *, activation_id: int, code: str) -> None:
+    state = load_auth_sms_state(args)
+    sms_page_started_at = float(state.get("sms_page_started_at") or time.time())
+    reuse_until = sms_page_started_at + auth_sms_ttl_seconds(args)
+    save_auth_sms_state(
+        args,
+        activation_id=int(activation_id),
+        code_received_at=time.time(),
+        last_code=str(code or "").strip(),
+        reuse_until=reuse_until,
+    )
+    print(
+        "[SMS] "
+        + _u(r"\u5df2\u8bb0\u5f55\u5df2\u6536\u7801\u624b\u673a\u53f7\uff0c20 \u5206\u949f\u5185\u6388\u6743\u62a2\u6551\u4f18\u5148\u590d\u7528"),
+        flush=True,
+    )
+
+
+def complete_auth_sms_state(args) -> None:
+    state = load_auth_sms_state(args)
+    if not state:
+        return
+    activation_id = int(state.get("activation_id") or 0)
+    provider_name = str(state.get("provider") or "").strip().lower()
+    if activation_id <= 0 or not provider_name:
+        clear_auth_sms_reuse_state(args)
+        return
+    try:
+        api_key = str(getattr(args, "sms_api_key", "") or getattr(args, "hero_sms_api_key", "") or "").strip()
+        if provider_name == "grizzly":
+            provider = GrizzlySMSProvider(api_key)
+        elif provider_name == "fivesim":
+            provider = FiveSimProvider(api_key)
+        elif provider_name == "smsbower":
+            provider = SmsBowerProvider(api_key, base_url=str(getattr(args, "sms_api_url", "") or "").strip() or "https://smsbower.app/stubs/handler_api.php")
+        else:
+            provider = HeroSMSProvider(api_key)
+        provider.complete(activation_id)
+    except Exception as exc:
+        print(f"[SMS] " + _u(r"\u6388\u6743\u6210\u529f\u540e\u5b8c\u6210\u63a5\u7801\u6fc0\u6d3b\u5931\u8d25\uff0c\u4e0d\u5f71\u54cd AT/RT \u843d\u76d8") + f": {exc}", flush=True)
+    finally:
+        clear_auth_sms_reuse_state(args)
+
+
+def goto_add_phone_for_retry(page) -> None:
+    try:
+        page.goto("https://auth.openai.com/add-phone", wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
+    except Exception as exc:
+        raise RuntimeError(f"AUTH_SMS_ADD_PHONE_GOTO_FAILED: {exc}") from exc
+
+
+def wait_sms_verification_page(page, remaining_seconds, *, label: str) -> float:
+    deadline = time.time() + min(max(10, int(remaining_seconds())), 75)
+    wait_round = 0
+    while time.time() < deadline:
+        wait_round += 1
+        if is_phone_link_limit_page(page):
+            raise RuntimeError("PHONE_LINK_LIMIT: phone linked to maximum accounts")
+        if is_phone_number_rejected_page(page):
+            raise RuntimeError("PHONE_REJECTED: phone rejected by page")
+        if page_looks_like_sms_verification(page):
+            now = time.time()
+            print(f"[SMS] {label} " + _u(r"\u9875\u9762\u5df2\u8fdb\u5165\u77ed\u4fe1\u9a8c\u8bc1\u7801\u9636\u6bb5"), flush=True)
+            return now
+        if capture_code_from_url(page.url):
+            return time.time()
+        if wait_round == 1 or wait_round % 5 == 0:
+            print(f"[SMS] {label} " + _u(r"\u7b49\u5f85\u77ed\u4fe1\u9a8c\u8bc1\u7801\u8f93\u5165\u9875\u51fa\u73b0") + f"... url={page.url}", flush=True)
+        time.sleep(1)
+    if is_phone_required_page(page):
+        raise RuntimeError("PHONE_STILL_REQUIRED: phone form still visible after submit")
+    raise RuntimeError("AUTH_SMS_VERIFICATION_PAGE_TIMEOUT")
+
+
 def handle_phone_required_with_hero_sms(page, args, remaining_seconds) -> bool:
     if not hero_sms_enabled(args):
         return False
@@ -3180,75 +3425,239 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
         provider = HeroSMSProvider(api_key)
         label = "HeroSMS"
     country = selected_sms_country(args)
-    activation = None
-    try:
-        default_service = "openai" if provider_name == "fivesim" else "dr"
-        service = str(getattr(args, "sms_service", "") or getattr(args, "hero_sms_service", "") or default_service).strip() or default_service
-        operator = str(getattr(args, "sms_operator", "") or getattr(args, "hero_sms_operator", "") or "").strip()
-        if provider_name == "fivesim" and not operator:
-            operator = "any"
+    default_service = "openai" if provider_name == "fivesim" else "dr"
+    service = str(getattr(args, "sms_service", "") or getattr(args, "hero_sms_service", "") or default_service).strip() or default_service
+    operator = str(getattr(args, "sms_operator", "") or getattr(args, "hero_sms_operator", "") or "").strip()
+    if provider_name == "fivesim" and not operator:
+        operator = "any"
+    poll_interval = float(getattr(args, "sms_poll_interval", 0) or getattr(args, "hero_sms_poll_interval", 5.0) or 5.0)
+    max_attempts = int(getattr(args, "sms_max_attempts", 0) or getattr(args, "hero_sms_max_attempts", 60) or 60)
+    phone_retry_limit = max(1, int(getattr(args, "sms_phone_retry_limit", 50) or 50))
+    phone_retry_interval = max(0.0, float(getattr(args, "sms_phone_retry_interval", 5.0) or 5.0))
+    operator_label = operator or _u(r"\u4efb\u4f55\u8fd0\u8425\u5546")
+    print(
+        f"[SMS] {label} "
+        + _u(r"\u81ea\u52a8\u63a5\u7801\u542f\u52a8")
+        + f": service={service}, country={country.name}({country.hero_sms_country}), "
+        + f"operator={operator_label}, "
+        + f"phone_retry={phone_retry_limit}, retry_interval={phone_retry_interval:g}s",
+        flush=True,
+    )
+    if provider_name == "fivesim":
+        slug = str(getattr(args, "fivesim_country_slug", "") or "").strip().lower()
+        if not slug:
+            # Fallback: map ISO to 5sim country slug.
+            from modules.fivesim_sms_provider import FIVESIM_ISO_TO_COUNTRY
+
+            slug = FIVESIM_ISO_TO_COUNTRY.get(country.iso_code.upper(), "")
+        if not slug:
+            raise RuntimeError("5sim missing country slug")
+        country_arg = slug
+    else:
+        country_arg = country.hero_sms_country
+
+    code_timeout = auth_sms_code_timeout_seconds(args)
+    code_page_retry_limit = auth_sms_code_page_retry_limit(args)
+
+    reusable_state = auth_sms_reuse_state(args, provider_name)
+    if reusable_state:
+        reused_country = phone_country_from_payload(reusable_state.get("country"), country)
+        reused_activation_id = int(reusable_state.get("activation_id") or 0)
+        reused_phone = str(reusable_state.get("phone_number") or "").strip()
+        reused_country_arg = reusable_state.get("country_arg") or country_arg
+        reused_operator = str(reusable_state.get("operator") or operator or "").strip()
+        excluded_codes: set[str] = set()
+        last_code = str(reusable_state.get("last_code") or "").strip()
+        if last_code:
+            excluded_codes.add(last_code)
         print(
-            f"[SMS] {label} 自动接码启动: service={service}, country={country.name}({country.hero_sms_country}), "
-            f"operator={operator or '任何运营商'}",
+            f"[SMS] {label} "
+            + _u(r"\u68c0\u6d4b\u5230 20 \u5206\u949f\u5185\u5df2\u6536\u7801\u624b\u673a\u53f7\uff0c\u672c\u8f6e\u4f18\u5148\u590d\u7528")
+            + f": phone={reused_phone}, activation={reused_activation_id}",
             flush=True,
         )
-        if provider_name == "fivesim":
-            slug = str(getattr(args, "fivesim_country_slug", "") or "").strip().lower()
-            if not slug:
-                # 兜底：按 ISO 映射成 slug
-                from modules.fivesim_sms_provider import FIVESIM_ISO_TO_COUNTRY
-
-                slug = FIVESIM_ISO_TO_COUNTRY.get(country.iso_code.upper(), "")
-            if not slug:
-                raise RuntimeError("5sim 缺少国家 slug，无法请求号码")
-            country_arg = slug
-        else:
-            country_arg = country.hero_sms_country
-        activation = provider.get_number(
-            service,
-            country_arg,
-            operator=operator,
-        )
-        provider.mark_ready(activation.activation_id)
-        fill_phone_and_wait_sms_page(page, activation.phone_number, country)
-        poll_interval = float(getattr(args, "sms_poll_interval", 0) or getattr(args, "hero_sms_poll_interval", 5.0) or 5.0)
-        max_attempts = int(getattr(args, "sms_max_attempts", 0) or getattr(args, "hero_sms_max_attempts", 60) or 60)
-        deadline = time.time() + min(max(30, int(remaining_seconds())), int(poll_interval * max_attempts) + 10)
-        wait_round = 0
-        while time.time() < deadline:
-            wait_round += 1
-            if is_phone_link_limit_page(page):
-                raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
-            if page_looks_like_sms_verification(page):
-                print(f"[SMS] 页面已进入短信验证码阶段，开始向 {label} 拉取验证码", flush=True)
-                break
-            if capture_code_from_url(page.url):
-                print("[SMS] 页面已直接产生 OAuth 回调，无需短信验证码", flush=True)
-                provider.complete(activation.activation_id)
+        last_error = ""
+        for reuse_attempt in range(1, code_page_retry_limit + 1):
+            try:
+                print(
+                    f"[SMS] {label} "
+                    + _u(r"\u590d\u7528\u5df2\u6536\u7801\u624b\u673a\u53f7\u5c1d\u8bd5")
+                    + f" {reuse_attempt}/{code_page_retry_limit}",
+                    flush=True,
+                )
+                fill_phone_and_wait_sms_page(page, reused_phone, reused_country)
+                sms_page_started_at = wait_sms_verification_page(page, remaining_seconds, label=label)
+                if capture_code_from_url(page.url):
+                    return True
+                save_auth_sms_page_state(
+                    args,
+                    provider_name=provider_name,
+                    label=label,
+                    service=service,
+                    country=reused_country,
+                    country_arg=reused_country_arg,
+                    operator=reused_operator,
+                    activation_id=reused_activation_id,
+                    phone_number=reused_phone,
+                    sms_page_started_at=sms_page_started_at,
+                )
+                code = poll_sms_code_with_timeout(
+                    provider,
+                    reused_activation_id,
+                    interval=poll_interval,
+                    timeout=code_timeout,
+                    exclude_codes=excluded_codes,
+                )
+                save_auth_sms_code_state(args, activation_id=reused_activation_id, code=code)
+                fill_sms_code(page, code)
+                status, detail = wait_for_code_submit_result(page, timeout=12)
+                if status == "invalid":
+                    excluded_codes.add(code)
+                    last_error = f"SMS_CODE_INVALID: {detail}"
+                    print(f"[SMS] {label} {last_error}", flush=True)
+                    goto_add_phone_for_retry(page)
+                    continue
+                if status == "pending":
+                    print("[SMS] " + _u(r"\u9a8c\u8bc1\u7801\u5df2\u63d0\u4ea4\uff0c\u9875\u9762\u6682\u672a\u660e\u786e\u63a8\u8fdb\uff0c\u7ee7\u7eed\u89c2\u5bdf\u6388\u6743\u6d41\u7a0b"), flush=True)
+                else:
+                    print("[SMS] " + _u(r"\u9a8c\u8bc1\u7801\u63d0\u4ea4\u6210\u529f\uff0c\u9875\u9762\u5df2\u63a8\u8fdb"), flush=True)
                 return True
-            if wait_round == 1 or wait_round % 5 == 0:
-                print(f"[SMS] 等待短信验证码输入页出现... 当前 URL: {page.url}", flush=True)
-            time.sleep(1)
-        code = provider.poll_for_code(
-            activation.activation_id,
-            interval=poll_interval,
-            max_attempts=max_attempts,
-        )
-        fill_sms_code(page, code)
-        status, detail = wait_for_code_submit_result(page, timeout=12)
-        if status == "invalid":
-            raise RuntimeError(f"短信验证码无效或过期: {detail}")
-        if status == "pending":
-            print("[SMS] 验证码已提交，页面暂未明确推进，继续观察授权流程", flush=True)
-        else:
-            print("[SMS] 验证码提交成功，页面已推进", flush=True)
-        provider.complete(activation.activation_id)
-        return True
-    except Exception as exc:
-        print(f"[SMS] {label} 自动接码失败: {exc}", flush=True)
-        if activation:
-            provider.cancel(activation.activation_id)
-        raise
+            except TimeoutError as exc:
+                last_error = str(exc or "")
+                print(
+                    f"[SMS] {label} "
+                    + _u(r"\u590d\u7528\u624b\u673a\u53f7 60 \u79d2\u5185\u672a\u6536\u5230\u65b0\u9a8c\u8bc1\u7801\uff0c\u56de\u5230 add-phone \u91cd\u8bd5")
+                    + f" ({reuse_attempt}/{code_page_retry_limit})",
+                    flush=True,
+                )
+                if reuse_attempt < code_page_retry_limit:
+                    goto_add_phone_for_retry(page)
+                    continue
+                break
+            except Exception as exc:
+                last_error = str(exc or "")
+                print(f"[SMS] {label} " + _u(r"\u590d\u7528\u624b\u673a\u53f7\u5931\u8d25") + f": {last_error}", flush=True)
+                if capture_code_from_url(page.url):
+                    return True
+                if reuse_attempt < code_page_retry_limit:
+                    try:
+                        goto_add_phone_for_retry(page)
+                        continue
+                    except Exception:
+                        pass
+                break
+        raise RuntimeError(f"AUTH_SMS_REUSE_PHONE_EXHAUSTED: activation={reused_activation_id}, last={last_error}")
+
+    last_error = ""
+    code_page_failures = 0
+    for phone_attempt in range(1, phone_retry_limit + 1):
+        activation = None
+        code_received = False
+        try:
+            print(
+                f"[SMS] {label} "
+                + _u(r"\u5f53\u524d\u56fd\u5bb6\u6362\u53f7\u5c1d\u8bd5")
+                + f" {phone_attempt}/{phone_retry_limit}: country={country.name}({country.hero_sms_country})",
+                flush=True,
+            )
+            try:
+                activation = provider.get_number(
+                    service,
+                    country_arg,
+                    operator=operator,
+                    max_retries=1,
+                )
+            except Exception as exc:
+                last_error = str(exc or "")
+                if sms_no_number_error(exc):
+                    raise RuntimeError(f"AUTH_SMS_COUNTRY_NO_NUMBER: country={country.name}({country.hero_sms_country}), last={last_error}") from exc
+                raise
+            provider.mark_ready(activation.activation_id)
+            fill_phone_and_wait_sms_page(page, activation.phone_number, country)
+            sms_page_started_at = wait_sms_verification_page(page, remaining_seconds, label=label)
+            if capture_code_from_url(page.url):
+                return True
+            save_auth_sms_page_state(
+                args,
+                provider_name=provider_name,
+                label=label,
+                service=service,
+                country=country,
+                country_arg=country_arg,
+                operator=operator,
+                activation_id=activation.activation_id,
+                phone_number=activation.phone_number,
+                sms_page_started_at=sms_page_started_at,
+            )
+            try:
+                code = poll_sms_code_with_timeout(
+                    provider,
+                    activation.activation_id,
+                    interval=poll_interval,
+                    timeout=code_timeout,
+                )
+            except TimeoutError as exc:
+                last_error = str(exc or "")
+                code_page_failures += 1
+                print(
+                    f"[SMS] {label} "
+                    + _u(r"60 \u79d2\u5185\u672a\u6536\u5230\u9a8c\u8bc1\u7801\uff0c\u56de\u5230 add-phone \u6362\u53f7")
+                    + f" ({code_page_failures}/{code_page_retry_limit})",
+                    flush=True,
+                )
+                try:
+                    provider.cancel(activation.activation_id)
+                except Exception:
+                    pass
+                activation = None
+                if code_page_failures >= code_page_retry_limit:
+                    raise RuntimeError(f"AUTH_SMS_CODE_PAGE_RETRY_EXHAUSTED: limit={code_page_retry_limit}, last={last_error}") from exc
+                goto_add_phone_for_retry(page)
+                continue
+            code_received = True
+            save_auth_sms_code_state(args, activation_id=activation.activation_id, code=code)
+            fill_sms_code(page, code)
+            status, detail = wait_for_code_submit_result(page, timeout=12)
+            if status == "invalid":
+                raise RuntimeError(f"SMS_CODE_INVALID: {detail}")
+            if status == "pending":
+                print("[SMS] " + _u(r"\u9a8c\u8bc1\u7801\u5df2\u63d0\u4ea4\uff0c\u9875\u9762\u6682\u672a\u660e\u786e\u63a8\u8fdb\uff0c\u7ee7\u7eed\u89c2\u5bdf\u6388\u6743\u6d41\u7a0b"), flush=True)
+            else:
+                print("[SMS] " + _u(r"\u9a8c\u8bc1\u7801\u63d0\u4ea4\u6210\u529f\uff0c\u9875\u9762\u5df2\u63a8\u8fdb"), flush=True)
+            return True
+        except Exception as exc:
+            last_error = str(exc or "")
+            lower_last_error = last_error.lower()
+            print(f"[SMS] {label} " + _u(r"\u5f53\u524d\u53f7\u7801\u9a8c\u8bc1\u5931\u8d25") + f": {last_error}", flush=True)
+            if activation and not code_received:
+                try:
+                    provider.cancel(activation.activation_id)
+                except Exception:
+                    pass
+            if capture_code_from_url(page.url):
+                return True
+            if "auth_sms_country_no_number" in lower_last_error:
+                raise RuntimeError(f"AUTH_SMS_COUNTRY_EXHAUSTED: country={country.name}({country.hero_sms_country}), attempts={phone_attempt}, last={last_error}") from exc
+            if "auth_sms_code_page_retry_exhausted" in lower_last_error:
+                raise
+            if phone_attempt >= phone_retry_limit:
+                break
+            if not is_phone_required_page(page):
+                try:
+                    goto_add_phone_for_retry(page)
+                except Exception:
+                    hint = phone_page_text_hint(page)
+                    raise RuntimeError(f"AUTH_SMS_PAGE_LEFT_PHONE_FORM: {last_error} | page_hint={hint}") from exc
+            print(
+                f"[SMS] {label} "
+                + _u(r"\u9875\u9762\u4ecd\u5728\u624b\u673a\u53f7\u8868\u5355\uff0c")
+                + f"{phone_retry_interval:g}s "
+                + _u(r"\u540e\u6362\u65b0\u53f7\u91cd\u8bd5")
+                + f" ({phone_attempt}/{phone_retry_limit})",
+                flush=True,
+            )
+            time.sleep(phone_retry_interval)
+    raise RuntimeError(f"AUTH_SMS_COUNTRY_EXHAUSTED: country={country.name}({country.hero_sms_country}), attempts={phone_retry_limit}, last={last_error}")
 
 
 def maybe_visible(page, selector: str, timeout: int = 1000):
@@ -5857,7 +6266,14 @@ def cmd_login(args) -> int:
                         except Exception as exc:
                             sms_error = str(exc or "")
                             lower_sms_error = sms_error.lower()
-                            if "phone_link_limit" in lower_sms_error or "最大账户" in sms_error:
+                            if "auth_sms_country_exhausted" in lower_sms_error or "auth_sms_page_left_phone_form" in lower_sms_error:
+                                mark_failure(
+                                    args,
+                                    _u(r"\u63a5\u7801\u5e73\u53f0\u5f53\u524d\u56fd\u5bb6\u6362\u53f7\u91cd\u8bd5\u8017\u5c3d\uff0c\u8d26\u53f7\u4fdd\u7559\u5f85\u6388\u6743: ")
+                                    + sms_error,
+                                    error_type="auth_sms_country_exhausted",
+                                )
+                            elif "phone_link_limit" in lower_sms_error or "最大账户" in sms_error:
                                 mark_failure(
                                     args,
                                     f"授权手机号已关联到可关联的最大账户，当前手机号已弃用并继续后续账号: {sms_error}",
@@ -6019,6 +6435,7 @@ def cmd_login(args) -> int:
         bundle = exchange_code(auth_code, code_verifier, fallback_email=email)
         payload = write_result_outputs(args, bundle)
         maybe_save_store(args, payload)
+        complete_auth_sms_state(args)
         if auth_mode == "team_pending":
             print("[ok] team pending 授权文件仅本地落盘，不上传服务器数据库。")
             setattr(args, "task_server_skipped", True)
@@ -6463,6 +6880,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sms-operator", default="", help="接码平台运营商/服务商；留空为任何")
     parser.add_argument("--sms-poll-interval", type=float, default=0.0, help="短信验证码轮询间隔秒数")
     parser.add_argument("--sms-max-attempts", type=int, default=0, help="短信验证码最大轮询次数")
+    parser.add_argument("--sms-phone-retry-limit", type=int, default=50, help="同一国家手机号表单仍未通过时最多更换多少个接码号码")
+    parser.add_argument("--sms-phone-retry-interval", type=float, default=5.0, help="同一国家换号重试间隔秒数")
+    parser.add_argument("--auth-sms-state-file", default="", help="流程三授权接码救援状态文件")
+    parser.add_argument("--sms-code-timeout", type=float, default=60.0, help="进入短信验证码页后等待验证码的最长秒数")
+    parser.add_argument("--sms-code-page-retry-limit", type=int, default=5, help="同一浏览器内验证码页 60 秒无码后回 add-phone 换号次数")
+    parser.add_argument("--auth-sms-reuse-ttl-seconds", type=int, default=1200, help="已收码手机号在授权救援生命周期内的复用有效期")
     parser.add_argument("--auth-phone-number", default="", help="授权手机号池号码（格式与 PayPal 手机号池一致）")
     parser.add_argument("--auth-phone-api-url", default="", help="授权手机号池取码 URL（返回 no|... 或 含验证码文本）")
     parser.add_argument("--auth-phone-poll-interval", type=float, default=5.0, help="授权手机号池取码轮询间隔秒数")

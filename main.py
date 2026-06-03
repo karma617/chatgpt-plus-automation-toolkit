@@ -371,6 +371,7 @@ async def run_account(
         slow_mo=int(browser_cfg.get("slow_mo", 80)),
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
+        isolated=True,
         fingerprint_seed=account.email,
     )
     try:

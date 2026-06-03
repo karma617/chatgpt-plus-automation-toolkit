@@ -45,6 +45,10 @@ ANSI_RESET = "\033[0m"
 install_print_theme()
 
 
+def _u(value: str) -> str:
+    return value.encode("ascii").decode("unicode_escape")
+
+
 def read_paid_accounts(path: str | Path = output_file("flow2_paid_success")) -> list[dict[str, str]]:
     input_path = migrate_output_file(path, LEGACY_OUTPUT_FILES["flow2_paid_success"])
     if not input_path.exists():
@@ -573,6 +577,14 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
         poll_interval = env_float(env.get("HERO_SMS_POLL_INTERVAL"), 5.0)
         max_attempts = env_int(env.get("HERO_SMS_MAX_ATTEMPTS"), 60)
 
+    phone_retry_limit = env_int(flow_env_value(env, flow_key, "SMS_PHONE_RETRY_LIMIT"), 50)
+    phone_retry_interval = env_float(flow_env_value(env, flow_key, "SMS_PHONE_RETRY_INTERVAL"), 5.0)
+    country_retry_limit = env_int(flow_env_value(env, flow_key, "SMS_COUNTRY_RETRY_LIMIT"), 2)
+    rescue_attempt_limit = env_int(flow_env_value(env, flow_key, "SMS_RESCUE_ATTEMPT_LIMIT"), 3)
+    code_timeout = env_float(flow_env_value(env, flow_key, "SMS_CODE_TIMEOUT"), 60.0)
+    code_page_retry_limit = env_int(flow_env_value(env, flow_key, "SMS_CODE_PAGE_RETRY_LIMIT"), 5)
+    reuse_ttl_seconds = env_int(flow_env_value(env, flow_key, "SMS_REUSE_TTL_SECONDS"), 1200)
+
     if not api_key:
         print(f"[SMS] 未配置 {api_key_name}，{flow_label}将不启用外部接码平台。")
         return None
@@ -630,13 +642,59 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
             "base_url": base_url if provider_name == "smsbower" else "",
             "service": service,
             "country": selected_country,
+            "countries": priced,
             "operator": selected_operator,
             "poll_interval": poll_interval,
             "max_attempts": max_attempts,
+            "phone_retry_limit": max(1, phone_retry_limit),
+            "phone_retry_interval": max(0.0, phone_retry_interval),
+            "country_retry_limit": max(1, country_retry_limit),
+            "rescue_attempt_limit": max(1, rescue_attempt_limit),
+            "code_timeout": max(5.0, code_timeout),
+            "code_page_retry_limit": max(1, code_page_retry_limit),
+            "reuse_ttl_seconds": max(60, reuse_ttl_seconds),
         }
     except Exception as exc:
         print(f"[SMS] 获取 {provider_label} 国家/价格失败，{flow_label}将不启用外部接码平台: {exc}")
         return None
+
+
+def _sms_country_key(country: PhoneCountry) -> tuple[str, int, str]:
+    return (country.iso_code.upper(), int(country.hero_sms_country or 0), country.dial_code)
+
+
+def sms_selection_with_country(selection: dict[str, object], country: PhoneCountry) -> dict[str, object]:
+    updated = dict(selection)
+    original = selection.get("country")
+    updated["country"] = country
+    if isinstance(original, PhoneCountry) and _sms_country_key(original) != _sms_country_key(country):
+        updated["operator"] = OperatorQuote("", "any", country.price, country.count, "country fallback")
+    return updated
+
+
+def sms_country_attempt_plan(selection: dict[str, object] | None, limit: int = 2) -> list[dict[str, object] | None]:
+    if not selection:
+        return [None]
+    limit = max(1, int(limit or 1))
+    country = selection.get("country")
+    countries = selection.get("countries")
+    if not isinstance(country, PhoneCountry):
+        return [selection]
+
+    plan: list[PhoneCountry] = [country]
+    seen = {_sms_country_key(country)}
+    if isinstance(countries, list):
+        for candidate in countries:
+            if not isinstance(candidate, PhoneCountry):
+                continue
+            key = _sms_country_key(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            plan.append(candidate)
+            if len(plan) >= limit:
+                break
+    return [sms_selection_with_country(selection, item) for item in plan[:limit]]
 
 
 def build_auth_command(
@@ -645,6 +703,7 @@ def build_auth_command(
     output_root: Path,
     sms_selection: dict[str, object] | None = None,
     auth_phone: PhoneInfo | None = None,
+    auth_sms_state_file: Path | None = None,
 ) -> list[str]:
     if getattr(sys, "frozen", False):
         command = [
@@ -682,13 +741,14 @@ def build_auth_command(
         str(output_root / "sub2api_accounts.json"),
         "--store",
         str(output_root / "oauth-rt-accounts.json"),
+        "--save-store",
         "--state-db",
         str(output_root / "auth_tasks.db"),
         "--remove-after-success",
         "--invalid-state-retries",
         "2",
         "--account-timeout-seconds",
-        "360",
+        str((sms_selection or {}).get("account_timeout_seconds") or (900 if sms_selection else 360)),
         ]
     )
     if sms_selection:
@@ -720,6 +780,16 @@ def build_auth_command(
                     str(sms_selection.get("poll_interval") or 5),
                     "--sms-max-attempts",
                     str(sms_selection.get("max_attempts") or 60),
+                    "--sms-phone-retry-limit",
+                    str(sms_selection.get("phone_retry_limit") or 50),
+                    "--sms-phone-retry-interval",
+                    str(sms_selection.get("phone_retry_interval") or 5),
+                    "--sms-code-timeout",
+                    str(sms_selection.get("code_timeout") or 60),
+                    "--sms-code-page-retry-limit",
+                    str(sms_selection.get("code_page_retry_limit") or 5),
+                    "--auth-sms-reuse-ttl-seconds",
+                    str(sms_selection.get("reuse_ttl_seconds") or 1200),
                     "--hero-sms-api-key",
                     str(sms_selection.get("api_key") or ""),
                     "--hero-sms-service",
@@ -742,6 +812,8 @@ def build_auth_command(
                 command.extend(["--fivesim-country-slug", fivesim_slug])
         if isinstance(operator, OperatorQuote) and operator.operator:
             command.extend(["--sms-operator", operator.operator, "--hero-sms-operator", operator.operator])
+        if auth_sms_state_file:
+            command.extend(["--auth-sms-state-file", str(auth_sms_state_file)])
     if auth_phone and auth_phone.number and auth_phone.api_url:
         command.extend(
             [
@@ -773,82 +845,138 @@ def run_one(
     env["PYTHONUNBUFFERED"] = "1"
     state_db_path = output_root / "auth_tasks.db"
     source_path = str(account_file)
-    attempts = 1
-    if auth_phone_pool is not None:
-        attempts = max(1, auth_phone_pool.count())
+    country_retry_limit = int((sms_selection or {}).get("country_retry_limit") or 2)
+    sms_attempt_plan = sms_country_attempt_plan(sms_selection, limit=country_retry_limit)
+    country_attempts = max(1, len(sms_attempt_plan))
+    pool_attempts = max(1, auth_phone_pool.count()) if auth_phone_pool is not None else 0
+    external_sms_enabled = sms_selection is not None and auth_phone_pool is None
+    rescue_attempt_limit = max(1, int((sms_selection or {}).get("rescue_attempt_limit") or 3)) if external_sms_enabled else 1
+    auth_sms_state_file = work_dir / "auth_sms_rescue_state.json" if external_sms_enabled else None
     final_returncode = 1
     final_error_text = ""
     final_error_type = ""
-    for attempt in range(1, attempts + 1):
-        assigned_phone: PhoneInfo | None = None
-        phone_marked_failed = False
-        if auth_phone_pool is not None:
-            assigned_phone = auth_phone_pool.acquire(index)
-            if not assigned_phone:
-                final_returncode = 1
-                final_error_type = "auth_phone_pool_empty"
-                final_error_text = "授权手机号池已无可用号码"
-                log(f"[授权 {index}/{total}] 授权手机号池已无可用号码，终止当前账号: {record['account']}")
-                break
-            log(f"[授权 {index}/{total}] 已分配授权手机号池号码: {assigned_phone.number}")
-        command = build_auth_command(record, account_file, output_root, sms_selection, assigned_phone)
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(AUTH_ROOT),
-                env=env,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
+    stop_account = False
+    for rescue_attempt in range(1, rescue_attempt_limit + 1):
+        attempts = pool_attempts if auth_phone_pool is not None else country_attempts
+        if external_sms_enabled and rescue_attempt_limit > 1:
+            log(
+                f"[授权 {index}/{total}] "
+                + _u(r"\u6388\u6743\u62a2\u6551\u8f6e")
+                + f" {rescue_attempt}/{rescue_attempt_limit}: {record['account']}"
             )
-            output_lines: list[str] = []
-            assert process.stdout is not None
-            for line in process.stdout:
-                print(line, end="")
-                output_lines.append(line)
-            process.wait()
-            final_returncode = int(process.returncode or 0)
-            final_error_text = "".join(output_lines).strip()
-            final_error_type = classify_exit(final_returncode, final_error_text)
-            if final_returncode == 0:
-                break
-            lower_error_text = final_error_text.lower()
-            phone_link_limited = (
-                final_error_type == "auth_phone_link_limit"
-                or "phone_link_limit" in lower_error_text
-                or "最大账户" in final_error_text
+        for attempt in range(1, attempts + 1):
+            assigned_phone: PhoneInfo | None = None
+            phone_marked_failed = False
+            current_sms_selection = sms_attempt_plan[min(attempt - 1, len(sms_attempt_plan) - 1)] if sms_attempt_plan else sms_selection
+            if auth_phone_pool is not None:
+                current_sms_selection = sms_selection
+                assigned_phone = auth_phone_pool.acquire(index)
+                if not assigned_phone:
+                    final_returncode = 1
+                    final_error_type = "auth_phone_pool_empty"
+                    final_error_text = "授权手机号池已无可用号码"
+                    log(f"[授权 {index}/{total}] 授权手机号池已无可用号码，终止当前账号: {record['account']}")
+                    stop_account = True
+                    break
+                log(f"[授权 {index}/{total}] 已分配授权手机号池号码: {assigned_phone.number}")
+            else:
+                country = current_sms_selection.get("country") if isinstance(current_sms_selection, dict) else None
+                if attempts > 1 and isinstance(country, PhoneCountry):
+                    log(
+                        f"[授权 {index}/{total}] "
+                        + _u(r"\u63a5\u7801\u56fd\u5bb6\u5c1d\u8bd5")
+                        + f" {attempt}/{attempts}: {country.name} (+{country.dial_code}) price={price_text(country.price)}"
+                    )
+            command = build_auth_command(
+                record,
+                account_file,
+                output_root,
+                current_sms_selection,
+                assigned_phone,
+                auth_sms_state_file=auth_sms_state_file,
             )
-            if phone_link_limited and assigned_phone and auth_phone_pool is not None:
-                auth_phone_pool.mark_failed(assigned_phone.number)
-                phone_marked_failed = True
-                log(f"[授权 {index}/{total}] 授权手机号池号码不可用，已移除: {assigned_phone.number}")
-                if attempt < attempts:
-                    log(f"[授权 {index}/{total}] 检测到号码关联上限，切换下一手机号重试当前账号 ({attempt}/{attempts})")
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(AUTH_ROOT),
+                    env=env,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=1,
+                )
+                output_lines: list[str] = []
+                assert process.stdout is not None
+                for line in process.stdout:
+                    print(line, end="")
+                    output_lines.append(line)
+                process.wait()
+                final_returncode = int(process.returncode or 0)
+                final_error_text = "".join(output_lines).strip()
+                final_error_type = classify_exit(final_returncode, final_error_text)
+                if final_returncode == 0:
+                    stop_account = True
+                    break
+                lower_error_text = final_error_text.lower()
+                phone_link_limited = (
+                    final_error_type == "auth_phone_link_limit"
+                    or "phone_link_limit" in lower_error_text
+                    or "最大账户" in final_error_text
+                )
+                if phone_link_limited and assigned_phone and auth_phone_pool is not None:
+                    auth_phone_pool.mark_failed(assigned_phone.number)
+                    phone_marked_failed = True
+                    log(f"[授权 {index}/{total}] 授权手机号池号码不可用，已移除: {assigned_phone.number}")
+                    if attempt < attempts:
+                        log(f"[授权 {index}/{total}] 检测到号码关联上限，切换下一手机号重试当前账号 ({attempt}/{attempts})")
+                        continue
+                sms_country_exhausted = (
+                    final_error_type == "auth_sms_country_exhausted"
+                    or "auth_sms_country_exhausted" in lower_error_text
+                    or "auth_sms_country_no_number" in lower_error_text
+                    or "auth_sms_page_left_phone_form" in lower_error_text
+                )
+                if sms_country_exhausted and external_sms_enabled and attempt < attempts:
+                    log(
+                        f"[授权 {index}/{total}] "
+                        + _u(r"\u5f53\u524d\u63a5\u7801\u56fd\u5bb6\u672a\u901a\u8fc7\uff0c\u5207\u6362\u4e0b\u4e00\u4e2a\u4f4e\u4ef7\u56fd\u5bb6\u91cd\u8bd5\u5f53\u524d\u8d26\u53f7")
+                        + f" ({attempt}/{attempts})"
+                    )
                     continue
-            state_db.ensure_task(
-                state_db_path,
-                email=record["account"],
-                account_type="normal",
-                source_type="flow2_paid",
-                source_path=source_path,
-                headless=False,
-            )
-            state_db.finish_task(
-                state_db_path,
-                email=record["account"],
-                account_type="normal",
-                source_path=source_path,
-                status="failed",
-                error_type=final_error_type,
-                last_error=final_error_text[:1000],
-            )
+                fatal_error_types = {"wrong_password", "otp_invalid", "mail_adapter_failed", "auth_phone_pool_empty"}
+                if external_sms_enabled and rescue_attempt < rescue_attempt_limit and final_error_type not in fatal_error_types:
+                    log(
+                        f"[授权 {index}/{total}] "
+                        + _u(r"\u672c\u8f6e\u6388\u6743\u5931\u8d25\uff0c\u5173\u95ed\u6d4f\u89c8\u5668\u540e\u91cd\u65b0\u6253\u5f00\u6388\u6743\u94fe\u63a5\u62a2\u6551")
+                        + f" ({rescue_attempt}/{rescue_attempt_limit})"
+                    )
+                    break
+                state_db.ensure_task(
+                    state_db_path,
+                    email=record["account"],
+                    account_type="normal",
+                    source_type="flow2_paid",
+                    source_path=source_path,
+                    headless=False,
+                )
+                state_db.finish_task(
+                    state_db_path,
+                    email=record["account"],
+                    account_type="normal",
+                    source_path=source_path,
+                    status="failed",
+                    error_type=final_error_type,
+                    last_error=final_error_text[:1000],
+                )
+                stop_account = True
+                break
+            finally:
+                if assigned_phone and auth_phone_pool is not None and not phone_marked_failed:
+                    auth_phone_pool.release(assigned_phone.number, success=(final_returncode == 0))
+        if final_returncode == 0 or stop_account:
             break
-        finally:
-            if assigned_phone and auth_phone_pool is not None and not phone_marked_failed:
-                auth_phone_pool.release(assigned_phone.number, success=(final_returncode == 0))
 
     ok = final_returncode == 0
     status = "成功" if ok else f"失败(code={final_returncode})"
@@ -963,19 +1091,12 @@ def interactive_authorize(args: argparse.Namespace | None = None) -> int:
 
     phone_required_accounts = accounts_by_error_type(output_root / "auth_tasks.db", "phone_required")
     selected_by_email = {record["account"].lower(): record for record in selected}
-    phone_required_selected = [selected_by_email[email] for email in phone_required_accounts if email in selected_by_email]
-    removed_phone_required = remove_accounts_from_paid_file(
-        paid_file,
-        {selected_by_email[email]["account"].lower() for email in phone_required_accounts if email in selected_by_email},
-    )
-    if removed_phone_required:
-        mark_paypal_flow_state_if_applicable(
-            paid_file,
-            discarded={selected_by_email[email]["account"].lower() for email in phone_required_accounts if email in selected_by_email},
-            reason="auth_phone_required",
+    kept_phone_required = sorted(email for email in phone_required_accounts if email in selected_by_email)
+    if kept_phone_required:
+        log(
+            _u(r"\u624b\u673a\u53f7\u9a8c\u8bc1\u672a\u901a\u8fc7\u7684\u8d26\u53f7\u5df2\u4fdd\u7559\u5728\u5f85\u6388\u6743\u6c60\uff0c\u4e0d\u518d\u81ea\u52a8\u5f03\u7f6e: ")
+            + ", ".join(kept_phone_required)
         )
-        discarded_path = append_discarded_accounts(phone_required_selected, "授权阶段出现手机号必填页", output_root)
-        log(f"已从待授权账号池移除手机号必填弃置账号: {removed_phone_required} 个；记录: {discarded_path}")
 
     no_valid_org_accounts = accounts_by_error_type(output_root / "auth_tasks.db", "no_valid_organizations")
     kept_no_valid_org = sorted(email for email in no_valid_org_accounts if email in selected_by_email)

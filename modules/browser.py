@@ -5,7 +5,7 @@ import contextlib
 from pathlib import Path
 from urllib.parse import urlparse
 
-from playwright.async_api import BrowserContext, Page, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from .utils import resolve_path
 
@@ -259,35 +259,57 @@ async def prepare_proxy_for_playwright(value: str | None) -> tuple[dict[str, str
 
 
 class BrowserSession:
-    def __init__(self, profile_dir: str | Path, headless: bool, slow_mo: int, timeout_ms: int, proxy: str | None = None, **kwargs):
+    def __init__(
+        self,
+        profile_dir: str | Path,
+        headless: bool,
+        slow_mo: int,
+        timeout_ms: int,
+        proxy: str | None = None,
+        isolated: bool = False,
+        **kwargs,
+    ):
         self.profile_dir = resolve_path(profile_dir)
         self.headless = headless
         self.slow_mo = slow_mo
         self.timeout_ms = timeout_ms
         self.proxy = proxy
+        self.isolated = isolated
         self._playwright = None
+        self._browser: Browser | None = None
         self._proxy_bridge: Socks5AuthProxyBridge | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
 
     async def __aenter__(self) -> "BrowserSession":
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        if not self.isolated:
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
         try:
             proxy, self._proxy_bridge = await prepare_proxy_for_playwright(self.proxy)
             self._playwright = await async_playwright().start()
-            self.context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self.profile_dir),
-                headless=self.headless,
-                slow_mo=self.slow_mo,
-                viewport={"width": 1365, "height": 900},
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                ],
-                proxy=proxy,
-            )
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-gpu",
+            ]
+            if self.isolated:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self.headless,
+                    slow_mo=self.slow_mo,
+                    args=launch_args,
+                    proxy=proxy,
+                )
+                self.context = await self._browser.new_context(viewport={"width": 1365, "height": 900})
+            else:
+                self.context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(self.profile_dir),
+                    headless=self.headless,
+                    slow_mo=self.slow_mo,
+                    viewport={"width": 1365, "height": 900},
+                    args=launch_args,
+                    proxy=proxy,
+                )
         except Exception:
             await self.__aexit__(None, None, None)
             raise
@@ -310,8 +332,13 @@ class BrowserSession:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self.context:
             await self.context.close()
+            self.context = None
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
         if self._playwright:
             await self._playwright.stop()
+            self._playwright = None
         if self._proxy_bridge:
             await self._proxy_bridge.close()
             self._proxy_bridge = None

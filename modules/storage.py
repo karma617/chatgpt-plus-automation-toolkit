@@ -149,22 +149,32 @@ class AccountStore:
             in_progress_file or "output/gopay注册plus/流程1_注册处理中.txt",
             LEGACY_OUTPUT_FILES["flow1_in_progress"],
         )
+        self.blocked_emails: set[str] = set()
         self._lock = RLock()
         for path in [self.accounts_file, self.raw_pool_file, self.success_file, self.failed_file, self.in_progress_file]:
             path.parent.mkdir(parents=True, exist_ok=True)
             if not path.exists():
                 path.write_text("", encoding="utf-8")
 
+    def _is_blocked(self, email: str) -> bool:
+        return (email or "").strip().lower() in self.blocked_emails
+
     def next_email(self) -> str | None:
         lines = _read_lines(self.accounts_file)
-        if not lines:
-            return None
-        account = parse_mail_line(lines[0])
-        return account.email if account else None
+        for line in lines:
+            account = parse_mail_line(line)
+            if account and not self._is_blocked(account.email):
+                return account.email
+        return None
 
     def pending_count(self) -> int:
         with self._lock:
-            return sum(1 for line in _read_lines(self.accounts_file) if parse_mail_line(line))
+            return sum(
+                1
+                for line in _read_lines(self.accounts_file)
+                for account in [parse_mail_line(line)]
+                if account and not self._is_blocked(account.email)
+            )
 
     def resolve_account(self, email: str) -> MailAccount:
         email_lower = email.lower()
@@ -201,6 +211,8 @@ class AccountStore:
             for line in lines:
                 account = parse_mail_line(line)
                 if not account:
+                    continue
+                if self._is_blocked(account.email):
                     continue
                 if account.email.lower() in claimed_emails:
                     continue

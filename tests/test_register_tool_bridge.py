@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import main
+from modules import paypal_flow_state
 from modules import register_tool_bridge as bridge
 
 
@@ -11,6 +12,14 @@ class FakeProxyPool:
 
     def pick(self, worker_id: int) -> str:
         return f"http://proxy-{worker_id}"
+
+
+class FakeStore:
+    def __init__(self) -> None:
+        self.blocked_emails: set[str] = set()
+
+    def pending_count(self) -> int:
+        return 1
 
 
 def test_run_register_only_many_uses_register_only_outputs_and_disables_payment_link(monkeypatch, tmp_path) -> None:
@@ -149,3 +158,40 @@ def test_run_register_only_many_uses_sms_only_in_phone_mode(monkeypatch, tmp_pat
 
     assert result.returncode == 0
     assert captured["kwargs"]["sms_selection"] is sms_selection
+
+
+def test_apply_paypal_blocked_emails_blocks_discarded_registered_and_linked(monkeypatch, tmp_path) -> None:
+    output_dir = tmp_path / "output" / "register_only"
+    summary_file = output_dir / "registered_sessions.txt"
+    used_file = output_dir / "used_emails.txt"
+    state_file = output_dir / "paypal_flow_state.json"
+    discard_file = output_dir / "paypal_flow_discarded_emails.txt"
+    link_file = tmp_path / "output" / "paypal" / "links" / "account.txt"
+    pending_file = tmp_path / "output" / "paypal" / "pending" / "account.txt"
+    summary_file.parent.mkdir(parents=True)
+    summary_file.write_text("registered@example.com----pw\n", encoding="utf-8")
+    used_file.write_text("used@example.com\n", encoding="utf-8")
+    discard_file.write_text("discarded@example.com\tmanual\n", encoding="utf-8")
+    link_file.parent.mkdir(parents=True)
+    link_file.write_text("linked@example.com----pw----https://pay.example\n", encoding="utf-8")
+    pending_file.parent.mkdir(parents=True)
+    pending_file.write_text("pending@example.com----pw\n", encoding="utf-8")
+
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_SUMMARY_FILE", summary_file)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_USED_FILE", used_file)
+    monkeypatch.setattr(bridge, "PAYPAL_LINK_POOL_FILE", link_file)
+    monkeypatch.setattr(bridge, "PAYPAL_PENDING_AUTH_FILE", pending_file)
+    monkeypatch.setattr(paypal_flow_state, "PAYPAL_FLOW_STATE_FILE", state_file)
+    monkeypatch.setattr(paypal_flow_state, "PAYPAL_FLOW_DISCARDED_FILE", discard_file)
+    store = FakeStore()
+
+    blocked = bridge.apply_paypal_blocked_emails(store)
+
+    assert {
+        "registered@example.com",
+        "used@example.com",
+        "discarded@example.com",
+        "linked@example.com",
+        "pending@example.com",
+    }.issubset(blocked)
+    assert blocked.issubset(store.blocked_emails)

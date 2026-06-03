@@ -40,6 +40,9 @@ REGISTER_ONLY_SUMMARY_FILE = REGISTER_ONLY_OUTPUT_DIR / "registered_sessions.txt
 REGISTER_ONLY_USED_FILE = REGISTER_ONLY_OUTPUT_DIR / "used_emails.txt"
 REGISTER_ONLY_IN_PROGRESS_FILE = REGISTER_ONLY_OUTPUT_DIR / "in_progress.txt"
 REGISTER_ONLY_FAILED_FILE = REGISTER_ONLY_OUTPUT_DIR / "failed_accounts.txt"
+PAYPAL_OUTPUT_ROOT = resolve_path(_zh(r"output/paypal\u6ce8\u518c"))
+PAYPAL_LINK_POOL_FILE = PAYPAL_OUTPUT_ROOT / _zh(r"\u957f\u94fe\u63a5\u8d26\u53f7") / "account.txt"
+PAYPAL_PENDING_AUTH_FILE = PAYPAL_OUTPUT_ROOT / _zh(r"\u5f85\u6388\u6743\u8d26\u53f7") / "account.txt"
 
 
 def register_only_mode(env: dict[str, str] | None = None) -> str:
@@ -108,6 +111,7 @@ async def run_register_only_many(
     mode = register_only_mode()
     ensure_output_files()
     store = main_app.create_store(register_cfg)
+    apply_paypal_blocked_emails(store)
     target = max(1, int(count or 1))
     pending = await main_app.ensure_register_accounts(register_cfg, store, target)
     if pending <= 0:
@@ -201,6 +205,26 @@ def clone_register_only_config(cfg: dict[str, Any], *, selected_email: str = "")
         mail_cfg["raw_pool_file"] = str(raw_path if raw_path.exists() else selected_path)
         cloned["mail"] = mail_cfg
     return cloned
+
+
+def apply_paypal_blocked_emails(store: object) -> set[str]:
+    from . import paypal_flow_state
+
+    paypal_flow_state.sync_from_files(
+        registered_file=REGISTER_ONLY_SUMMARY_FILE,
+        link_file=PAYPAL_LINK_POOL_FILE,
+        pending_file=PAYPAL_PENDING_AUTH_FILE,
+    )
+    blocked = paypal_flow_state.flow1_blocked_emails(
+        link_file=PAYPAL_LINK_POOL_FILE,
+        pending_file=PAYPAL_PENDING_AUTH_FILE,
+    )
+    blocked |= paypal_flow_state.file_emails(REGISTER_ONLY_SUMMARY_FILE)
+    blocked |= paypal_flow_state.file_emails(REGISTER_ONLY_USED_FILE)
+    if blocked and hasattr(store, "blocked_emails"):
+        existing = getattr(store, "blocked_emails", set()) or set()
+        setattr(store, "blocked_emails", {str(email).lower() for email in existing | blocked if email})
+    return blocked
 
 
 def find_account_line(email: str, path: Path) -> str:

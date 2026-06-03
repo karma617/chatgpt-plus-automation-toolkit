@@ -462,6 +462,7 @@ class PaypalAccountStatePage(ttk.Frame):
         ttk.Button(toolbar, text="刷新", command=self.refresh).pack(side=LEFT, padx=2)
         ttk.Button(toolbar, text="标记弃置", command=self.mark_discarded).pack(side=LEFT, padx=2)
         ttk.Button(toolbar, text="恢复未完成", command=self.restore_unfinished).pack(side=LEFT, padx=2)
+        ttk.Button(toolbar, text="标记授权", command=self.mark_pending_auth).pack(side=LEFT, padx=2)
         ttk.Button(toolbar, text="标记完成", command=self.mark_completed).pack(side=LEFT, padx=2)
         ttk.Button(toolbar, text="查看弃置名单路径", command=self.show_discard_file).pack(side=LEFT, padx=2)
 
@@ -564,6 +565,46 @@ class PaypalAccountStatePage(ttk.Frame):
             remaining.append(raw)
         self.discard_file.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
 
+    def _account_line_for_email(self, email: str, state: dict[str, dict]) -> str:
+        key = email.lower()
+        record = dict(state.get(key) or {})
+        line = str(record.get("account_line") or "").strip()
+        if line:
+            return line
+        for path in (self.pending_file, self.link_file, self.registered_file):
+            if not path.exists():
+                continue
+            for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                text = raw.strip()
+                if not text:
+                    continue
+                match = EMAIL_RE.search(text)
+                if not match or match.group(0).lower() != key:
+                    continue
+                parts = text.split("----")
+                if len(parts) >= 3 and parts[-1].startswith(("http://", "https://")):
+                    return "----".join(parts[:-1]).strip()
+                return text
+        return email
+
+    def _append_pending_auth_lines(self, lines: list[str]) -> int:
+        if not lines:
+            return 0
+        self.pending_file.parent.mkdir(parents=True, exist_ok=True)
+        existing_emails = paypal_flow_state.file_emails(self.pending_file)
+        written = 0
+        with self.pending_file.open("a", encoding="utf-8") as fh:
+            for line in lines:
+                match = EMAIL_RE.search(line)
+                email = match.group(0).lower() if match else ""
+                if email and email in existing_emails:
+                    continue
+                fh.write(line.rstrip() + "\n")
+                if email:
+                    existing_emails.add(email)
+                written += 1
+        return written
+
     def mark_discarded(self) -> None:
         emails = self._require_selection()
         if not emails:
@@ -573,6 +614,20 @@ class PaypalAccountStatePage(ttk.Frame):
         self._use_runtime_state_files()
         self._append_discard_file(emails)
         paypal_flow_state.mark_discarded_many(emails, reason="manual_gui")
+        self.refresh()
+
+    def mark_pending_auth(self) -> None:
+        emails = self._require_selection()
+        if not emails:
+            return
+        self._use_runtime_state_files()
+        self._remove_from_discard_file(emails)
+        state = paypal_flow_state.load_state(self.state_file)
+        lines = [self._account_line_for_email(email, state) for email in emails]
+        written = self._append_pending_auth_lines(lines)
+        for email, line in zip(emails, lines):
+            paypal_flow_state.mark_paid_pending_auth(email, account_line=line)
+        messagebox.showinfo("标记授权", f"已标记 {len(emails)} 个账号为待授权；新增写入待授权池 {written} 行")
         self.refresh()
 
     def restore_unfinished(self) -> None:

@@ -374,6 +374,7 @@ async def register_one(
         slow_mo=int(browser_cfg.get("slow_mo", 80)),
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
+        isolated=True,
         fingerprint_seed=email,
     )
     session = BrowserSession(**session_kwargs)
@@ -399,7 +400,8 @@ async def register_one(
                     if "ChatGPT" in body and ("历史聊天记录" in body or "新聊天" in body or "免费版" in body):
                         log(f"{prefix} detected existing ChatGPT login profile; clearing profile and retrying signup")
                         await session.__aexit__(None, None, None)
-                        shutil.rmtree(profile_dir, ignore_errors=True)
+                        if not session_kwargs.get("isolated"):
+                            shutil.rmtree(profile_dir, ignore_errors=True)
                         session = BrowserSession(**session_kwargs)
                         await session.__aenter__()
                         page = await session.current_page()

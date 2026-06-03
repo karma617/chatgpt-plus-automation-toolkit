@@ -196,6 +196,25 @@ def load_manual_discarded_emails(path: Path | None = None) -> set[str]:
     return emails
 
 
+def append_discarded_emails(emails: Iterable[str], *, reason: str = "") -> int:
+    existing = load_manual_discarded_emails()
+    normalized_emails = []
+    for email in emails:
+        normalized = normalize_email(str(email))
+        if normalized and normalized not in existing:
+            normalized_emails.append(normalized)
+            existing.add(normalized)
+    if not normalized_emails:
+        return 0
+    PAYPAL_FLOW_DISCARDED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    safe_reason = re.sub(r"[\r\n\t]+", " ", str(reason or "")).strip()[:300]
+    stamp = _now_iso()
+    with PAYPAL_FLOW_DISCARDED_FILE.open("a", encoding="utf-8") as fh:
+        for email in normalized_emails:
+            fh.write(f"{email}\t{stamp}\t{safe_reason}\n")
+    return len(normalized_emails)
+
+
 def state_emails_by_status(statuses: set[str], *, state_path: Path | None = None) -> set[str]:
     return {
         email
@@ -225,6 +244,7 @@ def sync_from_files(
     pending_file: Path | None = None,
 ) -> None:
     state = load_state()
+    manual_discarded = load_manual_discarded_emails()
     changed = False
 
     if registered_file and registered_file.exists():
@@ -236,12 +256,17 @@ def sync_from_files(
             if not email:
                 continue
             record = dict(state.get(email) or {})
-            if record.get("status") not in FLOW1_BLOCKING_STATUSES:
+            status = str(record.get("status") or "")
+            if email in manual_discarded:
+                continue
+            if status not in FLOW1_BLOCKING_STATUSES or status == STATUS_DISCARDED:
                 record.setdefault("created_at", _now_iso())
                 record["email"] = email
-                record["status"] = record.get("status") or STATUS_REGISTERED
-                record["account_line"] = record.get("account_line") or line
+                record["status"] = STATUS_REGISTERED if status == STATUS_DISCARDED else (status or STATUS_REGISTERED)
+                record["account_line"] = line
                 record["updated_at"] = _now_iso()
+                if record["status"] == STATUS_REGISTERED:
+                    record.pop("reason", None)
                 state[email] = record
                 changed = True
 

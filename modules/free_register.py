@@ -360,6 +360,7 @@ async def run_free_register_once(
         slow_mo=int(browser_cfg.get("slow_mo", 80)),
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
+        isolated=True,
         fingerprint_seed=account.email,
     )
     success = False
@@ -390,7 +391,7 @@ async def run_free_register_once(
         finally:
             await session.__aexit__(None, None, None)
     finally:
-        if not success and not keep_profile:
+        if not success and not keep_profile and not session.isolated:
             try:
                 shutil.rmtree(profile_dir, ignore_errors=True)
             except Exception:
@@ -640,6 +641,7 @@ async def run_free_register_once_email(
         slow_mo=int(browser_cfg.get("slow_mo", 80)),
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
+        isolated=True,
         fingerprint_seed=account.email,
     )
     success = False
@@ -672,7 +674,7 @@ async def run_free_register_once_email(
         finally:
             await session.__aexit__(None, None, None)
     finally:
-        if not success and not keep_profile:
+        if not success and not keep_profile and not session.isolated:
             try:
                 shutil.rmtree(profile_dir, ignore_errors=True)
             except Exception:

@@ -127,3 +127,22 @@ def test_flow1_reuses_existing_unfinished_link_instead_of_failing(monkeypatch, t
     )
 
     assert result == 1
+
+
+def test_sync_from_registered_file_reopens_non_manual_discarded_accounts(monkeypatch, tmp_path) -> None:
+    state_file, discard_file = _isolate_flow_state(monkeypatch, tmp_path)
+    registered_file = tmp_path / "registered_sessions.txt"
+    registered_file.write_text(
+        "manual@example.com----pw\nold@example.com----pw\n",
+        encoding="utf-8",
+    )
+    discard_file.write_text("manual@example.com\tmanual\n", encoding="utf-8")
+    paypal_flow_state.mark_discarded_many(["manual@example.com"], reason="manual_gui")
+    paypal_flow_state.mark_discarded_many(["old@example.com"], reason="old_failure")
+
+    paypal_flow_state.sync_from_files(registered_file=registered_file)
+
+    state = paypal_flow_state.load_state(state_file)
+    assert state["manual@example.com"]["status"] == paypal_flow_state.STATUS_DISCARDED
+    assert state["old@example.com"]["status"] == paypal_flow_state.STATUS_REGISTERED
+    assert state["old@example.com"]["account_line"] == "old@example.com----pw"

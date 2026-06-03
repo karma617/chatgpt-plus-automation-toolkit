@@ -41,10 +41,18 @@ install_runtime_project_root()
 
 from main import apply_env_config
 from main import configure_mail_source
+from modules import paypal_flow_state
 from modules.paypal_filler_bridge import run_paypal_filler_flow2
 from modules.paypal_flow import _run_paypal_authorize
 from modules.paypal_pay import PENDING_AUTH_FILE, load_link_pool, run_paypal_pay
-from modules.paypal_register import get_last_run_detail, reset_last_run_detail, run_paypal_register
+from modules.paypal_register import (
+    LINK_POOL_FILE as PAYPAL_LINK_POOL_FILE,
+    PAYPAL_PENDING_AUTH_FILE,
+    REGISTER_ONLY_SUMMARY_FILE,
+    get_last_run_detail,
+    reset_last_run_detail,
+    run_paypal_register,
+)
 from modules.register_tool_bridge import run_register_tool_only
 from modules.storage import parse_mail_line
 from modules.utils import load_config
@@ -150,6 +158,35 @@ def _count_pending_auth(selected_email: str = "") -> int:
         account = parse_mail_line(line)
         email = account.email if account else line.split("----", 1)[0].strip()
         if "@" in email and _matches_selected_email(email, selected_email):
+            count += 1
+    return count
+
+
+def _count_flow1_ready_registered(selected_email: str = "") -> int:
+    paypal_flow_state.sync_from_files(
+        registered_file=REGISTER_ONLY_SUMMARY_FILE,
+        link_file=PAYPAL_LINK_POOL_FILE,
+        pending_file=PAYPAL_PENDING_AUTH_FILE,
+    )
+    blocked = paypal_flow_state.flow1_blocked_emails(
+        link_file=PAYPAL_LINK_POOL_FILE,
+        pending_file=PAYPAL_PENDING_AUTH_FILE,
+    )
+    if not REGISTER_ONLY_SUMMARY_FILE.exists():
+        return 0
+    count = 0
+    for raw in REGISTER_ONLY_SUMMARY_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        account = parse_mail_line(line)
+        email = account.email if account else line.split("----", 1)[0].strip()
+        if not email or "@" not in email:
+            continue
+        normalized = email.strip().lower()
+        if normalized in blocked:
+            continue
+        if _matches_selected_email(normalized, selected_email):
             count += 1
     return count
 
@@ -338,13 +375,17 @@ def run_action(args: argparse.Namespace) -> int:
             use_local_random_mode = flow in {"paypal-auto-nocard", "paypal-auto-jp-nocard"}
             use_jp_region = flow == "paypal-auto-jp-nocard"
             if use_jp_region:
-                run_register_tool_only(
-                    cfg,
-                    count=target,
-                    workers=workers,
-                    mail_source=args.mail_source,
-                    selected_email=args.email,
-                )
+                ready_count = _count_flow1_ready_registered(args.email)
+                link_count = _count_payment_links(args.email)
+                pending_count = _count_pending_auth(args.email)
+                if ready_count <= 0 and link_count <= 0 and pending_count <= 0:
+                    run_register_tool_only(
+                        cfg,
+                        count=target,
+                        workers=workers,
+                        mail_source=args.mail_source,
+                        selected_email=args.email,
+                    )
             reg_success = asyncio.run(
                 run_with_playwright_noise_filter(
                     run_paypal_register(

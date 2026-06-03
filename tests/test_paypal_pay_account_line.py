@@ -51,6 +51,60 @@ def test_save_pending_auth_keeps_full_mail_account_line(monkeypatch, tmp_path) -
     assert state["user@hotmail.com"]["status"] == paypal_flow_state.STATUS_PAID_PENDING_AUTH
 
 
+def test_discard_flow2_link_marks_manual_discard_and_removes_link(monkeypatch, tmp_path) -> None:
+    state_file, discard_file = _isolate_flow_state(monkeypatch, tmp_path)
+    link_file = tmp_path / "account.txt"
+    link_file.write_text(
+        "user@hotmail.com----pw----client----rt----https://pay.example/checkout\n"
+        "next@hotmail.com----pw----client----rt----https://pay.example/next\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(paypal_pay, "LINK_POOL_FILE", link_file)
+
+    paypal_pay.discard_flow2_link("user@hotmail.com", reason="nonzero_checkout_amount: US$20.00")
+
+    assert "user@hotmail.com" not in link_file.read_text(encoding="utf-8")
+    assert "next@hotmail.com" in link_file.read_text(encoding="utf-8")
+    assert "user@hotmail.com" in discard_file.read_text(encoding="utf-8")
+    state = paypal_flow_state.load_state(state_file)
+    assert state["user@hotmail.com"]["status"] == paypal_flow_state.STATUS_DISCARDED
+
+
+def test_classify_checkout_due_amount_detects_zero_and_nonzero() -> None:
+    zero = paypal_pay.classify_checkout_due_amount("Due today\nUS$0.00\nPay now")
+    nonzero = paypal_pay.classify_checkout_due_amount("Due today\nUS$20.00\nPay now")
+
+    assert zero["status"] == "zero"
+    assert nonzero["status"] == "nonzero"
+    assert nonzero["amount_value"] == 20.0
+
+
+def test_classify_checkout_amount_candidates_prefers_order_total() -> None:
+    result = paypal_pay.classify_checkout_amount_candidates(
+        [
+            {
+                "selector": "#ProductSummary-totalAmount",
+                "priority": 6,
+                "text": "ChatGPT Plus Subscription US$20.00 monthly",
+            },
+            {
+                "selector": "[data-testid='order-details-footer-subtotal-amount']",
+                "priority": 4,
+                "text": "US$20.00",
+            },
+            {
+                "selector": "#OrderDetails-TotalAmount",
+                "priority": 0,
+                "text": "US$20.00",
+            },
+        ]
+    )
+
+    assert result["status"] == "nonzero"
+    assert result["amount_value"] == 20.0
+    assert result["selector"] == "#OrderDetails-TotalAmount"
+
+
 def test_filler_flow2_keeps_full_mail_account_line(monkeypatch, tmp_path) -> None:
     _isolate_flow_state(monkeypatch, tmp_path)
     pending_file = tmp_path / "pending.txt"
