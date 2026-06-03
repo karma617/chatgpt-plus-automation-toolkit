@@ -767,7 +767,11 @@ def main() -> int:
     parser.add_argument("--workers", type=int, help="并发浏览器 worker 数")
     parser.add_argument("--count", type=int, help="目标成功数量")
     parser.add_argument("--country", default="", help="流程二/三接码国家: 序号 / ISO / 平台国家 ID，例如 US")
-    parser.add_argument("--sms-provider", default="", help="流程二/三接码平台: herosms / grizzly")
+    parser.add_argument(
+        "--sms-provider",
+        default="",
+        help="流程二/三接码平台: herosms / grizzly / fivesim / smsbower / sms-verification-number / nexsms / smspool / chatgpt-api",
+    )
     parser.add_argument(
         "--mail-source",
         choices=["moemail", "hotmail", "domain163"],

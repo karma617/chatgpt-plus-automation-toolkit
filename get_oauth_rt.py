@@ -42,6 +42,13 @@ from modules.hero_sms_provider import HeroSMSProvider, PhoneCountry, local_phone
 from modules.fivesim_sms_provider import FiveSimProvider
 from modules.smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
 from modules.smsbower_provider import SmsBowerProvider
+from modules.sms_provider_factory import (
+    create_sms_provider,
+    normalize_sms_provider_name,
+    provider_country_arg,
+    sms_provider_default_service,
+    sms_provider_label,
+)
 from modules.auth_upload import auth_upload_enabled, upload_bundle
 from modules.terminal_theme import install_print_theme
 from modules.utils import load_env
@@ -746,7 +753,6 @@ def load_root_env() -> dict:
         "SUB2API_AUTO_PAUSE_ON_EXPIRED",
         "SUB2API_UPDATE_EXISTING",
         "SUB2API_TIMEOUT",
-        "SMSBOWER_API_URL",
         "INBOX_LOUCER_BASE_URL",
         "INBOX_LOUCER_USERNAME",
         "INBOX_LOUCER_PASSWORD",
@@ -2705,6 +2711,8 @@ def is_phone_link_limit_page(page) -> bool:
 
 
 def is_phone_number_rejected_page(page) -> bool:
+    if is_phone_voip_rejected_page(page):
+        return True
     reject_texts = [
         "Try a different phone number",
         "Use a different phone number",
@@ -2768,6 +2776,55 @@ def is_phone_number_rejected_page(page) -> bool:
     return any(hint.lower() in normalized for hint in reject_texts)
 
 
+def is_phone_voip_rejected_page(page) -> bool:
+    hints = (
+        "voip",
+        "virtual number",
+        "virtual phone number",
+        "non-virtual phone number",
+        "valid non-virtual phone number",
+        _u(r"\u8fd9\u4f3c\u4e4e\u662f\u4e2a\u865a\u62df\u53f7\u7801"),
+        _u(r"\u865a\u62df\u53f7\u7801"),
+        _u(r"\u975e\u865a\u62df\u7535\u8bdd\u53f7\u7801"),
+    )
+
+    def _looks_like_voip_reject(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(text or "").lower()).strip()
+        if not normalized:
+            return False
+        if any(str(hint).lower() in normalized for hint in hints):
+            return True
+        return (
+            ("voip" in normalized or "virtual" in normalized)
+            and ("phone" in normalized or "number" in normalized)
+            and ("valid" in normalized or "continue" in normalized or "provide" in normalized)
+        )
+
+    try:
+        body = page.locator("body").inner_text(timeout=1200)
+        if _looks_like_voip_reject(body):
+            return True
+    except Exception:
+        pass
+    for frame in page.frames:
+        try:
+            frame_body = frame.locator("body").inner_text(timeout=500)
+            if _looks_like_voip_reject(frame_body):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def raise_phone_rejection_if_needed(page, *, after_submit: bool = False) -> None:
+    if is_phone_voip_rejected_page(page):
+        suffix = " after submit" if after_submit else ""
+        raise RuntimeError(f"PHONE_VOIP_REJECTED: virtual/voip phone rejected by page{suffix}")
+    if is_phone_number_rejected_page(page):
+        suffix = " after submit" if after_submit else ""
+        raise RuntimeError(f"PHONE_REJECTED: phone rejected by page{suffix}")
+
+
 def phone_page_text_hint(page, limit: int = 220) -> str:
     try:
         body = page.locator("body").inner_text(timeout=1200)
@@ -2809,29 +2866,25 @@ def sms_provider_enabled(args) -> bool:
 
 
 def sms_provider_name(args) -> str:
-    name = str(getattr(args, "sms_provider", "") or "").strip().lower()
+    name = normalize_sms_provider_name(str(getattr(args, "sms_provider", "") or "").strip())
     if not name and hero_sms_enabled(args):
         return "herosms"
-    if name in {"hero", "hero_sms", "herosms"}:
-        return "herosms"
-    if name in {"grizzly", "grizzlysms", "grizzly_sms"}:
-        return "grizzly"
-    if name in {"fivesim", "5sim", "five_sim", "5sims"}:
-        return "fivesim"
-    if name in {"smsbower", "sms_bower", "sms-bower"}:
-        return "smsbower"
     return name
 
 
 def smsbower_base_url(args) -> str:
-    explicit = str(getattr(args, "sms_api_url", "") or "").strip()
-    if explicit:
-        return explicit
-    try:
-        env = load_root_env()
-    except Exception:
-        env = {}
-    return str(env.get("SMSBOWER_API_URL") or SMSBOWER_DEFAULT_ENDPOINT).strip() or SMSBOWER_DEFAULT_ENDPOINT
+    return SMSBOWER_DEFAULT_ENDPOINT
+
+
+def create_auth_sms_provider(args, provider_name: str):
+    api_key = str(getattr(args, "sms_api_key", "") or getattr(args, "hero_sms_api_key", "") or "").strip()
+    api_url = str(getattr(args, "sms_api_url", "") or "").strip()
+    return create_sms_provider(
+        provider_name,
+        api_key,
+        base_url=api_url if provider_name == "nexsms" else "",
+        pool_file=api_url if provider_name == "chatgpt-api" else "",
+    )
 
 
 def sms_enabled(args) -> bool:
@@ -3051,8 +3104,7 @@ def fill_phone_and_wait_sms_page(page, phone: str, country: PhoneCountry) -> Non
     time.sleep(4)
     if is_phone_link_limit_page(page):
         raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
-    if is_phone_number_rejected_page(page):
-        raise RuntimeError("PHONE_REJECTED: phone rejected by page after submit")
+    raise_phone_rejection_if_needed(page, after_submit=True)
 
 
 def find_sms_code_input(page):
@@ -3315,15 +3367,7 @@ def complete_auth_sms_state(args) -> None:
         clear_auth_sms_reuse_state(args)
         return
     try:
-        api_key = str(getattr(args, "sms_api_key", "") or getattr(args, "hero_sms_api_key", "") or "").strip()
-        if provider_name == "grizzly":
-            provider = GrizzlySMSProvider(api_key)
-        elif provider_name == "fivesim":
-            provider = FiveSimProvider(api_key)
-        elif provider_name == "smsbower":
-            provider = SmsBowerProvider(api_key, base_url=smsbower_base_url(args))
-        else:
-            provider = HeroSMSProvider(api_key)
+        provider = create_auth_sms_provider(args, provider_name)
         provider.complete(activation_id)
     except Exception as exc:
         print(f"[SMS] " + _u(r"\u6388\u6743\u6210\u529f\u540e\u5b8c\u6210\u63a5\u7801\u6fc0\u6d3b\u5931\u8d25\uff0c\u4e0d\u5f71\u54cd AT/RT \u843d\u76d8") + f": {exc}", flush=True)
@@ -3346,8 +3390,7 @@ def wait_sms_verification_page(page, remaining_seconds, *, label: str) -> float:
         wait_round += 1
         if is_phone_link_limit_page(page):
             raise RuntimeError("PHONE_LINK_LIMIT: phone linked to maximum accounts")
-        if is_phone_number_rejected_page(page):
-            raise RuntimeError("PHONE_REJECTED: phone rejected by page")
+        raise_phone_rejection_if_needed(page)
         if page_looks_like_sms_verification(page):
             now = time.time()
             print(f"[SMS] {label} " + _u(r"\u9875\u9762\u5df2\u8fdb\u5165\u77ed\u4fe1\u9a8c\u8bc1\u7801\u9636\u6bb5"), flush=True)
@@ -3392,8 +3435,7 @@ def handle_phone_required_with_hero_sms(page, args, remaining_seconds) -> bool:
             wait_round += 1
             if is_phone_link_limit_page(page):
                 raise RuntimeError("PHONE_LINK_LIMIT: phone linked to maximum accounts")
-            if is_phone_number_rejected_page(page):
-                raise RuntimeError("PHONE_REJECTED: phone rejected by page")
+            raise_phone_rejection_if_needed(page)
             if page_looks_like_sms_verification(page):
                 print(f"[SMS] 页面已进入短信验证码阶段，开始向 HeroSMS 拉取验证码", flush=True)
                 break
@@ -3446,8 +3488,7 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
                 wait_round += 1
                 if is_phone_link_limit_page(page):
                     raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
-                if is_phone_number_rejected_page(page):
-                    raise RuntimeError("PHONE_REJECTED: phone rejected by page")
+                raise_phone_rejection_if_needed(page)
                 if page_looks_like_sms_verification(page):
                     print("[SMS][POOL] 页面已进入短信验证码阶段，开始从手机号池取码 URL 拉取验证码", flush=True)
                     break
@@ -3463,8 +3504,7 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
             while time.time() - started < timeout:
                 if is_phone_link_limit_page(page):
                     raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
-                if is_phone_number_rejected_page(page):
-                    raise RuntimeError("PHONE_REJECTED: phone rejected by page")
+                raise_phone_rejection_if_needed(page)
                 try:
                     resp = requests.get(sms_api_url, timeout=10)
                     text = (resp.text or "").strip()
@@ -3482,8 +3522,7 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
             if not code:
                 if is_phone_link_limit_page(page):
                     raise RuntimeError("PHONE_LINK_LIMIT: 此电话号码已关联到可关联的最大账户")
-                if is_phone_number_rejected_page(page):
-                    raise RuntimeError("PHONE_REJECTED: phone rejected by page")
+                raise_phone_rejection_if_needed(page)
                 hint = phone_page_text_hint(page)
                 raise RuntimeError(f"PHONE_POOL_TIMEOUT: 手机号池验证码超时 ({timeout}s) | page_hint={hint}")
 
@@ -3507,23 +3546,11 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
         raise RuntimeError("未配置接码平台参数，且授权手机号池验证失败")
 
     provider_name = sms_provider_name(args) or "herosms"
-    if provider_name in {"fivesim", "5sim"}:
-        provider_name = "fivesim"
     api_key = str(getattr(args, "sms_api_key", "") or getattr(args, "hero_sms_api_key", "") or "").strip()
-    if provider_name == "grizzly":
-        provider = GrizzlySMSProvider(api_key)
-        label = "GrizzlySMS"
-    elif provider_name == "fivesim":
-        provider = FiveSimProvider(api_key)
-        label = "5sim"
-    elif provider_name == "smsbower":
-        provider = SmsBowerProvider(api_key, base_url=smsbower_base_url(args))
-        label = "SMSBower"
-    else:
-        provider = HeroSMSProvider(api_key)
-        label = "HeroSMS"
+    provider = create_auth_sms_provider(args, provider_name)
+    label = sms_provider_label(provider_name)
     country = selected_sms_country(args)
-    default_service = "openai" if provider_name == "fivesim" else "dr"
+    default_service = sms_provider_default_service(provider_name)
     service = str(getattr(args, "sms_service", "") or getattr(args, "hero_sms_service", "") or default_service).strip() or default_service
     operator = str(getattr(args, "sms_operator", "") or getattr(args, "hero_sms_operator", "") or "").strip()
     if provider_name == "fivesim" and not operator:
@@ -3552,7 +3579,7 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
             raise RuntimeError("5sim missing country slug")
         country_arg = slug
     else:
-        country_arg = country.hero_sms_country
+        country_arg = provider_country_arg(provider_name, country)
 
     code_timeout = auth_sms_code_timeout_seconds(args)
     code_page_retry_limit = auth_sms_code_page_retry_limit(args)
@@ -3637,6 +3664,9 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
                 print(f"[SMS] {label} " + _u(r"\u590d\u7528\u624b\u673a\u53f7\u5931\u8d25") + f": {last_error}", flush=True)
                 if capture_code_from_url(page.url):
                     return True
+                if "phone_voip_rejected" in last_error.lower():
+                    clear_auth_sms_reuse_state(args)
+                    raise RuntimeError(f"AUTH_SMS_COUNTRY_EXHAUSTED: country={reused_country.name}({reused_country.hero_sms_country}), attempts={reuse_attempt}, last={last_error}") from exc
                 if reuse_attempt < code_page_retry_limit:
                     try:
                         goto_add_phone_for_retry(page)
@@ -3745,6 +3775,13 @@ def handle_phone_required_with_sms_provider(page, args, remaining_seconds) -> bo
             if capture_code_from_url(page.url):
                 return True
             if "auth_sms_country_no_number" in lower_last_error:
+                raise RuntimeError(f"AUTH_SMS_COUNTRY_EXHAUSTED: country={country.name}({country.hero_sms_country}), attempts={phone_attempt}, last={last_error}") from exc
+            if "phone_voip_rejected" in lower_last_error:
+                print(
+                    f"[SMS] {label} "
+                    + _u(r"\u68c0\u6d4b\u5230\u865a\u62df\u53f7\u7801/VoIP \u62d2\u7edd\uff0c\u8df3\u8fc7\u5f53\u524d\u63a5\u7801\u56fd\u5bb6"),
+                    flush=True,
+                )
                 raise RuntimeError(f"AUTH_SMS_COUNTRY_EXHAUSTED: country={country.name}({country.hero_sms_country}), attempts={phone_attempt}, last={last_error}") from exc
             if "auth_sms_code_page_retry_exhausted" in lower_last_error:
                 raise
@@ -6977,7 +7014,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rt-txt", default=str(DEFAULT_RT_TXT), help="标准 TXT 输出文件，格式为 账号----refresh_token")
     parser.add_argument("--sub-out", default="", help="SUB 聚合格式输出文件，默认写到输出分类目录 sub2api_accounts.json")
     parser.add_argument("--no-sub-output", action="store_true", help="标准输出时不写 SUB 聚合 JSON")
-    parser.add_argument("--sms-provider", default="", help="接码平台：herosms / grizzly / fivesim / smsbower")
+    parser.add_argument(
+        "--sms-provider",
+        default="",
+        help="接码平台：herosms / grizzly / fivesim / smsbower / sms-verification-number / nexsms / smspool / chatgpt-api",
+    )
     parser.add_argument("--sms-api-key", default="", help="接码平台 API Key")
     parser.add_argument("--sms-api-url", default="", help="接码平台接口地址")
     parser.add_argument("--sms-service", default="", help="接码平台服务代码")

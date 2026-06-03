@@ -130,7 +130,6 @@ SETTINGS: list[SettingItem] = [
     SettingItem("FIVESIM_COUNTRY_SELECT", "5sim 固定国家", "流程一/三/Free 接码", help_text="填 ISO 代码（ID / VN / PH…）或 slug（indonesia）。", section="手机号接码"),
     SettingItem("FIVESIM_PROMPT_COUNTRY_SELECTION", "5sim 运行时选国家", "流程一/三/Free 接码", "bool", section="手机号接码"),
     SettingItem("SMSBOWER_API_KEY", "SMSBower API Key", "流程一/三/Free 接码", masked=True, section="手机号接码"),
-    SettingItem("SMSBOWER_API_URL", "SMSBower 接口地址", "流程一/三/Free 接码", section="手机号接码"),
     SettingItem("SMSBOWER_SERVICE", "SMSBower 服务", "流程一/三/Free 接码", section="手机号接码"),
     SettingItem("SMSBOWER_COUNTRY_TOP_N", "SMSBower 国家数量", "流程一/三/Free 接码", "int", section="手机号接码"),
     SettingItem("SMSBOWER_PROVIDER_THRESHOLD", "SMSBower 服务商阈值", "流程一/三/Free 接码", "int", section="手机号接码"),
@@ -147,7 +146,92 @@ SETTINGS: list[SettingItem] = [
     SettingItem("PAYPAL_BILLING_COUNTRY", "账单国家", "PayPal Plus", help_text="生成长链接时的账单国家（默认 US）。", section="PayPal Plus"),
 ]
 
+SMS_PROVIDER_CHOICES = (
+    "herosms",
+    "grizzly",
+    "fivesim",
+    "smsbower",
+    "sms-verification-number",
+    "nexsms",
+    "smspool",
+    "chatgpt-api",
+)
+
+_SMS_PROVIDER_SETTING_KEYS = {
+    "SMS_PROVIDER",
+    "FLOW1_SMS_PROVIDER",
+    "FLOW3_SMS_PROVIDER",
+    "FREE_SMS_PROVIDER",
+}
+
+def _with_choices(item: SettingItem, choices: tuple[str, ...]) -> SettingItem:
+    return SettingItem(
+        item.key,
+        item.label,
+        item.group,
+        item.kind,
+        choices,
+        item.masked,
+        item.help_text,
+        item.section,
+    )
+
+
+SETTINGS = [
+    _with_choices(item, SMS_PROVIDER_CHOICES) if item.key in _SMS_PROVIDER_SETTING_KEYS else item
+    for item in SETTINGS
+]
+
+_SMS_SETTINGS_GROUP = _u(r"\u6d41\u7a0b\u4e00/\u4e09/Free \u63a5\u7801")
+_SMS_SETTINGS_SECTION = _u(r"\u624b\u673a\u53f7\u63a5\u7801")
+
+_EXTRA_SMS_SETTINGS: tuple[SettingItem, ...] = (
+    SettingItem("SMS_VERIFICATION_NUMBER_API_KEY", "SMS Verification Number API Key", _SMS_SETTINGS_GROUP, masked=True, section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMS_VERIFICATION_NUMBER_SERVICE", _u(r"SMS Verification Number \u6ce8\u518c\u9879\u76ee"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMS_VERIFICATION_NUMBER_COUNTRY_TOP_N", _u(r"SMS Verification Number \u56fd\u5bb6\u6570\u91cf"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMS_VERIFICATION_NUMBER_PROVIDER_THRESHOLD", _u(r"SMS Verification Number \u670d\u52a1\u5546\u9608\u503c"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMS_VERIFICATION_NUMBER_PROMPT_PROVIDER_SELECTION", _u(r"SMS Verification Number \u9009\u62e9\u670d\u52a1\u5546"), _SMS_SETTINGS_GROUP, "bool", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMS_VERIFICATION_NUMBER_POLL_INTERVAL", _u(r"SMS Verification Number \u8f6e\u8be2\u79d2\u6570"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMS_VERIFICATION_NUMBER_MAX_ATTEMPTS", _u(r"SMS Verification Number \u8f6e\u8be2\u6b21\u6570"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMS_VERIFICATION_NUMBER_COUNTRY_SELECT", _u(r"SMS Verification Number \u56fa\u5b9a\u56fd\u5bb6"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMS_VERIFICATION_NUMBER_PROMPT_COUNTRY_SELECTION", _u(r"SMS Verification Number \u8fd0\u884c\u65f6\u9009\u56fd\u5bb6"), _SMS_SETTINGS_GROUP, "bool", section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_API_KEY", "NexSMS API Key", _SMS_SETTINGS_GROUP, masked=True, section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_SERVICE", _u(r"NexSMS \u6ce8\u518c\u9879\u76ee"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_COUNTRY_TOP_N", _u(r"NexSMS \u56fd\u5bb6\u6570\u91cf"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_PROVIDER_THRESHOLD", _u(r"NexSMS \u670d\u52a1\u5546\u9608\u503c"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_PROMPT_PROVIDER_SELECTION", _u(r"NexSMS \u9009\u62e9\u670d\u52a1\u5546"), _SMS_SETTINGS_GROUP, "bool", section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_POLL_INTERVAL", _u(r"NexSMS \u8f6e\u8be2\u79d2\u6570"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_MAX_ATTEMPTS", _u(r"NexSMS \u8f6e\u8be2\u6b21\u6570"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_COUNTRY_SELECT", _u(r"NexSMS \u56fa\u5b9a\u56fd\u5bb6"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("NEXSMS_PROMPT_COUNTRY_SELECTION", _u(r"NexSMS \u8fd0\u884c\u65f6\u9009\u56fd\u5bb6"), _SMS_SETTINGS_GROUP, "bool", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_API_KEY", "SMSPool API Key", _SMS_SETTINGS_GROUP, masked=True, section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_SERVICE", _u(r"SMSPool \u6ce8\u518c\u9879\u76ee"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_COUNTRY_TOP_N", _u(r"SMSPool \u56fd\u5bb6\u6570\u91cf"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_PROVIDER_THRESHOLD", _u(r"SMSPool \u670d\u52a1\u5546\u9608\u503c"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_PROMPT_PROVIDER_SELECTION", _u(r"SMSPool \u9009\u62e9\u670d\u52a1\u5546"), _SMS_SETTINGS_GROUP, "bool", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_POLL_INTERVAL", _u(r"SMSPool \u8f6e\u8be2\u79d2\u6570"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_MAX_ATTEMPTS", _u(r"SMSPool \u8f6e\u8be2\u6b21\u6570"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_COUNTRY_SELECT", _u(r"SMSPool \u56fa\u5b9a\u56fd\u5bb6"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("SMSPOOL_PROMPT_COUNTRY_SELECTION", _u(r"SMSPool \u8fd0\u884c\u65f6\u9009\u56fd\u5bb6"), _SMS_SETTINGS_GROUP, "bool", section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_POOL_FILE", _u(r"ChatGPT API \u63a5\u7801\u53f7\u6c60\u6587\u4ef6"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_SERVICE", _u(r"ChatGPT API \u6ce8\u518c\u9879\u76ee"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_COUNTRY_TOP_N", _u(r"ChatGPT API \u56fd\u5bb6\u6570\u91cf"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_PROVIDER_THRESHOLD", _u(r"ChatGPT API \u670d\u52a1\u5546\u9608\u503c"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_PROMPT_PROVIDER_SELECTION", _u(r"ChatGPT API \u9009\u62e9\u670d\u52a1\u5546"), _SMS_SETTINGS_GROUP, "bool", section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_POLL_INTERVAL", _u(r"ChatGPT API \u8f6e\u8be2\u79d2\u6570"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_MAX_ATTEMPTS", _u(r"ChatGPT API \u8f6e\u8be2\u6b21\u6570"), _SMS_SETTINGS_GROUP, "int", section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_COUNTRY_SELECT", _u(r"ChatGPT API \u56fa\u5b9a\u56fd\u5bb6"), _SMS_SETTINGS_GROUP, section=_SMS_SETTINGS_SECTION),
+    SettingItem("CHATGPT_API_SMS_PROMPT_COUNTRY_SELECTION", _u(r"ChatGPT API \u8fd0\u884c\u65f6\u9009\u56fd\u5bb6"), _SMS_SETTINGS_GROUP, "bool", section=_SMS_SETTINGS_SECTION),
+)
+
+_existing_setting_keys = {item.key for item in SETTINGS}
+SETTINGS.extend(item for item in _EXTRA_SMS_SETTINGS if item.key not in _existing_setting_keys)
+
 SETTINGS_BY_KEY = {item.key: item for item in SETTINGS}
+
+DEPRECATED_ENV_KEYS = {
+    "SMSBOWER_API_URL",
+}
 
 FLOW2_PRESETS: list[tuple[str, str, dict[str, str]]] = [
     (
@@ -352,6 +436,8 @@ def parse_env(lines: list[str]) -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
+        if key.strip() in DEPRECATED_ENV_KEYS:
+            continue
         values[key.strip()] = value.strip().strip('"').strip("'")
     return values
 
@@ -379,6 +465,8 @@ def write_env_values(path: Path, updates: dict[str, str]) -> None:
         if stripped and not stripped.startswith("#") and "=" in stripped:
             key, _value = stripped.split("=", 1)
             key = key.strip()
+            if key in DEPRECATED_ENV_KEYS:
+                continue
             if key in updates:
                 output.append(f"{key}={updates[key]}")
                 seen.add(key)

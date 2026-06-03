@@ -28,8 +28,19 @@ from modules.fivesim_sms_provider import (
     FIVESIM_ISO_TO_COUNTRY,
     configured_fivesim_countries,
 )
-from modules.smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
-from modules.smsbower_provider import SmsBowerProvider, smsbower_country_catalog
+from modules.sms_provider_factory import (
+    SUPPORTED_SMS_PROVIDERS,
+    create_sms_provider,
+    normalize_sms_provider_name,
+    provider_country_arg,
+    sms_provider_api_key_from_env,
+    sms_provider_api_key_name,
+    sms_provider_default_service,
+    sms_provider_env_prefix,
+    sms_provider_label,
+    sms_provider_uses_country_object,
+)
+from modules.smsbower_provider import smsbower_country_catalog
 from modules.sms_country_filter import filter_allowed_sms_countries
 from modules.paypal_phone_pool import PhoneInfo, PhonePool
 from modules.auth_upload import auth_upload_enabled, parse_upload_targets
@@ -491,6 +502,41 @@ def flow_env_value(env: dict[str, str], flow_key: str, name: str) -> str:
     return (env.get(name) or "").strip()
 
 
+def _arg_name_for_env_key(env_key: str) -> str:
+    return str(env_key or "").strip().lower()
+
+
+def _provider_arg(args: argparse.Namespace, env_key: str, default: object = "") -> object:
+    return getattr(args, _arg_name_for_env_key(env_key), default)
+
+
+def _provider_config_value(
+    args: argparse.Namespace,
+    env: dict[str, str],
+    provider_name: str,
+    suffix: str,
+    default: str = "",
+) -> str:
+    prefix = sms_provider_env_prefix(provider_name)
+    env_key = f"{prefix}_{suffix}" if prefix else suffix
+    value = str(_provider_arg(args, env_key, "") or "").strip()
+    if value:
+        return value
+    return str(env.get(env_key) or default).strip()
+
+
+def _provider_threshold_suffix(provider_name: str) -> str:
+    if provider_name in {"herosms", "fivesim"}:
+        return "OPERATOR_THRESHOLD"
+    return "PROVIDER_THRESHOLD"
+
+
+def _provider_prompt_suffix(provider_name: str) -> str:
+    if provider_name in {"herosms", "fivesim"}:
+        return "PROMPT_OPERATOR_SELECTION"
+    return "PROMPT_PROVIDER_SELECTION"
+
+
 def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: str = "流程三", flow_key: str = "") -> dict[str, object] | None:
     env = read_env_keys(AUTH_ROOT / ".env")
     sms_enabled_value = flow_env_value(env, flow_key, "SMS_ENABLED")
@@ -501,81 +547,32 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
         print(f"[SMS] 手机号接码已关闭，{flow_label}保持原逻辑：遇到手机号必填页会弃置账号。")
         return None
 
-    provider_name = (getattr(args, "sms_provider", "") or flow_env_value(env, flow_key, "SMS_PROVIDER") or "herosms").strip().lower()
-    if provider_name in {"hero", "hero_sms", "herosms"}:
-        provider_name = "herosms"
-    elif provider_name in {"grizzly", "grizzlysms", "grizzly_sms"}:
-        provider_name = "grizzly"
-    elif provider_name in {"5sim", "fivesim", "5sims", "five_sim"}:
-        provider_name = "fivesim"
-    elif provider_name in {"smsbower", "sms_bower", "sms-bower"}:
-        provider_name = "smsbower"
-    else:
+    provider_name = normalize_sms_provider_name(
+        getattr(args, "sms_provider", "") or flow_env_value(env, flow_key, "SMS_PROVIDER") or "herosms"
+    )
+    if provider_name not in SUPPORTED_SMS_PROVIDERS:
         print(f"[SMS] SMS_PROVIDER={provider_name} 暂不支持，{flow_label}保持原手机号失败处理。")
         return None
 
-    if provider_name == "smsbower":
-        api_key = (getattr(args, "smsbower_api_key", "") or env.get("SMSBOWER_API_KEY") or env.get("SMS_API_KEY") or "").strip()
-        api_key_name = "SMSBOWER_API_KEY"
-        provider_label = "SMSBower"
-        base_url = (env.get("SMSBOWER_API_URL") or SMSBOWER_DEFAULT_ENDPOINT).strip() or SMSBOWER_DEFAULT_ENDPOINT
-        provider = SmsBowerProvider(api_key, base_url=base_url) if api_key else None
-        raw_service = (getattr(args, "smsbower_service", "") or env.get("SMSBOWER_SERVICE") or "auto").strip() or "auto"
-        service = provider.resolve_openai_service(raw_service) if provider else "dr"
-        top_n = env_int(str(getattr(args, "smsbower_country_top_n", "") or env.get("SMSBOWER_COUNTRY_TOP_N") or ""), 10)
-        threshold = env_int(str(getattr(args, "smsbower_provider_threshold", "") or env.get("SMSBOWER_PROVIDER_THRESHOLD") or ""), 20)
-        prompt_operator = env_bool(env.get("SMSBOWER_PROMPT_PROVIDER_SELECTION"), default=True)
-        forced_country = (getattr(args, "country", "") or env.get("SMSBOWER_COUNTRY_SELECT") or "").strip()
-        prompt_country = env_bool(env.get("SMSBOWER_PROMPT_COUNTRY_SELECTION"), default=True)
-        poll_interval = env_float(env.get("SMSBOWER_POLL_INTERVAL"), 5.0)
-        max_attempts = env_int(env.get("SMSBOWER_MAX_ATTEMPTS"), 60)
-    elif provider_name == "grizzly":
-        api_key = (getattr(args, "grizzly_api_key", "") or env.get("GRIZZLY_API_KEY") or env.get("SMS_API_KEY") or "").strip()
-        api_key_name = "GRIZZLY_API_KEY"
-        provider_label = "GrizzlySMS"
-        provider = GrizzlySMSProvider(api_key) if api_key else None
-        raw_service = (getattr(args, "grizzly_service", "") or env.get("GRIZZLY_SERVICE") or "auto").strip() or "auto"
-        service = provider.resolve_openai_service(raw_service) if provider else "auto"
-        top_n = env_int(str(getattr(args, "grizzly_country_top_n", "") or env.get("GRIZZLY_COUNTRY_TOP_N") or ""), 10)
-        threshold = env_int(str(getattr(args, "grizzly_provider_threshold", "") or env.get("GRIZZLY_PROVIDER_THRESHOLD") or ""), 20)
-        prompt_operator = env_bool(env.get("GRIZZLY_PROMPT_PROVIDER_SELECTION"), default=True)
-        forced_country = (getattr(args, "country", "") or env.get("GRIZZLY_COUNTRY_SELECT") or "").strip()
-        prompt_country = env_bool(env.get("GRIZZLY_PROMPT_COUNTRY_SELECTION"), default=True)
-        poll_interval = env_float(env.get("GRIZZLY_POLL_INTERVAL"), 5.0)
-        max_attempts = env_int(env.get("GRIZZLY_MAX_ATTEMPTS"), 60)
-    elif provider_name == "fivesim":
-        api_key = (getattr(args, "fivesim_api_key", "") or env.get("FIVESIM_API_KEY") or env.get("SMS_API_KEY") or "").strip()
-        api_key_name = "FIVESIM_API_KEY"
-        provider_label = "5sim"
-        provider = FiveSimProvider(api_key) if api_key else None
-        raw_service = (getattr(args, "fivesim_service", "") or env.get("FIVESIM_SERVICE") or "openai").strip() or "openai"
-        service = provider.resolve_openai_service(raw_service) if provider else "openai"
-        top_n = env_int(str(getattr(args, "fivesim_country_top_n", "") or env.get("FIVESIM_COUNTRY_TOP_N") or ""), 10)
-        threshold = env_int(str(getattr(args, "fivesim_operator_threshold", "") or env.get("FIVESIM_OPERATOR_THRESHOLD") or ""), 20)
-        prompt_operator = env_bool(env.get("FIVESIM_PROMPT_OPERATOR_SELECTION"), default=True)
-        forced_country = (getattr(args, "country", "") or env.get("FIVESIM_COUNTRY_SELECT") or "").strip()
-        prompt_country = env_bool(env.get("FIVESIM_PROMPT_COUNTRY_SELECTION"), default=True)
-        poll_interval = env_float(env.get("FIVESIM_POLL_INTERVAL"), 5.0)
-        max_attempts = env_int(env.get("FIVESIM_MAX_ATTEMPTS"), 60)
+    api_key = sms_provider_api_key_from_env(provider_name, env)
+    api_key_name = sms_provider_api_key_name(provider_name)
+    provider_label = sms_provider_label(provider_name)
+    base_url = _provider_config_value(args, env, provider_name, "BASE_URL", "")
+    pool_file = _provider_config_value(args, env, provider_name, "POOL_FILE", "")
+    pool_text = str(env.get("CHATGPT_API_SMS_POOL_TEXT") or "").strip() if provider_name == "chatgpt-api" else ""
+    provider = create_sms_provider(provider_name, api_key, base_url=base_url, pool_file=pool_file, pool_text=pool_text) if api_key else None
+    raw_service = _provider_config_value(args, env, provider_name, "SERVICE", sms_provider_default_service(provider_name))
+    if provider and hasattr(provider, "resolve_openai_service"):
+        service = provider.resolve_openai_service(raw_service)
     else:
-        api_key = (
-            getattr(args, "hero_sms_api_key", "")
-            or env.get("HERO_SMS_API_KEY")
-            or env.get("HEROSMS_API_KEY")
-            or env.get("SMS_API_KEY")
-            or ""
-        ).strip()
-        api_key_name = "HERO_SMS_API_KEY"
-        provider_label = "HeroSMS"
-        provider = HeroSMSProvider(api_key) if api_key else None
-        service = (getattr(args, "hero_sms_service", "") or env.get("HERO_SMS_SERVICE") or "dr").strip() or "dr"
-        top_n = env_int(str(getattr(args, "hero_sms_country_top_n", "") or env.get("HERO_SMS_COUNTRY_TOP_N") or ""), 10)
-        threshold = env_int(str(getattr(args, "hero_sms_operator_threshold", "") or env.get("HERO_SMS_OPERATOR_THRESHOLD") or ""), 20)
-        prompt_operator = env_bool(env.get("HERO_SMS_PROMPT_OPERATOR_SELECTION"), default=True)
-        forced_country = (getattr(args, "country", "") or env.get("HERO_SMS_COUNTRY_SELECT") or "").strip()
-        prompt_country = env_bool(env.get("HERO_SMS_PROMPT_COUNTRY_SELECTION"), default=True)
-        poll_interval = env_float(env.get("HERO_SMS_POLL_INTERVAL"), 5.0)
-        max_attempts = env_int(env.get("HERO_SMS_MAX_ATTEMPTS"), 60)
+        service = raw_service or sms_provider_default_service(provider_name)
+    top_n = env_int(_provider_config_value(args, env, provider_name, "COUNTRY_TOP_N", ""), 10)
+    threshold = env_int(_provider_config_value(args, env, provider_name, _provider_threshold_suffix(provider_name), ""), 20)
+    prompt_operator = env_bool(_provider_config_value(args, env, provider_name, _provider_prompt_suffix(provider_name), ""), default=True)
+    forced_country = (getattr(args, "country", "") or _provider_config_value(args, env, provider_name, "COUNTRY_SELECT", "")).strip()
+    prompt_country = env_bool(_provider_config_value(args, env, provider_name, "PROMPT_COUNTRY_SELECTION", ""), default=True)
+    poll_interval = env_float(_provider_config_value(args, env, provider_name, "POLL_INTERVAL", ""), 5.0)
+    max_attempts = env_int(_provider_config_value(args, env, provider_name, "MAX_ATTEMPTS", ""), 60)
 
     phone_retry_limit = env_int(flow_env_value(env, flow_key, "SMS_PHONE_RETRY_LIMIT"), 50)
     phone_retry_interval = env_float(flow_env_value(env, flow_key, "SMS_PHONE_RETRY_INTERVAL"), 5.0)
@@ -593,7 +590,7 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
 
     if provider_name == "fivesim":
         catalog = configured_fivesim_countries()
-    elif provider_name == "smsbower":
+    elif provider_name in {"smsbower", "sms-verification-number", "smspool"}:
         catalog = smsbower_country_catalog(provider)
     else:
         catalog = configured_country_catalog()
@@ -601,7 +598,7 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
         if provider_name == "fivesim":
             priced = provider.list_country_prices(service, catalog)
             if not priced:
-                raise RuntimeError("5sim 未返回可用国家报价")
+                raise RuntimeError(f"{provider_label} 未返回可用国家报价")
         else:
             api_countries = provider.get_countries()
             countries = enrich_countries_with_api(catalog, api_countries) if api_countries else catalog
@@ -639,7 +636,7 @@ def resolve_authorization_sms_selection(args: argparse.Namespace, flow_label: st
             "provider": provider_name,
             "provider_label": provider_label,
             "api_key": api_key,
-            "base_url": base_url if provider_name == "smsbower" else "",
+            "base_url": base_url if provider_name == "nexsms" else "",
             "service": service,
             "country": selected_country,
             "countries": priced,
@@ -1150,7 +1147,11 @@ def main() -> int:
     parser.add_argument("--count", type=int, help="授权账号数量")
     parser.add_argument("--workers", type=int, help="并发线程数")
     parser.add_argument("--country", default="", help="指定国家：序号 / ISO / 接码平台国家ID")
-    parser.add_argument("--sms-provider", default="", help="接码平台：herosms / grizzly / fivesim")
+    parser.add_argument(
+        "--sms-provider",
+        default="",
+        help="接码平台：herosms / grizzly / fivesim / smsbower / sms-verification-number / nexsms / smspool / chatgpt-api",
+    )
     parser.add_argument("--hero-sms-api-key", default="", help="HeroSMS API Key")
     parser.add_argument("--hero-sms-service", default="", help="HeroSMS 服务代码，默认 dr")
     parser.add_argument("--hero-sms-country-top-n", type=int, help="列出最便宜国家数量")

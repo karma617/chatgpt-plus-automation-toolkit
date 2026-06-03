@@ -101,7 +101,7 @@ def test_smsbower_country_dropdown_parses_provider_price_map(monkeypatch) -> Non
     assert [item.display() for item in options] == ["12 - \u7f8e\u56fd / +1 / US / $0.02 / \u5e93\u5b58 320"]
 
 
-def test_smsbower_service_dropdown_uses_custom_api_url(monkeypatch) -> None:
+def test_smsbower_service_dropdown_uses_code_default_endpoint(monkeypatch) -> None:
     captured: list[dict] = []
 
     class FakeSmsBowerProvider:
@@ -116,10 +116,10 @@ def test_smsbower_service_dropdown_uses_custom_api_url(monkeypatch) -> None:
 
     options = dynamic_env_options(
         "SMSBOWER_SERVICE",
-        {"SMSBOWER_API_KEY": "sms-key", "SMSBOWER_API_URL": "https://smsbower.page/stubs/handler_api.php"},
+        {"SMSBOWER_API_KEY": "sms-key"},
     )
 
-    assert captured[0]["base_url"] == "https://smsbower.page/stubs/handler_api.php"
+    assert "base_url" not in captured[0]
     assert [item.display() for item in options] == ["auto - \u81ea\u52a8\u8bc6\u522b OpenAI/ChatGPT", "dr - OpenAI"]
 
 

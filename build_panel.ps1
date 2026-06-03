@@ -84,6 +84,30 @@ if (Test-Path $DistOutputRoot) {
 $RuntimeStateDirs = @("data", "output", "profiles")
 $RuntimeStateFiles = @(".env")
 $RuntimeBackupRoot = Join-Path $ProjectRoot "build\_dist_runtime_backup"
+$DeprecatedEnvKeys = @("SMSBOWER_API_URL")
+
+function Remove-DeprecatedEnvKeys {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        return
+    }
+    $lines = Get-Content -LiteralPath $Path -Encoding UTF8
+    $filtered = @()
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        $drop = $false
+        if ($trimmed -and -not $trimmed.StartsWith("#") -and $trimmed.Contains("=")) {
+            $key = ($trimmed -split "=", 2)[0].Trim()
+            if ($DeprecatedEnvKeys -contains $key) {
+                $drop = $true
+            }
+        }
+        if (-not $drop) {
+            $filtered += $line
+        }
+    }
+    Set-Content -LiteralPath $Path -Value $filtered -Encoding UTF8
+}
 
 # Preserve runtime state in existing dist so rebuild does not re-import consumed pools.
 if (Test-Path $RuntimeBackupRoot) {
@@ -171,6 +195,9 @@ foreach ($file in $RuntimeStateFiles) {
     if (Test-Path $src) {
         Write-Host "[build] Restore runtime file $file"
         Copy-Item -LiteralPath $src -Destination $dst -Force
+        if ($file -eq ".env") {
+            Remove-DeprecatedEnvKeys -Path $dst
+        }
     }
 }
 

@@ -7,7 +7,7 @@ from typing import Any
 from modules.fivesim_sms_provider import FiveSimProvider, configured_fivesim_countries
 from modules.grizzly_sms_provider import GrizzlySMSProvider
 from modules.hero_sms_provider import HeroSMSProvider, configured_country_catalog, enrich_countries_with_api
-from modules.smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
+from modules.extra_sms_providers import ChatGptApiSmsProvider, NexSmsProvider, SmsPoolProvider, SmsVerificationNumberProvider
 from modules.smsbower_provider import SmsBowerProvider, smsbower_country_catalog
 from modules.sms_country_filter import allowed_sms_country_name, filter_allowed_sms_countries
 from modules.auth_upload import join_url, normalize_base_url
@@ -32,6 +32,15 @@ def dynamic_env_options(key: str, env: dict[str, str]) -> list[OptionItem]:
     if key == "SMSBOWER_SERVICE":
         return [OptionItem("auto", "自动识别 OpenAI/ChatGPT"), *_handler_services(_smsbower(env))]
 
+    if key == "SMS_VERIFICATION_NUMBER_SERVICE":
+        return [OptionItem("auto", "OpenAI / ChatGPT"), *_handler_services(_sms_verification_number(env))]
+    if key == "NEXSMS_SERVICE":
+        return [OptionItem("ot", "OpenAI / ChatGPT")]
+    if key == "SMSPOOL_SERVICE":
+        return [OptionItem("671", "OpenAI / ChatGPT"), *_handler_services(_smspool(env))]
+    if key == "CHATGPT_API_SMS_SERVICE":
+        return [OptionItem("custom-api", "ChatGPT API SMS")]
+
     if key == "HERO_SMS_COUNTRY_SELECT":
         return _handler_countries(HeroSMSProvider(_api_key(env, "HERO_SMS_API_KEY"), base_url="https://hero-sms.com/stubs/handler_api.php"), "HERO_SMS_SERVICE", env)
     if key == "GRIZZLY_COUNTRY_SELECT":
@@ -40,6 +49,14 @@ def dynamic_env_options(key: str, env: dict[str, str]) -> list[OptionItem]:
         return _fivesim_countries(env)
     if key == "SMSBOWER_COUNTRY_SELECT":
         return _smsbower_countries(env)
+    if key == "SMS_VERIFICATION_NUMBER_COUNTRY_SELECT":
+        return _sms_compatible_countries(_sms_verification_number(env), "SMS_VERIFICATION_NUMBER_SERVICE", env)
+    if key == "NEXSMS_COUNTRY_SELECT":
+        return _nexsms_countries(env)
+    if key == "SMSPOOL_COUNTRY_SELECT":
+        return _sms_compatible_countries(_smspool(env), "SMSPOOL_SERVICE", env)
+    if key == "CHATGPT_API_SMS_COUNTRY_SELECT":
+        return _chatgpt_api_sms_countries(env)
     if key == "SUB2API_GROUP_IDS":
         return _sub2api_groups(env)
 
@@ -51,10 +68,15 @@ def _api_key(env: dict[str, str], key: str) -> str:
 
 
 def _smsbower(env: dict[str, str]) -> SmsBowerProvider:
-    return SmsBowerProvider(
-        _api_key(env, "SMSBOWER_API_KEY"),
-        base_url=(env.get("SMSBOWER_API_URL") or SMSBOWER_DEFAULT_ENDPOINT).strip() or SMSBOWER_DEFAULT_ENDPOINT,
-    )
+    return SmsBowerProvider(_api_key(env, "SMSBOWER_API_KEY"))
+
+
+def _sms_verification_number(env: dict[str, str]) -> SmsVerificationNumberProvider:
+    return SmsVerificationNumberProvider(_api_key(env, "SMS_VERIFICATION_NUMBER_API_KEY"))
+
+
+def _smspool(env: dict[str, str]) -> SmsPoolProvider:
+    return SmsPoolProvider(_api_key(env, "SMSPOOL_API_KEY"))
 
 
 def _handler_services(provider: Any) -> list[OptionItem]:
@@ -113,6 +135,58 @@ def _smsbower_countries(env: dict[str, str]) -> list[OptionItem]:
     service = (env.get("SMSBOWER_SERVICE") or "dr").strip() or "dr"
     try:
         priced = provider.list_country_prices(service, smsbower_country_catalog(provider))
+    except Exception:
+        return []
+    priced = filter_allowed_sms_countries(priced)
+    return [
+        OptionItem(str(country.hero_sms_country), _country_label(country))
+        for country in priced
+        if country.hero_sms_country > 0
+    ]
+
+
+def _sms_compatible_countries(provider: Any, service_key: str, env: dict[str, str]) -> list[OptionItem]:
+    if not getattr(provider, "api_key", ""):
+        return []
+    service = (env.get(service_key) or "dr").strip() or "dr"
+    try:
+        priced = provider.list_country_prices(service, smsbower_country_catalog(provider))
+    except Exception:
+        return []
+    priced = filter_allowed_sms_countries(priced)
+    return [
+        OptionItem(str(country.hero_sms_country), _country_label(country))
+        for country in priced
+        if country.hero_sms_country > 0
+    ]
+
+
+def _nexsms_countries(env: dict[str, str]) -> list[OptionItem]:
+    provider = NexSmsProvider(_api_key(env, "NEXSMS_API_KEY"))
+    if not provider.api_key:
+        return []
+    service = (env.get("NEXSMS_SERVICE") or "ot").strip() or "ot"
+    try:
+        priced = provider.list_country_prices(service, configured_country_catalog())
+    except Exception:
+        return []
+    priced = filter_allowed_sms_countries(priced)
+    return [
+        OptionItem(str(country.hero_sms_country), _country_label(country))
+        for country in priced
+        if country.hero_sms_country > 0
+    ]
+
+
+def _chatgpt_api_sms_countries(env: dict[str, str]) -> list[OptionItem]:
+    provider = ChatGptApiSmsProvider(
+        pool_text=env.get("CHATGPT_API_SMS_POOL_TEXT") or "",
+        pool_file=env.get("CHATGPT_API_SMS_POOL_FILE") or "",
+    )
+    if not provider.api_key:
+        return []
+    try:
+        priced = provider.list_country_prices("custom-api", configured_country_catalog())
     except Exception:
         return []
     priced = filter_allowed_sms_countries(priced)

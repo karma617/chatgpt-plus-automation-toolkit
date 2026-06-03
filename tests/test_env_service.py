@@ -2,6 +2,17 @@ from pathlib import Path
 
 from control_panel.env_service import EnvField, get_known_env_fields, read_env, update_env
 
+SMS_PROVIDER_CHOICES = (
+    "herosms",
+    "grizzly",
+    "fivesim",
+    "smsbower",
+    "sms-verification-number",
+    "nexsms",
+    "smspool",
+    "chatgpt-api",
+)
+
 
 def _u(text: str) -> str:
     return text.encode("ascii").decode("unicode_escape")
@@ -31,6 +42,20 @@ def test_update_env_preserves_comments_and_unknown_keys(tmp_path: Path) -> None:
     update_env(target, {"A": "changed"})
 
     assert target.read_text(encoding="utf-8") == "# keep\nA=changed\nUNKNOWN=value\n"
+
+
+def test_update_env_removes_deprecated_smsbower_api_url(tmp_path: Path) -> None:
+    target = tmp_path / ".env"
+    target.write_text(
+        "# keep\nSMSBOWER_API_KEY=key\nSMSBOWER_API_URL=https://old.example/api\nUNKNOWN=value\n",
+        encoding="utf-8",
+    )
+
+    assert "SMSBOWER_API_URL" not in read_env(target)
+
+    update_env(target, {"SMSBOWER_API_KEY": "changed"})
+
+    assert target.read_text(encoding="utf-8") == "# keep\nSMSBOWER_API_KEY=changed\nUNKNOWN=value\n"
 
 
 def test_update_env_adds_missing_keys_at_end(tmp_path: Path) -> None:
@@ -65,9 +90,18 @@ def test_known_env_fields_include_api_keys() -> None:
     assert "GRIZZLY_PROMPT_PROVIDER_SELECTION" in fields
     assert "FIVESIM_OPERATOR_THRESHOLD" in fields
     assert "SMSBOWER_API_KEY" in fields
-    assert "SMSBOWER_API_URL" in fields
+    removed_smsbower_url_key = "SMSBOWER_" + "API_URL"
+    assert removed_smsbower_url_key not in fields
     assert "SMSBOWER_SERVICE" in fields
     assert "SMSBOWER_COUNTRY_SELECT" in fields
+    assert "SMS_VERIFICATION_NUMBER_API_KEY" in fields
+    assert "SMS_VERIFICATION_NUMBER_SERVICE" in fields
+    assert "NEXSMS_API_KEY" in fields
+    assert "NEXSMS_SERVICE" in fields
+    assert "SMSPOOL_API_KEY" in fields
+    assert "SMSPOOL_SERVICE" in fields
+    assert "CHATGPT_API_SMS_POOL_FILE" in fields
+    assert "CHATGPT_API_SMS_SERVICE" in fields
     assert "YESCAPTCHA_API_KEY" in fields
     assert "HERO_SMS_API_KEY" in fields
     assert "PAYPAL_CARD_REDEEM_API_KEY" in fields
@@ -140,6 +174,10 @@ def test_sms_provider_fields_are_grouped_by_platform() -> None:
     assert _field_by_key("FIVESIM_API_KEY").group == "5sim"
     assert _field_by_key("SMSBOWER_API_KEY").group == "SMSBower"
     assert _field_by_key("SMSBOWER_COUNTRY_SELECT").group == "SMSBower"
+    assert _field_by_key("SMS_VERIFICATION_NUMBER_API_KEY").group == "SMS Verification Number"
+    assert _field_by_key("NEXSMS_API_KEY").group == "NexSMS"
+    assert _field_by_key("SMSPOOL_API_KEY").group == "SMSPool"
+    assert _field_by_key("CHATGPT_API_SMS_POOL_FILE").group == "ChatGPT API SMS"
 
 
 def test_known_env_fields_include_dropdown_choices_for_enum_values() -> None:
@@ -150,7 +188,10 @@ def test_known_env_fields_include_dropdown_choices_for_enum_values() -> None:
     assert _field_by_key("PAYPAL_CAPTCHA_MODE").choices == ("manual", "api")
     assert _field_by_key("CAPTCHA_API_PROVIDER").choices == ("capsolver", "twocaptcha", "yescaptcha")
     assert _field_by_key("PAYPAL_USE_PROXY").choices == ("true", "false")
-    assert _field_by_key("SMS_PROVIDER").choices == ("herosms", "grizzly", "fivesim", "smsbower")
+    assert _field_by_key("SMS_PROVIDER").choices == SMS_PROVIDER_CHOICES
+    assert _field_by_key("FLOW1_SMS_PROVIDER").choices == SMS_PROVIDER_CHOICES
+    assert _field_by_key("FLOW3_SMS_PROVIDER").choices == SMS_PROVIDER_CHOICES
+    assert _field_by_key("FREE_SMS_PROVIDER").choices == SMS_PROVIDER_CHOICES
     assert _field_by_key("FLOW1_MAIL_SOURCE").choices == ("moemail", "hotmail", "icloud_query", "domain163")
     assert _field_by_key("GRIZZLY_PROMPT_PROVIDER_SELECTION").choices == ("true", "false")
     assert _field_by_key("SMSBOWER_PROMPT_PROVIDER_SELECTION").choices == ("true", "false")

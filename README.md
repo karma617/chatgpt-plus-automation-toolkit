@@ -184,7 +184,7 @@ host:port
 
 #### 接码平台配置
 
-支持 HeroSMS / GrizzlySMS / 5sim 三个平台：
+支持 HeroSMS / GrizzlySMS / 5sim / SMSBower / SMS Verification Number / NexSMS / SMSPool / ChatGPT API SMS：
 
 ```ini
 # 全局开关
@@ -203,6 +203,26 @@ GRIZZLY_SERVICE=auto
 # 5sim
 FIVESIM_API_KEY=your-key
 FIVESIM_SERVICE=openai
+
+# SMSBower
+SMSBOWER_API_KEY=your-key
+SMSBOWER_SERVICE=auto
+
+# SMS Verification Number
+SMS_VERIFICATION_NUMBER_API_KEY=your-key
+SMS_VERIFICATION_NUMBER_SERVICE=auto
+
+# NexSMS
+NEXSMS_API_KEY=your-key
+NEXSMS_SERVICE=ot
+
+# SMSPool
+SMSPOOL_API_KEY=your-key
+SMSPOOL_SERVICE=671
+
+# ChatGPT API SMS local pool
+CHATGPT_API_SMS_POOL_FILE=data/auth/chatgpt_api_sms_pool.txt
+CHATGPT_API_SMS_SERVICE=custom-api
 ```
 
 #### 流程二 GoPay 配置
@@ -381,7 +401,7 @@ python main.py [OPTIONS]
   --workers WORKERS     并发浏览器数量
   --count COUNT         目标成功数量
   --country COUNTRY     接码国家（ISO 代码或平台 ID）
-  --sms-provider {herosms,grizzly,fivesim}
+  --sms-provider {herosms,grizzly,fivesim,smsbower,sms-verification-number,nexsms,smspool,chatgpt-api}
                         接码平台
   --mail-source {moemail,hotmail,domain163}
                         邮箱源

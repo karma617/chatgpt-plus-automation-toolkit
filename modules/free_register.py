@@ -19,6 +19,12 @@ from .mail_provider import MailProvider
 from .moemail_factory import create_moemail_accounts, split_domains
 from .proxy_pool import ProxyPool
 from .proxy_config import register_local_proxy_url
+from .sms_provider_factory import (
+    create_sms_provider,
+    normalize_sms_provider_name,
+    provider_country_arg,
+    sms_provider_default_service,
+)
 from .storage import MailAccount, parse_mail_line
 from .utils import load_env, log, now_utc, resolve_path, safe_filename
 
@@ -414,12 +420,12 @@ async def phase1_phone_register(flow: FreeBrowserFlow, sms_selection: dict[str, 
     operator = sms_selection.get("operator")
     operator_value = str(getattr(operator, "operator", "") or "").strip()
     # 5sim 不接受空 operator，必须传 "any"；HeroSMS/Grizzly 空串表示 "任何运营商"
-    provider_name = str(sms_selection.get("provider") or "herosms").lower()
-    if provider_name in {"fivesim", "5sim"} and not operator_value:
+    provider_name = normalize_sms_provider_name(str(sms_selection.get("provider") or "herosms"))
+    if provider_name == "fivesim" and not operator_value:
         operator_value = "any"
-    service = str(sms_selection.get("service") or ("openai" if provider_name in {"fivesim", "5sim"} else "dr")).strip()
+    service = str(sms_selection.get("service") or sms_provider_default_service(provider_name)).strip()
     # 5sim 用 slug；HeroSMS/Grizzly 用 hero_sms_country int
-    country_arg: object = country if provider_name in {"fivesim", "5sim"} else country.hero_sms_country
+    country_arg: object = provider_country_arg(provider_name, country)
     activation = None
     number_used = False
 
@@ -550,21 +556,15 @@ async def finalize_free_sms_activation(sms_selection: dict[str, object], *, succ
 
 
 def create_sms_provider_from_selection(sms_selection: dict[str, object]):
-    from .grizzly_sms_provider import GrizzlySMSProvider
-    from .hero_sms_provider import HeroSMSProvider
-    from .fivesim_sms_provider import FiveSimProvider
-    from .smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
-    from .smsbower_provider import SmsBowerProvider
-
-    provider_name = str(sms_selection.get("provider") or "herosms").lower()
+    provider_name = normalize_sms_provider_name(str(sms_selection.get("provider") or "herosms"))
     api_key = str(sms_selection.get("api_key") or "").strip()
-    if provider_name == "grizzly":
-        return GrizzlySMSProvider(api_key)
-    if provider_name in {"fivesim", "5sim"}:
-        return FiveSimProvider(api_key)
-    if provider_name in {"smsbower", "sms_bower", "sms-bower"}:
-        return SmsBowerProvider(api_key, base_url=str(sms_selection.get("base_url") or "").strip() or SMSBOWER_DEFAULT_ENDPOINT)
-    return HeroSMSProvider(api_key)
+    base_url = str(sms_selection.get("base_url") or "").strip()
+    return create_sms_provider(
+        provider_name,
+        api_key,
+        base_url=base_url,
+        pool_file=base_url if provider_name == "chatgpt-api" else "",
+    )
 
 
 async def poll_sms_code_excluding(provider, activation_id: int, *, interval: float, max_attempts: int, exclude: set[str]) -> str:
@@ -749,11 +749,11 @@ async def phase1_email_register(
     provider = create_sms_provider_from_selection(sms_selection)
     operator = sms_selection.get("operator")
     operator_value = str(getattr(operator, "operator", "") or "").strip()
-    provider_name = str(sms_selection.get("provider") or "herosms").lower()
-    if provider_name in {"fivesim", "5sim"} and not operator_value:
+    provider_name = normalize_sms_provider_name(str(sms_selection.get("provider") or "herosms"))
+    if provider_name == "fivesim" and not operator_value:
         operator_value = "any"
-    service = str(sms_selection.get("service") or ("openai" if provider_name in {"fivesim", "5sim"} else "dr")).strip()
-    country_arg: object = country if provider_name in {"fivesim", "5sim"} else country.hero_sms_country
+    service = str(sms_selection.get("service") or sms_provider_default_service(provider_name)).strip()
+    country_arg: object = provider_country_arg(provider_name, country)
 
     activation = await asyncio.to_thread(provider.get_number, service, country_arg, operator=operator_value)
     sms_selection["last_phone"] = activation.phone_number
@@ -821,11 +821,11 @@ async def phase2_email_oauth_token(
             provider = create_sms_provider_from_selection(sms_selection)
             operator = sms_selection.get("operator")
             operator_value = str(getattr(operator, "operator", "") or "").strip()
-            provider_name = str(sms_selection.get("provider") or "herosms").lower()
-            if provider_name in {"fivesim", "5sim"} and not operator_value:
+            provider_name = normalize_sms_provider_name(str(sms_selection.get("provider") or "herosms"))
+            if provider_name == "fivesim" and not operator_value:
                 operator_value = "any"
-            service = str(sms_selection.get("service") or ("openai" if provider_name in {"fivesim", "5sim"} else "dr")).strip()
-            country_arg: object = country if provider_name in {"fivesim", "5sim"} else country.hero_sms_country
+            service = str(sms_selection.get("service") or sms_provider_default_service(provider_name)).strip()
+            country_arg: object = provider_country_arg(provider_name, country)
             activation = await asyncio.to_thread(provider.get_number, service, country_arg, operator=operator_value)
             sms_selection["last_phone"] = activation.phone_number
             sms_selection["last_activation"] = activation

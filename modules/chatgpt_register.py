@@ -8,11 +8,15 @@ from typing import Awaitable, Callable
 
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
-from .grizzly_sms_provider import GrizzlySMSProvider
 from .hero_sms_provider import HeroSMSProvider, PhoneCountry, SmsActivation, local_phone_number, phone_matches_country
 from .mail_provider import MailProvider
-from .smsbower_provider import DEFAULT_ENDPOINT as SMSBOWER_DEFAULT_ENDPOINT
-from .smsbower_provider import SmsBowerProvider
+from .sms_provider_factory import (
+    create_sms_provider,
+    normalize_sms_provider_name,
+    provider_country_arg,
+    sms_provider_default_service,
+    sms_provider_label,
+)
 from .storage import MailAccount
 from .utils import log, random_profile
 
@@ -361,13 +365,10 @@ class ChatGPTRegister:
 
     async def handle_phone_required(self) -> None:
         selection = self.sms_selection or {}
-        provider_name = str(selection.get("provider") or "herosms").lower()
-        if provider_name in {"fivesim", "5sim"}:
-            provider_name = "fivesim"
-        default_label = {"grizzly": "GrizzlySMS", "fivesim": "5sim", "smsbower": "SMSBower"}.get(provider_name, "HeroSMS")
-        provider_label = str(selection.get("provider_label") or default_label)
+        provider_name = normalize_sms_provider_name(str(selection.get("provider") or "herosms"))
+        provider_label = str(selection.get("provider_label") or sms_provider_label(provider_name))
         api_key = str(selection.get("api_key") or "").strip()
-        default_service = "openai" if provider_name == "fivesim" else "dr"
+        default_service = sms_provider_default_service(provider_name)
         service = str(selection.get("service") or default_service).strip() or default_service
         country = selection.get("country")
         operator = selection.get("operator")
@@ -380,18 +381,15 @@ class ChatGPTRegister:
         operator_label = str(getattr(operator, "label", "") or operator_value or "任何运营商")
         poll_interval = float(selection.get("poll_interval") or 5.0)
         max_attempts = int(selection.get("max_attempts") or 60)
-        if provider_name == "grizzly":
-            provider = GrizzlySMSProvider(api_key)
-        elif provider_name == "fivesim":
-            from .fivesim_sms_provider import FiveSimProvider
-
-            provider = FiveSimProvider(api_key)
-        elif provider_name == "smsbower":
-            provider = SmsBowerProvider(api_key, base_url=str(selection.get("base_url") or "").strip() or SMSBOWER_DEFAULT_ENDPOINT)
-        else:
-            provider = HeroSMSProvider(api_key)
+        base_url = str(selection.get("base_url") or "").strip()
+        provider = create_sms_provider(
+            provider_name,
+            api_key,
+            base_url=base_url,
+            pool_file=base_url if provider_name == "chatgpt-api" else "",
+        )
         # 5sim 用 slug；HeroSMS/Grizzly 用 hero_sms_country int
-        country_arg = country if provider_name == "fivesim" else country.hero_sms_country
+        country_arg = provider_country_arg(provider_name, country)
         activation: SmsActivation | None = None
         try:
             self.log(

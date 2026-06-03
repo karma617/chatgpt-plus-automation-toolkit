@@ -27,11 +27,14 @@ KNOWN_ENV_FIELDS = [
     "SUB2API_SERVER_URL",
     "SUB2API_API_KEY",
     "SUB2API_GROUP_IDS",
-    "SMSBOWER_API_URL",
     "HERO_SMS_API_KEY",
     "GRIZZLY_API_KEY",
     "FIVESIM_API_KEY",
     "SMSBOWER_API_KEY",
+    "SMS_VERIFICATION_NUMBER_API_KEY",
+    "NEXSMS_API_KEY",
+    "SMSPOOL_API_KEY",
+    "CHATGPT_API_SMS_POOL_FILE",
     "CAPSOLVER_API_KEY",
     "TWOCAPTCHA_API_KEY",
     "YESCAPTCHA_API_KEY",
@@ -103,7 +106,43 @@ KNOWN_ENV_FIELDS = [
     "SMSBOWER_MAX_ATTEMPTS",
     "SMSBOWER_COUNTRY_SELECT",
     "SMSBOWER_PROMPT_COUNTRY_SELECTION",
+    "SMS_VERIFICATION_NUMBER_SERVICE",
+    "SMS_VERIFICATION_NUMBER_COUNTRY_TOP_N",
+    "SMS_VERIFICATION_NUMBER_PROVIDER_THRESHOLD",
+    "SMS_VERIFICATION_NUMBER_PROMPT_PROVIDER_SELECTION",
+    "SMS_VERIFICATION_NUMBER_POLL_INTERVAL",
+    "SMS_VERIFICATION_NUMBER_MAX_ATTEMPTS",
+    "SMS_VERIFICATION_NUMBER_COUNTRY_SELECT",
+    "SMS_VERIFICATION_NUMBER_PROMPT_COUNTRY_SELECTION",
+    "NEXSMS_SERVICE",
+    "NEXSMS_COUNTRY_TOP_N",
+    "NEXSMS_PROVIDER_THRESHOLD",
+    "NEXSMS_PROMPT_PROVIDER_SELECTION",
+    "NEXSMS_POLL_INTERVAL",
+    "NEXSMS_MAX_ATTEMPTS",
+    "NEXSMS_COUNTRY_SELECT",
+    "NEXSMS_PROMPT_COUNTRY_SELECTION",
+    "SMSPOOL_SERVICE",
+    "SMSPOOL_COUNTRY_TOP_N",
+    "SMSPOOL_PROVIDER_THRESHOLD",
+    "SMSPOOL_PROMPT_PROVIDER_SELECTION",
+    "SMSPOOL_POLL_INTERVAL",
+    "SMSPOOL_MAX_ATTEMPTS",
+    "SMSPOOL_COUNTRY_SELECT",
+    "SMSPOOL_PROMPT_COUNTRY_SELECTION",
+    "CHATGPT_API_SMS_SERVICE",
+    "CHATGPT_API_SMS_COUNTRY_TOP_N",
+    "CHATGPT_API_SMS_PROVIDER_THRESHOLD",
+    "CHATGPT_API_SMS_PROMPT_PROVIDER_SELECTION",
+    "CHATGPT_API_SMS_POLL_INTERVAL",
+    "CHATGPT_API_SMS_MAX_ATTEMPTS",
+    "CHATGPT_API_SMS_COUNTRY_SELECT",
+    "CHATGPT_API_SMS_PROMPT_COUNTRY_SELECTION",
 ]
+
+DEPRECATED_ENV_KEYS = {
+    "SMSBOWER_API_URL",
+}
 
 
 def _u(text: str) -> str:
@@ -137,7 +176,6 @@ ENV_FIELD_LABELS = {
     "GRIZZLY_API_KEY": _u(r"Grizzly \u77ed\u4fe1\u63a5\u7801\u5bc6\u94a5"),
     "FIVESIM_API_KEY": _u(r"5sim \u77ed\u4fe1\u63a5\u7801\u5bc6\u94a5"),
     "SMSBOWER_API_KEY": _u(r"SMSBower \u77ed\u4fe1\u63a5\u7801\u5bc6\u94a5"),
-    "SMSBOWER_API_URL": _u(r"SMSBower \u63a5\u53e3\u5730\u5740"),
     "CAPSOLVER_API_KEY": _u(r"Capsolver \u9a8c\u8bc1\u7801\u5bc6\u94a5"),
     "TWOCAPTCHA_API_KEY": _u(r"2Captcha \u9a8c\u8bc1\u7801\u5bc6\u94a5"),
     "YESCAPTCHA_API_KEY": _u(r"YesCaptcha \u9a8c\u8bc1\u7801\u5bc6\u94a5"),
@@ -291,7 +329,6 @@ ENV_FIELD_GROUPS = {
     "FIVESIM_COUNTRY_SELECT": "5sim",
     "FIVESIM_PROMPT_COUNTRY_SELECTION": "5sim",
     "SMSBOWER_API_KEY": "SMSBower",
-    "SMSBOWER_API_URL": "SMSBower",
     "SMSBOWER_SERVICE": "SMSBower",
     "SMSBOWER_COUNTRY_TOP_N": "SMSBower",
     "SMSBOWER_PROVIDER_THRESHOLD": "SMSBower",
@@ -395,7 +432,6 @@ ENV_FIELD_TOOLTIPS.update({
     "GRIZZLY_API_KEY": _u(r"Grizzly SMS \u63a5\u7801\u5e73\u53f0\u5bc6\u94a5\u3002\u5f53\u63a5\u7801\u5e73\u53f0\u9009 Grizzly SMS \u65f6\u4f7f\u7528\u3002"),
     "FIVESIM_API_KEY": _u(r"5sim \u63a5\u7801\u5e73\u53f0 Bearer API Key\u3002\u5f53\u63a5\u7801\u5e73\u53f0\u9009 5sim \u65f6\uff0c\u7528\u4e8e\u8d2d\u4e70\u624b\u673a\u53f7\u548c\u67e5\u8be2\u77ed\u4fe1\u3002"),
     "SMSBOWER_API_KEY": _u(r"SMSBower \u63a5\u7801\u5e73\u53f0\u5bc6\u94a5\u3002\u5f53\u63a5\u7801\u5e73\u53f0\u9009 SMSBower \u65f6\u4f7f\u7528\u3002"),
-    "SMSBOWER_API_URL": _u(r"SMSBower \u63a5\u53e3\u5730\u5740\u3002\u9ed8\u8ba4\u4f7f\u7528 https://smsbower.page/stubs/handler_api.php\uff1b\u5982\u5e73\u53f0\u66f4\u6362\u57df\u540d\uff0c\u53ef\u5728\u8fd9\u91cc\u8986\u76d6\u3002"),
     "CAPSOLVER_API_KEY": _u(r"CapSolver \u6253\u7801\u5e73\u53f0 API Key\u3002PAYPAL_CAPTCHA_MODE=api \u4e14 CAPTCHA_API_PROVIDER=capsolver \u65f6\uff0cPayPal \u6d41\u7a0b\u9047\u5230 reCAPTCHA/hCaptcha \u4f1a\u4f7f\u7528\u3002"),
     "TWOCAPTCHA_API_KEY": _u(r"2Captcha \u6253\u7801\u5e73\u53f0 API Key\u3002PAYPAL_CAPTCHA_MODE=api \u4e14 CAPTCHA_API_PROVIDER=twocaptcha \u65f6\u4f7f\u7528\u3002"),
     "YESCAPTCHA_API_KEY": _u(r"YesCaptcha \u6253\u7801\u5e73\u53f0 API Key\u3002PAYPAL_CAPTCHA_MODE=api \u4e14 CAPTCHA_API_PROVIDER=yescaptcha \u65f6\u4f7f\u7528\u3002"),
@@ -426,7 +462,7 @@ ENV_FIELD_TOOLTIPS.update({
     "FLOW3_MAIL_SOURCE": _u(r"\u6d41\u7a0b3/OAuth \u6388\u6743\u767b\u5f55\u65f6\u7684\u90ae\u7bb1\u6765\u6e90\u3002\u7528\u4e8e\u9700\u8981\u4ece\u90ae\u7bb1\u53d6\u767b\u5f55\u9a8c\u8bc1\u7801\u7684\u573a\u666f\u3002"),
     "FREE_MAIL_SOURCE": _u(r"Free \u6ce8\u518c\u7684\u90ae\u7bb1\u6765\u6e90\u3002\u5f53\u8fd0\u884c Free \u6ce8\u518c\u6d41\u7a0b\u65f6\u4f7f\u7528\uff0c\u5f53\u524d\u4e3b\u8981\u914d\u5408 MoeMail \u81ea\u52a8\u521b\u5efa\u90ae\u7bb1\u3002"),
     "SMS_ENABLED": _u(r"\u9ed8\u8ba4\u63a5\u7801\u5f00\u5173\u3002\u5f53\u6d41\u7a0b\u6ca1\u6709\u5355\u72ec\u914d\u7f6e\u63a5\u7801\u5f00\u5173\u65f6\uff0c\u7528\u5b83\u51b3\u5b9a\u662f\u5426\u542f\u7528\u5916\u90e8\u63a5\u7801\u5e73\u53f0\u3002"),
-    "SMS_PROVIDER": _u(r"\u9ed8\u8ba4\u63a5\u7801\u5e73\u53f0\u3002\u5f53\u6d41\u7a0b\u6ca1\u6709\u5355\u72ec\u6307\u5b9a\u5e73\u53f0\u65f6\uff0c\u4f7f\u7528\u8fd9\u4e2a\u503c\uff0c\u53ef\u9009 herosms/grizzly/fivesim/smsbower\u3002"),
+    "SMS_PROVIDER": _u(r"\u9ed8\u8ba4\u63a5\u7801\u5e73\u53f0\u3002\u5f53\u6d41\u7a0b\u6ca1\u6709\u5355\u72ec\u6307\u5b9a\u5e73\u53f0\u65f6\uff0c\u4f7f\u7528\u8fd9\u4e2a\u503c\uff0c\u53ef\u9009 herosms/grizzly/fivesim/smsbower/sms-verification-number/nexsms/smspool/chatgpt-api\u3002"),
     "FLOW1_SMS_ENABLED": _u(r"\u6d41\u7a0b1/\u4ec5\u6ce8\u518c\u5728\u9047\u5230\u624b\u673a\u53f7\u5fc5\u586b\u9875\u65f6\u662f\u5426\u542f\u7528\u5916\u90e8\u63a5\u7801\u3002false \u65f6\u9047\u5230\u624b\u673a\u53f7\u5fc5\u586b\u4f1a\u6309\u5931\u8d25\u5904\u7406\u3002"),
     "FLOW1_SMS_PROVIDER": _u(r"\u6d41\u7a0b1/\u4ec5\u6ce8\u518c\u4f7f\u7528\u7684\u63a5\u7801\u5e73\u53f0\u3002\u542f\u7528 FLOW1_SMS_ENABLED \u540e\u751f\u6548\u3002"),
     "FLOW3_SMS_ENABLED": _u(r"\u6d41\u7a0b3/OAuth \u6388\u6743\u767b\u5f55\u9047\u5230\u624b\u673a\u9a8c\u8bc1\u65f6\u662f\u5426\u542f\u7528\u63a5\u7801\u5e73\u53f0\u3002"),
@@ -444,7 +480,16 @@ MAIL_SOURCE_CHOICES = ("moemail", "hotmail", "icloud_query", "domain163")
 MAIL_ACCOUNT_MODE_CHOICES = ("pool", "api")
 DOMAIN_MODE_CHOICES = ("random", "fixed", "rotate")
 CREATE_MODE_CHOICES = ("human", "random")
-SMS_PROVIDER_CHOICES = ("herosms", "grizzly", "fivesim", "smsbower")
+SMS_PROVIDER_CHOICES = (
+    "herosms",
+    "grizzly",
+    "fivesim",
+    "smsbower",
+    "sms-verification-number",
+    "nexsms",
+    "smspool",
+    "chatgpt-api",
+)
 CAPTCHA_MODE_CHOICES = ("manual", "api")
 CAPTCHA_PROVIDER_CHOICES = ("capsolver", "twocaptcha", "yescaptcha")
 UPLOAD_TARGET_CHOICES = ("cpa", "sub2api", "both", "none")
@@ -490,6 +535,48 @@ ENV_FIELD_CHOICES = {
     "SMSBOWER_PROMPT_COUNTRY_SELECTION": BOOL_CHOICES,
 }
 
+
+_EXTRA_SMS_PLATFORM_FIELDS = {
+    "SMS_VERIFICATION_NUMBER": "SMS Verification Number",
+    "NEXSMS": "NexSMS",
+    "SMSPOOL": "SMSPool",
+    "CHATGPT_API_SMS": "ChatGPT API SMS",
+}
+
+for _prefix, _platform in _EXTRA_SMS_PLATFORM_FIELDS.items():
+    _api_key = f"{_prefix}_API_KEY"
+    if _api_key in KNOWN_ENV_FIELDS:
+        ENV_FIELD_LABELS.setdefault(_api_key, f"{_platform} API Key")
+        ENV_FIELD_GROUPS.setdefault(_api_key, _platform)
+        ENV_FIELD_TOOLTIPS.setdefault(
+            _api_key,
+            _u(rf"{_platform} \u63a5\u7801\u5e73\u53f0 API Key\u3002\u5f53\u63a5\u7801\u5e73\u53f0\u9009 {_platform} \u65f6\u4f7f\u7528\u3002"),
+        )
+    for _suffix, _label_suffix, _tooltip_suffix in (
+        ("SERVICE", _u(r"\u6ce8\u518c\u9879\u76ee"), "SERVICE"),
+        ("COUNTRY_TOP_N", _u(r"\u663e\u793a\u5ec9\u4ef7\u56fd\u5bb6\u6570"), "COUNTRY_TOP_N"),
+        ("PROVIDER_THRESHOLD", _u(r"\u5e93\u5b58\u4f4e\u4e8e\u6b64\u503c\u65f6\u9009\u670d\u52a1\u5546"), "PROVIDER_THRESHOLD"),
+        ("PROMPT_PROVIDER_SELECTION", _u(r"\u662f\u5426\u624b\u52a8\u9009\u670d\u52a1\u5546"), "PROMPT_PROVIDER_SELECTION"),
+        ("POLL_INTERVAL", _u(r"\u51e0\u79d2\u67e5\u4e00\u6b21\u77ed\u4fe1"), "POLL_INTERVAL"),
+        ("MAX_ATTEMPTS", _u(r"\u6700\u591a\u67e5\u8be2\u6b21\u6570"), "MAX_ATTEMPTS"),
+        ("COUNTRY_SELECT", _u(r"\u56fa\u5b9a\u4f7f\u7528\u7684\u56fd\u5bb6"), "COUNTRY_SELECT"),
+        ("PROMPT_COUNTRY_SELECTION", _u(r"\u662f\u5426\u624b\u52a8\u9009\u56fd\u5bb6"), "PROMPT_COUNTRY_SELECTION"),
+    ):
+        _key = f"{_prefix}_{_suffix}"
+        if _key not in KNOWN_ENV_FIELDS:
+            continue
+        ENV_FIELD_LABELS.setdefault(_key, f"{_platform} {_label_suffix}")
+        ENV_FIELD_GROUPS.setdefault(_key, _platform)
+        ENV_FIELD_TOOLTIPS.setdefault(_key, _sms_tooltip(_platform, _tooltip_suffix))
+        if _suffix.startswith("PROMPT_"):
+            ENV_FIELD_CHOICES.setdefault(_key, BOOL_CHOICES)
+
+ENV_FIELD_LABELS.setdefault("CHATGPT_API_SMS_POOL_FILE", _u(r"ChatGPT API \u63a5\u7801\u53f7\u6c60\u6587\u4ef6"))
+ENV_FIELD_GROUPS.setdefault("CHATGPT_API_SMS_POOL_FILE", "ChatGPT API SMS")
+ENV_FIELD_TOOLTIPS.setdefault(
+    "CHATGPT_API_SMS_POOL_FILE",
+    _u(r"\u672c\u5730 ChatGPT API \u63a5\u7801\u53f7\u6c60\u6587\u4ef6\uff0c\u6bcf\u884c phone----url\uff0c\u6216\u624b\u673a\u53f7\u548c\u53d6\u7801 URL \u4e24\u884c\u4e00\u7ec4\u3002"),
+)
 
 @dataclass(frozen=True)
 class EnvField:
@@ -551,6 +638,8 @@ def read_env(path: Path | str) -> dict[str, str]:
         parsed = _parse_env_line(line)
         if parsed:
             key, value = parsed
+            if key in DEPRECATED_ENV_KEYS:
+                continue
             values[key] = value
     return values
 
@@ -568,6 +657,8 @@ def update_env(path: Path | str, updates: dict[object, str]) -> None:
             output.append(line)
             continue
         key, _old_value = parsed
+        if key in DEPRECATED_ENV_KEYS:
+            continue
         if key in remaining:
             output.append(f"{key}={remaining.pop(key)}")
         else:
