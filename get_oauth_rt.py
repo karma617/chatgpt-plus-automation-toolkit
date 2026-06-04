@@ -1170,10 +1170,10 @@ def should_upload_to_server(env: dict) -> bool:
     return auth_upload_enabled(env)
 
 
-def upload_bundle_to_server(bundle: dict, account_type: str = "") -> bool:
+def upload_bundle_to_server(bundle: dict, account_type: str = "") -> bool | None:
     env = load_root_env()
     if not should_upload_to_server(env):
-        return False
+        return None
 
     payload = server_upload_payload(bundle, account_type=account_type)
     results = upload_bundle(payload, env, account_type=account_type)
@@ -6586,12 +6586,22 @@ def cmd_login(args) -> int:
             setattr(args, "task_server_skipped", True)
             record_run_stat(args, "server_skipped")
         else:
-            if upload_bundle_to_server(payload, account_type=auth_mode):
+            upload_result = upload_bundle_to_server(payload, account_type=auth_mode)
+            if upload_result is True:
                 setattr(args, "task_server_uploaded", True)
                 record_run_stat(args, "server_uploaded")
-            else:
+            elif upload_result is False:
                 setattr(args, "task_server_failed", True)
                 record_run_stat(args, "server_failed")
+                mark_failure(
+                    args,
+                    _u(r"\u670d\u52a1\u5668\u4e0a\u4f20\u5931\u8d25\uff0c\u5df2\u4fdd\u7559\u8d26\u53f7\u7b49\u5f85\u4e0b\u6b21\u91cd\u8dd1"),
+                    error_type="server_upload_failed",
+                )
+                return 1
+            else:
+                setattr(args, "task_server_skipped", True)
+                record_run_stat(args, "server_skipped")
         if account_input and getattr(args, "remove_after_success", False):
             if remove_account_from_input_file(args.account_file, account_input["email"]):
                 setattr(args, "task_removed_from_input", True)

@@ -37,6 +37,10 @@ HOTMAIL_FALLBACK_MISS_THRESHOLD = 3
 HOTMAIL_APPLE_FIRST_HARD_MODE = False
 
 
+class MailCodeTimeoutError(TimeoutError):
+    pass
+
+
 @dataclass
 class ImapTokenCacheEntry:
     access_token: str
@@ -99,13 +103,18 @@ class MailProvider:
         exclude = exclude or set()
         self.log(f"开始等待邮箱验证码: {account.email} | 排除旧码数={len(exclude)}")
         if account.mail_url:
-            code = await wait_code_with_legacy_adapter(
-                account.mail_url,
-                account.email,
-                self.timeout_sec,
-                self.poll_interval_sec,
-                exclude,
-            )
+            try:
+                code = await wait_code_with_legacy_adapter(
+                    account.mail_url,
+                    account.email,
+                    self.timeout_sec,
+                    self.poll_interval_sec,
+                    exclude,
+                )
+            except TimeoutError as exc:
+                raise MailCodeTimeoutError(
+                    f"MAIL_CODE_TIMEOUT: no new verification code for {account.email}: {exc}"
+                ) from exc
             self.log(f"已通过旧版接码适配器获取验证码: {code}")
             return code
         deadline = asyncio.get_running_loop().time() + self.timeout_sec
@@ -123,7 +132,10 @@ class MailProvider:
                 last_error = str(exc)
                 self.log(f"邮箱验证码暂未取到: {last_error}")
             await asyncio.sleep(self.poll_interval_sec)
-        raise TimeoutError(f"验证码等待超时: {last_error or '没有新验证码'}")
+        raise MailCodeTimeoutError(
+            f"MAIL_CODE_TIMEOUT: no new verification code for {account.email}: "
+            f"{last_error or 'no new code'}"
+        )
 
     async def fetch_code(self, account: MailAccount, since: datetime, exclude: set[str] | None = None) -> str | None:
         if account.mail_url:
@@ -322,6 +334,7 @@ def choose_mail_code(text: str, exclude: set[str]) -> str | None:
         r"输入此临时验证码以继续[^0-9]{0,80}(\d{6})",
         r"临时验证码[^0-9]{0,80}(\d{6})",
         r"verification code[^0-9]{0,80}(\d{6})",
+        "(?:\u78ba\u8a8d\u30b3\u30fc\u30c9|\u8a8d\u8a3c\u30b3\u30fc\u30c9|\u691c\u8a3c\u30b3\u30fc\u30c9|\u30bb\u30ad\u30e5\u30ea\u30c6\u30a3\u30b3\u30fc\u30c9|\u30ed\u30b0\u30a4\u30f3\u30b3\u30fc\u30c9|\u30b3\u30fc\u30c9)[^0-9]{0,80}(\\d{6})",
     ]
     for pattern in priority_patterns:
         for code in re.findall(pattern, normalized, flags=re.I):
@@ -356,6 +369,8 @@ def parse_icloud_time(item: dict[str, Any]) -> datetime | None:
 async def fetch_hotmail_graph_code(account: MailAccount, since: datetime, exclude: set[str]) -> str | None:
     if not account.client_id or not account.refresh_token:
         raise RuntimeError("Hotmail Graph 需要 email----password----client_id----refresh_token 格式")
+    since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+    since_floor = since_utc - HOTMAIL_CODE_TIME_SKEW
     if hotmail_appleemail_api_enabled() and account.email.lower() not in _APPLEEMAIL_UNAVAILABLE:
         try:
             code = await fetch_appleemail_code(account, since, exclude)
@@ -384,7 +399,9 @@ async def fetch_hotmail_graph_code(account: MailAccount, since: datetime, exclud
     messages = await list_recent_messages(token)
     for item in messages:
         received = parse_graph_time(item.get("receivedDateTime"))
-        if received and received < since:
+        if received and not received.tzinfo:
+            received = received.replace(tzinfo=timezone.utc)
+        if received and received < since_floor:
             continue
         sender = (((item.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
         subject = item.get("subject") or ""
@@ -580,6 +597,7 @@ async def get_imap_access_token(client_id: str, refresh_token: str) -> str:
 
 def fetch_hotmail_imap_code_sync(email: str, access_token: str, since: datetime, exclude: set[str]) -> str | None:
     since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+    since_floor = since_utc - HOTMAIL_CODE_TIME_SKEW
     date_filter = since_utc.strftime("%d-%b-%Y")
     auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
     with imaplib.IMAP4_SSL(OUTLOOK_IMAP_HOST, 993) as conn:
@@ -612,7 +630,10 @@ def fetch_hotmail_imap_code_sync(email: str, access_token: str, since: datetime,
                             internal_date = parsedate_to_datetime(match.group(1).decode("ascii", errors="ignore"))
                         except Exception:
                             internal_date = None
-                if internal_date and internal_date < since_utc:
+                received = parse_imap_received_time(raw_message, internal_date)
+                if received and not received.tzinfo:
+                    received = received.replace(tzinfo=timezone.utc)
+                if received and received < since_floor:
                     continue
                 text = decode_imap_message(raw_message)
                 if not looks_like_openai_mail(text):
@@ -765,6 +786,8 @@ def looks_like_openai_mail(text: str) -> bool:
             "noreply@openai.com",
             "info@account.openai.com",
             "auth0.openai.com",
+            "tm.openai.com",
+            "tm1.openai.com",
         ]
     )
     has_code_hint = any(
@@ -779,7 +802,14 @@ def looks_like_openai_mail(text: str) -> bool:
             "临时验证码",
             "登录代码",
             "安全代码",
+            "\u30b3\u30fc\u30c9",
+            "\u78ba\u8a8d\u30b3\u30fc\u30c9",
+            "\u8a8d\u8a3c\u30b3\u30fc\u30c9",
+            "\u691c\u8a3c\u30b3\u30fc\u30c9",
+            "\u30ef\u30f3\u30bf\u30a4\u30e0",
+            "\u30bb\u30ad\u30e5\u30ea\u30c6\u30a3\u30b3\u30fc\u30c9",
+            "\u30ed\u30b0\u30a4\u30f3\u30b3\u30fc\u30c9",
         ]
     )
-    return has_sender_hint and has_code_hint
+    return has_sender_hint and (has_code_hint or bool(extract_code(text)))
 

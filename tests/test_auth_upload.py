@@ -163,3 +163,32 @@ def test_upload_sub2api_resolves_group_name_and_uses_origin_api(monkeypatch) -> 
     assert calls[1]["method"] == "post"
     assert calls[1]["url"] == "https://sub.example/api/v1/admin/accounts/data"
     assert calls[1]["json"]["data"]["accounts"][0]["group_ids"] == [5]
+
+
+def test_upload_sub2api_retries_transient_failure(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def fake_post(url: str, json: dict, headers: dict, timeout: int):
+        del url, json, headers, timeout
+        calls.append(1)
+        if len(calls) == 1:
+            return SimpleNamespace(status_code=502, text="bad gateway")
+        return SimpleNamespace(status_code=200, text="ok")
+
+    fake_requests = SimpleNamespace(post=fake_post)
+    monkeypatch.setattr(auth_upload, "requests", fake_requests, raising=False)
+    monkeypatch.setitem(__import__("sys").modules, "requests", fake_requests)
+    monkeypatch.setattr(auth_upload.time, "sleep", lambda seconds: None)
+
+    result = auth_upload.upload_sub2api(
+        {"email": "retry@example.com", "access_token": "at", "refresh_token": "rt"},
+        {
+            "SUB2API_SERVER_URL": "https://sub.example",
+            "SUB2API_API_KEY": "sub-token",
+            "AUTH_UPLOAD_RETRY": "2",
+            "AUTH_UPLOAD_RETRY_INTERVAL": "0.1",
+        },
+    )
+
+    assert result.ok is True
+    assert len(calls) == 2

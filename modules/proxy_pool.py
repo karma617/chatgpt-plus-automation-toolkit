@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 from .utils import resolve_path
@@ -34,6 +35,13 @@ class ProxyPool:
             return []
         start = (worker_id - 1) % len(self.proxies)
         return self.proxies[start:] + self.proxies[:start]
+
+    def random_sequence(self) -> list[str]:
+        if not self.proxies:
+            return []
+        values = self.proxies[:]
+        random.shuffle(values)
+        return values
 
     def count(self) -> int:
         return len(self.proxies)

@@ -114,6 +114,7 @@ def update_account(
     payment_link: str = "",
     reason: str = "",
     stage: str = "",
+    link_method: str = "",
     state_path: Path | None = None,
 ) -> None:
     normalized = normalize_email(email)
@@ -133,6 +134,8 @@ def update_account(
         record["reason"] = reason.strip()
     if stage:
         record["stage"] = stage.strip()
+    if link_method:
+        record["link_method"] = link_method.strip()
     state[normalized] = record
     save_state(state, state_path)
 
@@ -144,8 +147,49 @@ def mark_registered(email: str, *, account_line: str = "") -> None:
     update_account(email, STATUS_REGISTERED, account_line=account_line)
 
 
-def mark_link_ready(email: str, *, account_line: str = "", payment_link: str = "") -> None:
-    update_account(email, STATUS_LINK_READY, account_line=account_line, payment_link=payment_link)
+def mark_link_ready(email: str, *, account_line: str = "", payment_link: str = "", link_method: str = "") -> None:
+    update_account(email, STATUS_LINK_READY, account_line=account_line, payment_link=payment_link, link_method=link_method)
+
+
+def bad_link_methods(email: str) -> set[str]:
+    normalized = normalize_email(email)
+    if not normalized:
+        return set()
+    record = load_state().get(normalized, {})
+    raw = record.get("bad_link_methods") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return set()
+    return {str(item or "").strip() for item in raw if str(item or "").strip()}
+
+
+def mark_needs_link(email: str, *, account_line: str = "", reason: str = "", failed_link_method: str = "") -> None:
+    normalized = normalize_email(email)
+    if not normalized:
+        return
+    state = load_state()
+    record = dict(state.get(normalized) or {})
+    record.setdefault("created_at", _now_iso())
+    record["email"] = normalized
+    record["status"] = STATUS_REGISTERED
+    record["updated_at"] = _now_iso()
+    record.pop("payment_link", None)
+    if account_line:
+        record["account_line"] = _account_line_without_payment_link(account_line)
+    if reason:
+        record["reason"] = reason.strip()[:1000]
+        record["last_error"] = reason.strip()[:1000]
+    failed_method = str(failed_link_method or record.get("link_method") or "").strip()
+    if failed_method:
+        methods = bad_link_methods(normalized)
+        methods.add(failed_method)
+        record["bad_link_methods"] = sorted(methods)
+        record["last_bad_link_method"] = failed_method
+        record.pop("link_method", None)
+    record["last_failed_stage"] = "flow2"
+    state[normalized] = record
+    save_state(state)
 
 
 def mark_paid_pending_auth(email: str, *, account_line: str = "") -> None:

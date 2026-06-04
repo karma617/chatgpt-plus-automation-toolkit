@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 
-from modules import paypal_card_redeem, paypal_flow_state, paypal_pay, utils
+from modules import paypal_card_redeem, paypal_flow_state, paypal_pay, proxy_pool as proxy_pool_module, utils
 
 
 def _use_paypal_files(monkeypatch, tmp_path: Path, links_file: Path) -> None:
@@ -300,7 +300,7 @@ def test_run_paypal_pay_jp_uses_jp_proxy_file(monkeypatch, tmp_path: Path) -> No
     assert captured["proxy"] == "http://jp-proxy.example.test:8080"
 
 
-def test_run_paypal_pay_rotates_proxy_on_proxy_failure(monkeypatch, tmp_path: Path) -> None:
+def test_run_paypal_pay_randomizes_proxy_order_on_proxy_failure(monkeypatch, tmp_path: Path) -> None:
     phones_file = tmp_path / "phones.txt"
     links_file = tmp_path / "links.txt"
     proxy_file = tmp_path / "jp.txt"
@@ -309,8 +309,78 @@ def test_run_paypal_pay_rotates_proxy_on_proxy_failure(monkeypatch, tmp_path: Pa
     proxy_file.write_text(
         "\n".join(
             [
-                "http://bad-proxy.example.test:1080",
                 "http://good-proxy.example.test:1080",
+                "http://bad-proxy.example.test:1080",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                f"PAYPAL_PHONES_FILE={phones_file}",
+                "PAYPAL_USE_PROXY=true",
+                f"PAYPAL_PROXY_FILE_JP={proxy_file}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    attempts = []
+    shuffled = []
+
+    def fake_shuffle(values):
+        values.reverse()
+        shuffled.append(values[:])
+
+    async def fake_pay_one(*args, **kwargs):
+        proxy = kwargs.get("proxy")
+        attempts.append(proxy)
+        if "bad-proxy" in proxy:
+            kwargs["last_error"]["reason"] = "Page.goto: net::ERR_SOCKS_CONNECTION_FAILED"
+            return False
+        return True
+
+    monkeypatch.setattr(utils, "PROJECT_ROOT", tmp_path)
+    _use_paypal_files(monkeypatch, tmp_path, links_file)
+    monkeypatch.setattr(proxy_pool_module.random, "shuffle", fake_shuffle)
+    monkeypatch.setattr(paypal_pay, "pay_one", fake_pay_one)
+
+    result = asyncio.run(
+        paypal_pay.run_paypal_pay(
+            {},
+            count=1,
+            workers=1,
+            card_source_mode="local_random",
+            flow2_region_mode="jp",
+        )
+    )
+
+    assert result == 1
+    assert shuffled == [
+        [
+            "http://bad-proxy.example.test:1080",
+            "http://good-proxy.example.test:1080",
+        ]
+    ]
+    assert attempts == [
+        "http://bad-proxy.example.test:1080",
+        "http://good-proxy.example.test:1080",
+    ]
+
+
+def test_run_paypal_pay_rebinds_proxy_after_flow_error(monkeypatch, tmp_path: Path) -> None:
+    phones_file = tmp_path / "phones.txt"
+    links_file = tmp_path / "links.txt"
+    proxy_file = tmp_path / "jp.txt"
+    phones_file.write_text("15555550123|https://sms.example.test/get\n", encoding="utf-8")
+    links_file.write_text("user-flow-error@example.com----query-code----https://pay.example.test/session\n", encoding="utf-8")
+    proxy_file.write_text(
+        "\n".join(
+            [
+                "http://good-proxy.example.test:1080",
+                "http://first-proxy.example.test:1080",
             ]
         )
         + "\n",
@@ -329,16 +399,20 @@ def test_run_paypal_pay_rotates_proxy_on_proxy_failure(monkeypatch, tmp_path: Pa
     )
     attempts = []
 
+    def fake_shuffle(values):
+        values.reverse()
+
     async def fake_pay_one(*args, **kwargs):
         proxy = kwargs.get("proxy")
         attempts.append(proxy)
-        if "bad-proxy" in proxy:
-            kwargs["last_error"]["reason"] = "Page.goto: net::ERR_SOCKS_CONNECTION_FAILED"
+        if "first-proxy" in proxy:
+            kwargs["last_error"]["reason"] = "checkout ui stuck after submit"
             return False
         return True
 
     monkeypatch.setattr(utils, "PROJECT_ROOT", tmp_path)
     _use_paypal_files(monkeypatch, tmp_path, links_file)
+    monkeypatch.setattr(proxy_pool_module.random, "shuffle", fake_shuffle)
     monkeypatch.setattr(paypal_pay, "pay_one", fake_pay_one)
 
     result = asyncio.run(
@@ -353,8 +427,60 @@ def test_run_paypal_pay_rotates_proxy_on_proxy_failure(monkeypatch, tmp_path: Pa
 
     assert result == 1
     assert attempts == [
-        "http://bad-proxy.example.test:1080",
+        "http://first-proxy.example.test:1080",
         "http://good-proxy.example.test:1080",
+    ]
+
+
+def test_run_paypal_pay_limits_stripe_redirect_proxy_retry_to_three(monkeypatch, tmp_path: Path) -> None:
+    phones_file = tmp_path / "phones.txt"
+    links_file = tmp_path / "links.txt"
+    proxy_file = tmp_path / "jp.txt"
+    phones_file.write_text("15555550123|https://sms.example.test/get\n", encoding="utf-8")
+    links_file.write_text("user6@example.com----query-code----https://pay.example.test/session\n", encoding="utf-8")
+    proxy_file.write_text(
+        "\n".join(f"http://proxy-{index}.example.test:1080" for index in range(1, 7)) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                f"PAYPAL_PHONES_FILE={phones_file}",
+                "PAYPAL_USE_PROXY=true",
+                f"PAYPAL_PROXY_FILE_JP={proxy_file}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    attempts = []
+
+    async def fake_pay_one(*args, **kwargs):
+        attempts.append(kwargs.get("proxy"))
+        kwargs["last_error"]["reason"] = paypal_pay.PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT
+        return False
+
+    monkeypatch.setattr(utils, "PROJECT_ROOT", tmp_path)
+    _use_paypal_files(monkeypatch, tmp_path, links_file)
+    monkeypatch.setattr(proxy_pool_module.random, "shuffle", lambda values: None)
+    monkeypatch.setattr(paypal_pay, "pay_one", fake_pay_one)
+
+    result = asyncio.run(
+        paypal_pay.run_paypal_pay(
+            {},
+            count=1,
+            workers=1,
+            card_source_mode="local_random",
+            flow2_region_mode="jp",
+        )
+    )
+
+    assert result == 0
+    assert attempts == [
+        "http://proxy-1.example.test:1080",
+        "http://proxy-2.example.test:1080",
+        "http://proxy-3.example.test:1080",
+        "http://proxy-4.example.test:1080",
     ]
 
 
@@ -403,3 +529,50 @@ def test_run_paypal_pay_replaces_nonzero_discard_with_next_link(monkeypatch, tmp
     assert "bad@example.com" not in links_file.read_text(encoding="utf-8")
     assert "good@example.com" in links_file.read_text(encoding="utf-8")
     assert "bad@example.com" in (tmp_path / "paypal_flow_discarded_emails.txt").read_text(encoding="utf-8")
+
+
+def test_run_paypal_pay_moves_bad_generated_link_back_to_registered(monkeypatch, tmp_path: Path) -> None:
+    phones_file = tmp_path / "phones.txt"
+    links_file = tmp_path / "links.txt"
+    phones_file.write_text("15555550123|https://sms.example.test/get\n", encoding="utf-8")
+    links_file.write_text(
+        "relink@example.com----pw----client----rt----https://pay.example.test/stuck\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                f"PAYPAL_PHONES_FILE={phones_file}",
+                "PAYPAL_USE_PROXY=false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def fake_pay_one(item, *args, **kwargs):
+        kwargs["last_error"]["reason"] = f"{paypal_pay.PAYPAL_FLOW2_RECREATE_LINK}: stuck after submit"
+        return False
+
+    monkeypatch.setattr(utils, "PROJECT_ROOT", tmp_path)
+    _use_paypal_files(monkeypatch, tmp_path, links_file)
+    paypal_flow_state.mark_link_ready(
+        "relink@example.com",
+        account_line="relink@example.com----pw----client----rt",
+        payment_link="https://pay.example.test/stuck",
+        link_method="external_api",
+    )
+    monkeypatch.setattr(paypal_pay, "pay_one", fake_pay_one)
+
+    result = asyncio.run(paypal_pay.run_paypal_pay({}, count=1, workers=1, card_source_mode="local_random"))
+
+    assert result == 0
+    assert links_file.read_text(encoding="utf-8") == ""
+    assert not (tmp_path / "paypal_flow_discarded_emails.txt").exists()
+    state = paypal_flow_state.load_state(tmp_path / "paypal_flow_state.json")
+    assert state["relink@example.com"]["status"] == paypal_flow_state.STATUS_REGISTERED
+    assert state["relink@example.com"]["account_line"] == "relink@example.com----pw----client----rt"
+    assert state["relink@example.com"]["bad_link_methods"] == ["external_api"]
+    assert state["relink@example.com"]["last_bad_link_method"] == "external_api"
+    assert "payment_link" not in state["relink@example.com"]
+    assert "link_method" not in state["relink@example.com"]

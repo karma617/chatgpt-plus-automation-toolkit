@@ -42,6 +42,11 @@ def _zh(text: str) -> str:
 
 
 LABEL_REGISTER_ONLY_SUCCESS = _zh(r"\u4ec5\u6ce8\u518c\u6210\u529f\uff0c\u5df2\u5199\u5165\u6ce8\u518c\u8f93\u51fa\u6e05\u5355")
+LABEL_REGISTER_ONLY_SESSION_PENDING = _zh(
+    r"\u4ec5\u6ce8\u518c\u6210\u529f\uff0csession \u6682\u672a\u83b7\u53d6\uff0c\u5df2\u5199\u5165\u6ce8\u518c\u8f93\u51fa\u6e05\u5355\u7b49\u5f85\u540e\u7eed\u8865\u5f55"
+)
+LABEL_PHONE_BIND_EMAIL_START = _zh(r"\u624b\u673a\u53f7\u6ce8\u518c\u5df2\u767b\u5f55\uff0c\u5f00\u59cb OAuth \u7ed1\u5b9a\u90ae\u7bb1")
+LABEL_PHONE_BIND_EMAIL_DONE = _zh(r"\u624b\u673a\u53f7\u6ce8\u518c\u90ae\u7bb1\u7ed1\u5b9a\u5b8c\u6210")
 
 
 def _display_width(s: str) -> int:
@@ -303,6 +308,21 @@ def display_proxy(proxy: str | None) -> str:
     return text
 
 
+def pick_task_proxy(proxy_pool: ProxyPool | None, fallback_proxy: str | None = "", seed: int = 1) -> str | None:
+    if proxy_pool:
+        random_sequence = getattr(proxy_pool, "random_sequence", None)
+        if callable(random_sequence):
+            values = random_sequence()
+            if values:
+                return values[0]
+        return proxy_pool.pick(seed)
+    return fallback_proxy or None
+
+
+def is_phone_register_entry_action(value: object) -> bool:
+    return str(value or "").strip().lower() in {"signup_phone", "phone_signup", "phone"}
+
+
 def make_sms_args(args: argparse.Namespace | None = None) -> argparse.Namespace:
     args = args or argparse.Namespace()
     return argparse.Namespace(
@@ -333,6 +353,62 @@ def resolve_flow1_sms_selection(args: argparse.Namespace | None = None) -> dict[
 
 def resolve_free_sms_selection(args: argparse.Namespace | None = None) -> dict[str, object] | None:
     return resolve_flow_sms_selection(args, flow_label="Free 注册", flow_key="FREE")
+
+
+async def fetch_chatgpt_session_with_retry(page, prefix: str, attempts: int = 4) -> dict:
+    last_error = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            chatgpt_session = await get_chatgpt_session(page)
+            if str(chatgpt_session.get("accessToken") or ""):
+                return chatgpt_session
+            last_error = "session missing accessToken"
+        except Exception as exc:
+            last_error = short_error(exc)
+        if attempt < attempts:
+            log(f"{prefix} accessToken/session 获取失败，等待页面稳定后重试 ({attempt}/{attempts}): {last_error}")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=6000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(2500)
+    raise RuntimeError(last_error or "failed to fetch ChatGPT session")
+
+
+async def bind_register_only_phone_email(
+    *,
+    page,
+    account,
+    mail_provider: MailProvider,
+    sms_selection: dict[str, object],
+    register: ChatGPTRegister,
+    cfg: dict,
+    prefix: str,
+) -> None:
+    try:
+        password = str(sms_selection.get("password") or account.password or "").strip()
+        if not password:
+            raise RuntimeError("phone register email bind requires account password")
+        full_name = str(register.generated_name or "").strip() or account.email.split("@", 1)[0] or "ChatGPT User"
+        age = str(register.generated_age or cfg.get("register_profile", {}).get("age_min") or "25")
+        try:
+            birth_date = free_register.random_birth_date(int(age))
+        except Exception:
+            birth_date = ""
+        profile = free_register.FreeProfile(
+            full_name=full_name,
+            age=age,
+            password=password,
+            birth_date=birth_date,
+        )
+        flow = free_register.FreeBrowserFlow(page, prefix)
+        log(f"{prefix} {LABEL_PHONE_BIND_EMAIL_START}: {account.email}")
+        await free_register.phase2_bind_and_get_token(flow, account, mail_provider, sms_selection, profile, prefix)
+    except Exception:
+        await free_register.finalize_free_sms_activation(sms_selection, success=False, prefix=prefix)
+        raise
+    await free_register.finalize_free_sms_activation(sms_selection, success=True, prefix=prefix)
+    log(f"{prefix} {LABEL_PHONE_BIND_EMAIL_DONE}: {account.email}")
 
 
 async def run_account(
@@ -377,45 +453,78 @@ async def run_account(
     try:
         await session.__aenter__()
         assert session.page is not None
+        effective_sms_selection = sms_selection
+        entry_action = cfg["chatgpt"].get("entry_action", "signup")
+        if effective_sms_selection is not None:
+            effective_sms_selection = dict(effective_sms_selection)
+            if account.password and not effective_sms_selection.get("password"):
+                effective_sms_selection["password"] = account.password
+            if not create_payment_link and is_phone_register_entry_action(entry_action):
+                effective_sms_selection["defer_sms_complete"] = True
         register = ChatGPTRegister(
             page=session.page,
             page_getter=session.current_page,
             start_url=cfg["chatgpt"]["start_url"],
-            entry_action=cfg["chatgpt"].get("entry_action", "signup"),
+            entry_action=entry_action,
             mail_provider=mail_provider,
             age_min=int(cfg["register_profile"]["age_min"]),
             age_max=int(cfg["register_profile"]["age_max"]),
-            sms_selection=sms_selection,
+            sms_selection=effective_sms_selection,
             log_prefix=prefix,
+            proxy=proxy,
         )
         await register.run_until_logged_in(account, since)
         page = await session.current_page()
+        if (
+            not create_payment_link
+            and effective_sms_selection is not None
+            and is_phone_register_entry_action(entry_action)
+        ):
+            await bind_register_only_phone_email(
+                page=page,
+                account=account,
+                mail_provider=mail_provider,
+                sms_selection=effective_sms_selection,
+                register=register,
+                cfg=cfg,
+                prefix=prefix,
+            )
+            page = await session.current_page()
         if "chatgpt.com" not in page.url:
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
         log(f"{prefix} 已登录，开始临时获取 accessToken")
         page = await session.current_page()
-        chatgpt_session = await get_chatgpt_session(page)
-        access_token = str(chatgpt_session.get("accessToken") or "")
-        if not access_token:
-            raise RuntimeError("无法获取 accessToken，当前页面可能未登录 ChatGPT")
+        session_fetch_error = ""
+        try:
+            chatgpt_session = await fetch_chatgpt_session_with_retry(page, prefix)
+            access_token = str(chatgpt_session.get("accessToken") or "")
+        except Exception as exc:
+            if create_payment_link:
+                raise
+            session_fetch_error = short_error(exc)
+            log(f"{prefix} 已确认登录成功，但临时获取 accessToken 失败；按仅注册成功落盘，后续流程1可重新登录补录: {session_fetch_error}")
+            chatgpt_session = {}
+            access_token = ""
         payment_link = ""
         if create_payment_link:
             log(f"{prefix} accessToken acquired, generating Plus checkout link")
-            payment_link = await create_plus_checkout_link(page, access_token, cfg["chatgpt"])
-        else:
+            payment_link = await create_plus_checkout_link(page, access_token, cfg["chatgpt"], proxy=proxy)
+        elif access_token:
             log(f"{prefix} accessToken acquired, skip Plus checkout link")
-        cache_record = session_export.extract_session_record(
-            chatgpt_session,
-            email=account.email,
-            mail_source=cfg.get("mail", {}).get("active_source", cfg.get("mail", {}).get("source", "")),
-            source_format="hotmail" if account.client_id and account.refresh_token else ("icloud_query" if account.email.lower().endswith("@icloud.com") else "code_address"),
-            code_address=account.code_address,
-            payment_link=payment_link,
-            profile_dir=str(profile_dir),
-            source=session_source,
-        )
-        cache_path = session_export.upsert_session_cache(cache_record, path=session_cache_path or session_export.CACHE_PATH)
-        log(f"{prefix} 已缓存 Session: {cache_path}")
+        cache_path = session_cache_path or session_export.CACHE_PATH
+        if access_token:
+            cache_record = session_export.extract_session_record(
+                chatgpt_session,
+                email=account.email,
+                mail_source=cfg.get("mail", {}).get("active_source", cfg.get("mail", {}).get("source", "")),
+                source_format="hotmail" if account.client_id and account.refresh_token else ("icloud_query" if account.email.lower().endswith("@icloud.com") else "code_address"),
+                code_address=account.code_address,
+                payment_link=payment_link,
+                profile_dir=str(profile_dir),
+                source=session_source,
+            )
+            cache_path = session_export.upsert_session_cache(cache_record, path=cache_path)
+            log(f"{prefix} 已缓存 Session: {cache_path}")
         await session.__aexit__(None, None, None)
         session = None
         register_only_account_line = account.raw or account.email
@@ -433,6 +542,8 @@ async def run_account(
         store.complete(account.email)
         if create_payment_link:
             log(f"{prefix} 成功，已写入 {output_file('flow1_success')}")
+        elif not access_token:
+            log(f"{prefix} {LABEL_REGISTER_ONLY_SESSION_PENDING}: {session_fetch_error}")
         else:
             log(f"{prefix} {LABEL_REGISTER_ONLY_SUCCESS}")
         print()
@@ -502,7 +613,7 @@ async def worker_loop(
     while True:
         if not await counter.acquire_slot():
             return
-        proxy = proxy_pool.pick(worker_id) if proxy_pool else fallback_proxy_from_env() or None
+        proxy = pick_task_proxy(proxy_pool, fallback_proxy_from_env(), seed=worker_id)
         result = await run_account(cfg, store, worker_id, proxy=proxy, sms_selection=sms_selection)
         if result is None:
             await counter.release_slot(success=False)
@@ -828,7 +939,7 @@ def main() -> int:
                 cfg,
                 store,
                 worker_id=1,
-                proxy=proxy_pool.pick(1) if proxy_pool else fallback_proxy_from_env() or None,
+                proxy=pick_task_proxy(proxy_pool, fallback_proxy_from_env(), seed=1),
                 sms_selection=sms_selection,
             )
         )

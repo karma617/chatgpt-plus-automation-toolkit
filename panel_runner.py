@@ -44,7 +44,8 @@ from main import configure_mail_source
 from modules import paypal_flow_state
 from modules.paypal_filler_bridge import run_paypal_filler_flow2
 from modules.paypal_flow import _run_paypal_authorize
-from modules.paypal_pay import PENDING_AUTH_FILE, load_link_pool, run_paypal_pay
+from modules.paypal_pay import PENDING_AUTH_FILE, load_link_pool, paypal_use_long_link, run_paypal_pay
+from modules.flaresolverr_service import ensure_flaresolverr_service
 from modules.paypal_register import (
     LINK_POOL_FILE as PAYPAL_LINK_POOL_FILE,
     PAYPAL_PENDING_AUTH_FILE,
@@ -55,7 +56,7 @@ from modules.paypal_register import (
 )
 from modules.register_tool_bridge import run_register_tool_only
 from modules.storage import parse_mail_line
-from modules.utils import load_config
+from modules.utils import load_config, load_env
 
 
 VALID_ACTIONS = (
@@ -191,6 +192,35 @@ def _count_flow1_ready_registered(selected_email: str = "") -> int:
     return count
 
 
+def _count_direct_pay_ready(selected_email: str = "") -> int:
+    paypal_flow_state.sync_from_files(
+        registered_file=REGISTER_ONLY_SUMMARY_FILE,
+        link_file=PAYPAL_LINK_POOL_FILE,
+        pending_file=PAYPAL_PENDING_AUTH_FILE,
+    )
+    blocked = paypal_flow_state.link_pool_blocked_emails(pending_file=PAYPAL_PENDING_AUTH_FILE)
+    blocked |= paypal_flow_state.load_manual_discarded_emails()
+    selected = (selected_email or "").strip().lower()
+    emails: set[str] = set()
+    state = paypal_flow_state.load_state()
+    for email, record in state.items():
+        if str(record.get("status") or "") in {paypal_flow_state.STATUS_REGISTERED, paypal_flow_state.STATUS_LINK_READY}:
+            if email not in blocked and (not selected or email == selected):
+                emails.add(email)
+    for path in (REGISTER_ONLY_SUMMARY_FILE, PAYPAL_LINK_POOL_FILE):
+        if not path.exists():
+            continue
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            account = parse_mail_line(line)
+            email = (account.email if account else line.split("----", 1)[0]).strip().lower()
+            if email and "@" in email and email not in blocked and (not selected or email == selected):
+                emails.add(email)
+    return len(emails)
+
+
 def resolve_config_path(config_path: str | Path) -> Path:
     path = Path(config_path)
     if path.is_absolute():
@@ -293,6 +323,9 @@ def run_action(args: argparse.Namespace) -> int:
         finally:
             sys.argv = old_argv
 
+    env_path = resolve_env_path(".env")
+    env_values = load_env(env_path)
+    ensure_flaresolverr_service(env_values, log_func=print)
     cfg = _load_panel_config(args.config, flow_key_for_action(flow))
     if args.mail_source and args.mail_source != "default":
         configure_mail_source(cfg, args.mail_source)
@@ -322,6 +355,7 @@ def run_action(args: argparse.Namespace) -> int:
                 workers=workers,
                 mail_source=args.mail_source,
                 selected_email=args.email,
+                env=env_values,
             )
             status = "success" if result.ok else "failure"
             detail = getattr(result, "message", "") or (
@@ -374,17 +408,22 @@ def run_action(args: argparse.Namespace) -> int:
             use_filler_flow2 = flow == "paypal-auto-filler"
             use_local_random_mode = flow in {"paypal-auto-nocard", "paypal-auto-jp-nocard"}
             use_jp_region = flow == "paypal-auto-jp-nocard"
+            env = env_values
+            use_long_link = paypal_use_long_link(env)
+            direct_jp_nocard = use_jp_region and use_local_random_mode and not use_long_link
             if use_jp_region:
                 ready_count = _count_flow1_ready_registered(args.email)
                 link_count = _count_payment_links(args.email)
                 pending_count = _count_pending_auth(args.email)
-                if ready_count <= 0 and link_count <= 0 and pending_count <= 0:
+                direct_count = _count_direct_pay_ready(args.email) if direct_jp_nocard else 0
+                if ready_count <= 0 and link_count <= 0 and pending_count <= 0 and direct_count <= 0:
                     register_result = run_register_tool_only(
                         cfg,
                         count=target,
                         workers=workers,
                         mail_source=args.mail_source,
                         selected_email=args.email,
+                        env=env_values,
                     )
                     if not register_result.ok:
                         print(
@@ -397,29 +436,38 @@ def run_action(args: argparse.Namespace) -> int:
                             flush=True,
                         )
                         return register_result.returncode or 1
-            reg_success = asyncio.run(
-                run_with_playwright_noise_filter(
-                    run_paypal_register(
-                        cfg,
-                        count=target,
-                        workers=workers,
-                        selected_email=args.email,
-                        checkout_region="jp" if use_jp_region else "us",
+            if direct_jp_nocard:
+                reg_success = _count_direct_pay_ready(args.email)
+            else:
+                reg_success = asyncio.run(
+                    run_with_playwright_noise_filter(
+                        run_paypal_register(
+                            cfg,
+                            count=target,
+                            workers=workers,
+                            selected_email=args.email,
+                            checkout_region="jp" if use_jp_region else "us",
+                        )
                     )
                 )
-            )
             link_count = _count_payment_links(args.email)
-            if reg_success <= 0:
+            direct_count = _count_direct_pay_ready(args.email) if direct_jp_nocard else 0
+            if not direct_jp_nocard:
+                if reg_success <= 0:
+                    detail = f" for selected email {args.email}" if args.email else ""
+                    print(result_event(flow, "failure", f"flow1 failed or produced no payment links{detail}"), flush=True)
+                    return 1
+                if link_count <= 0:
+                    detail = f" for selected email {args.email}" if args.email else ""
+                    print(result_event(flow, "failure", f"flow1 produced no payment links{detail}"), flush=True)
+                    return 1
+            elif direct_count <= 0:
                 detail = f" for selected email {args.email}" if args.email else ""
-                print(result_event(flow, "failure", f"flow1 failed or produced no payment links{detail}"), flush=True)
-                return 1
-            if link_count <= 0:
-                detail = f" for selected email {args.email}" if args.email else ""
-                print(result_event(flow, "failure", f"flow1 produced no payment links{detail}"), flush=True)
+                print(result_event(flow, "failure", f"PAYPAL_USE_LONG_LINK=false but no direct registered accounts{detail}"), flush=True)
                 return 1
             pay_success = 0
-            if link_count > 0:
-                pay_target = min(target, link_count)
+            if link_count > 0 or direct_jp_nocard:
+                pay_target = min(target, direct_count if direct_jp_nocard else link_count)
                 if use_filler_flow2:
                     pay_success = int(
                         run_paypal_filler_flow2(

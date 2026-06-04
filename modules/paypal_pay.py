@@ -12,16 +12,27 @@ import random
 import re
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 
 from .browser import BrowserSession
+from .chatgpt_register import ChatGPTRegister, is_signin_problem_retry_reason
+from .checkout import (
+    CHECKOUT_METHOD_BROWSER_CHECKOUT,
+    CHECKOUT_METHOD_EXTERNAL_API,
+    CHECKOUT_METHOD_HOSTED_URL_HELPER,
+    CHECKOUT_METHOD_LOCAL_GENERATOR,
+    CHECKOUT_METHOD_LOCAL_SERVICE,
+)
+from .mail_provider import MailProvider
 from . import paypal_flow_state
 from .paypal_card_pool import CardInfo, CardPool
 from .paypal_phone_pool import PhoneInfo, PhonePool
 from .proxy_config import local_proxy_url, paypal_flow2_proxy_enabled, paypal_flow2_proxy_file
+from .storage import MailAccount, parse_mail_line
 from .utils import load_env, log, resolve_path, safe_filename
 
 
@@ -29,8 +40,19 @@ PAYPAL_OUTPUT_ROOT = resolve_path("output/paypal注册")
 LINK_POOL_FILE = PAYPAL_OUTPUT_ROOT / "长链接账号" / "account.txt"
 PENDING_AUTH_DIR = PAYPAL_OUTPUT_ROOT / "待授权账号"
 PENDING_AUTH_FILE = PENDING_AUTH_DIR / "account.txt"
-PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_SMS_FAST_AGREE_WHATSAPP_REJECT_2026-06-03_01"
+REGISTER_ONLY_SUMMARY_FILE = resolve_path("output/register_only/registered_sessions.txt")
+PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_BROWSER_FINGERPRINT_TURNSTILE_BACKOFF_2026-06-04_01"
 PAYPAL_FLOW2_NONZERO_AMOUNT = "nonzero_checkout_amount"
+PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT = "stripe_paypal_redirect_timeout"
+PAYPAL_FLOW2_RECREATE_LINK = "generated_payment_link_invalid_recreate"
+PAYPAL_FLOW2_RECREATE_LINK_MAX = 3
+PAYPAL_FLOW2_RECREATE_METHOD_ORDER = (
+    CHECKOUT_METHOD_EXTERNAL_API,
+    CHECKOUT_METHOD_LOCAL_SERVICE,
+    CHECKOUT_METHOD_HOSTED_URL_HELPER,
+    CHECKOUT_METHOD_LOCAL_GENERATOR,
+    CHECKOUT_METHOD_BROWSER_CHECKOUT,
+)
 
 
 def _zh(text: str) -> str:
@@ -505,9 +527,193 @@ def _display_proxy(proxy: str | None) -> str:
     return text
 
 
+def _env_bool(env: dict[str, str], key: str, default: bool = False) -> bool:
+    raw = str(env.get(key) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on", "y"}:
+        return True
+    if raw in {"0", "false", "no", "off", "disabled", "none", "n"}:
+        return False
+    return default
+
+
+def paypal_use_long_link(env: dict[str, str]) -> bool:
+    return _env_bool(env, "PAYPAL_USE_LONG_LINK", True)
+
+
+def paypal_click_watcher_enabled(env: dict[str, str]) -> bool:
+    return _env_bool(env, "PAYPAL_CLICK_WATCHER_ENABLED", False)
+
+
+def paypal_direct_checkout_start_url(env: dict[str, str]) -> str:
+    raw = str(env.get("PAYPAL_DIRECT_CHECKOUT_START_URL") or "").strip()
+    return raw or "https://chatgpt.com/"
+
+
+def _mail_source_for_account(account: MailAccount, fallback: str) -> str:
+    if account.client_id and account.refresh_token:
+        return "hotmail"
+    if str(account.mail_url or "").strip().lower() == "imap163":
+        return "domain163"
+    if account.email.strip().lower().endswith("@icloud.com"):
+        return "icloud_query"
+    return fallback
+
+
+def _strip_payment_link_from_account_line(line: str) -> str:
+    parts = [part.strip() for part in str(line or "").strip().split("----")]
+    if len(parts) >= 3 and parts[-1].startswith(("http://", "https://")):
+        return "----".join(parts[:-1]).strip()
+    return str(line or "").strip()
+
+
+def _account_item_from_account(account: MailAccount, *, source: str = "registered") -> dict[str, str]:
+    code_address = (account.code_address or account.mail_url or "mail").strip()
+    account_line = _strip_payment_link_from_account_line(account.raw)
+    return {
+        "email": account.email,
+        "query_code": code_address,
+        "payment_link": "",
+        "account_line": account_line or f"{account.email}----{code_address}",
+        "source": source,
+    }
+
+
+def _load_direct_pay_accounts(selected_email: str = "") -> list[dict[str, str]]:
+    selected = (selected_email or "").strip().lower()
+    paypal_flow_state.sync_from_files(
+        registered_file=REGISTER_ONLY_SUMMARY_FILE,
+        link_file=LINK_POOL_FILE,
+        pending_file=PENDING_AUTH_FILE,
+    )
+    blocked = paypal_flow_state.link_pool_blocked_emails(pending_file=PENDING_AUTH_FILE)
+    blocked |= paypal_flow_state.load_manual_discarded_emails()
+    state = paypal_flow_state.load_state()
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add_account(account: MailAccount | None, *, source: str) -> None:
+        if not account:
+            return
+        email = account.email.strip().lower()
+        if not email or email in seen or email in blocked:
+            return
+        if selected and email != selected:
+            return
+        seen.add(email)
+        items.append(_account_item_from_account(account, source=source))
+
+    for path, source in ((LINK_POOL_FILE, "link_pool_account"), (REGISTER_ONLY_SUMMARY_FILE, "registered_file")):
+        if not path.exists():
+            continue
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            add_account(parse_mail_line(line), source=source)
+
+    for record in state.values():
+        status = str(record.get("status") or "")
+        if status not in {paypal_flow_state.STATUS_REGISTERED, paypal_flow_state.STATUS_LINK_READY}:
+            continue
+        add_account(parse_mail_line(str(record.get("account_line") or "")), source=f"state:{status}")
+
+    return items
+
+
+async def _install_click_watcher(page, email: str, *, enabled: bool, label: str = "flow2") -> Path | None:
+    if not enabled:
+        return None
+    out_dir = resolve_path("output/paypal\u6ce8\u518c/debug/click_watcher")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"{safe_filename(email)}_{int(time.time())}.jsonl"
+
+    async def _record_click(payload: dict[str, Any]) -> None:
+        try:
+            payload = dict(payload)
+            payload.setdefault("email", email)
+            payload.setdefault("label", label)
+            payload.setdefault("ts", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+            with out_file.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception:
+            return
+
+    try:
+        await page.expose_function("__paypalClickWatcherRecord", _record_click)
+    except Exception:
+        pass
+    script = """(() => {
+        if (window.__paypalClickWatcherInstalled) return;
+        window.__paypalClickWatcherInstalled = true;
+        const cssPath = (el) => {
+            if (!el || !el.tagName) return "";
+            const parts = [];
+            let node = el;
+            while (node && node.nodeType === 1 && parts.length < 6) {
+                let part = node.tagName.toLowerCase();
+                if (node.id) {
+                    part += "#" + CSS.escape(node.id);
+                    parts.unshift(part);
+                    break;
+                }
+                const cls = String(node.className || "").trim().split(/\\s+/).filter(Boolean).slice(0, 2);
+                if (cls.length) part += "." + cls.map((x) => CSS.escape(x)).join(".");
+                const parent = node.parentElement;
+                if (parent) {
+                    const same = Array.from(parent.children).filter((x) => x.tagName === node.tagName);
+                    if (same.length > 1) part += `:nth-of-type(${same.indexOf(node) + 1})`;
+                }
+                parts.unshift(part);
+                node = parent;
+            }
+            return parts.join(" > ");
+        };
+        document.addEventListener("click", (event) => {
+            const target = event.target && event.target.closest
+                ? event.target.closest("button, a, input, [role='button'], [data-testid], div, span")
+                : event.target;
+            if (!target) return;
+            const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : {};
+            const payload = {
+                url: location.href,
+                title: document.title || "",
+                tag: target.tagName || "",
+                role: target.getAttribute ? (target.getAttribute("role") || "") : "",
+                type: target.getAttribute ? (target.getAttribute("type") || "") : "",
+                text: String(target.innerText || target.textContent || target.value || "").replace(/\\s+/g, " ").trim().slice(0, 200),
+                aria: target.getAttribute ? (target.getAttribute("aria-label") || "") : "",
+                href: target.getAttribute ? (target.getAttribute("href") || "") : "",
+                testid: target.getAttribute ? (target.getAttribute("data-testid") || "") : "",
+                selector: cssPath(target),
+                x: Math.round(rect.left || 0),
+                y: Math.round(rect.top || 0),
+                w: Math.round(rect.width || 0),
+                h: Math.round(rect.height || 0),
+            };
+            try { window.__paypalClickWatcherRecord(payload); } catch {}
+        }, true);
+    })()"""
+    try:
+        await page.add_init_script(script)
+        await page.evaluate(script)
+        log(f"[ClickWatcher][{email}] " + _zh(r"\u5df2\u542f\u7528\u70b9\u51fb\u8bb0\u5f55: ") + str(out_file))
+        return out_file
+    except Exception as exc:
+        log(f"[ClickWatcher][{email}] " + _zh(r"\u542f\u7528\u5931\u8d25: ") + str(exc))
+        return out_file
+
+
 def _is_proxy_failure(reason: str | None) -> bool:
+    if is_signin_problem_retry_reason(reason):
+        return True
     text = str(reason or "").lower()
     markers = (
+        PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT,
+        "30s no paypal redirect",
+        "60s no paypal redirect",
+        "未跳转 paypal",
         "err_socks_connection_failed",
         "err_timed_out",
         "err_tunnel_connection_failed",
@@ -526,6 +732,7 @@ def load_link_pool() -> list[dict[str, str]]:
     if not LINK_POOL_FILE.exists():
         return []
     blocked = paypal_flow_state.link_pool_blocked_emails(pending_file=PENDING_AUTH_FILE)
+    state = paypal_flow_state.load_state()
     items = []
     for line in LINK_POOL_FILE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -541,15 +748,224 @@ def load_link_pool() -> list[dict[str, str]]:
             email = parts[0].strip()
             if email.lower() in blocked:
                 continue
-            items.append(
-                {
-                    "email": email,
-                    "query_code": query_code,
-                    "payment_link": payment_link,
-                    "account_line": account_line,
-                }
-            )
+            item = {
+                "email": email,
+                "query_code": query_code,
+                "payment_link": payment_link,
+                "account_line": account_line,
+            }
+            link_method = str((state.get(email.lower()) or {}).get("link_method") or "").strip()
+            if link_method:
+                item["link_method"] = link_method
+            items.append(item)
     return items
+
+
+async def _checkout_surface_ready(page) -> bool:
+    subscribe_cn = _zh(r"\u8ba2\u9605")
+    pay_cn = _zh(r"\u652f\u4ed8")
+    pay_jp = _zh(r"\u652f\u6255")
+    paypal_continue_jp = _zh(r"\u540c\u610f\u3057\u3066\u7d9a\u884c")
+    payment_method_cn = _zh(r"\u652f\u4ed8\u65b9\u5f0f")
+    today_payment_jp_1 = _zh(r"\u4eca\u65e5\u306e\u304a\u652f\u6255\u3044")
+    today_payment_jp_2 = _zh(r"\u672c\u65e5\u306e\u304a\u652f\u6255\u3044")
+    selectors = (
+        '#ProductSummary-totalAmount',
+        '#OrderDetails-TotalAmount',
+        '[data-testid="order-details-footer-total-amount"]',
+        '[data-testid="order-details-footer-subtotal-amount"]',
+        'input[autocomplete="cc-number"]',
+        'input[name="cardnumber"]',
+        'iframe[name*="__privateStripeFrame"]',
+        f'button:has-text("{subscribe_cn}")',
+        'button:has-text("Subscribe")',
+        'button:has-text("Pay")',
+        f'button:has-text("{pay_cn}")',
+        f'button:has-text("{pay_jp}")',
+        f'button:has-text("{paypal_continue_jp}")',
+        f'text={payment_method_cn}',
+        'text=Payment method',
+        'text=Due today',
+        f'text={today_payment_jp_1}',
+        f'text={today_payment_jp_2}',
+    )
+    for selector in selectors:
+        try:
+            if await page.locator(selector).first.is_visible(timeout=500):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _dismiss_chatgpt_interstitials(page, prefix: str) -> None:
+    skip_cn = _zh(r"\u8df3\u8fc7")
+    later_cn_1 = _zh(r"\u4ee5\u540e\u518d\u8bf4")
+    later_cn_2 = _zh(r"\u7a0d\u540e")
+    selectors = (
+        f'button:has-text("{skip_cn}")',
+        'button:has-text("Skip")',
+        f'button:has-text("{later_cn_1}")',
+        f'button:has-text("{later_cn_2}")',
+        'button:has-text("Not now")',
+        'button[aria-label="Close"]',
+        '[role="button"][aria-label="Close"]',
+    )
+    for _ in range(3):
+        clicked = False
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.is_visible(timeout=500) and await locator.is_enabled(timeout=500):
+                    await locator.click(timeout=1500, no_wait_after=True)
+                    log(f"{prefix} dismissed ChatGPT interstitial: {selector}")
+                    clicked = True
+                    await page.wait_for_timeout(800)
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            return
+
+
+async def _click_visible_offer_entry(page, prefix: str) -> bool:
+    claim_offer = _zh(r"\u9886\u53d6\u4f18\u60e0")
+    free_trial = _zh(r"\u514d\u8d39\u8bd5\u7528")
+    upgrade_cn = _zh(r"\u5347\u7ea7")
+    selectors = (
+        f'button:has-text("{claim_offer}")',
+        f'a:has-text("{claim_offer}")',
+        f'[role="button"]:has-text("{claim_offer}")',
+        f'button:has-text("{free_trial}")',
+        f'a:has-text("{free_trial}")',
+        f'button:has-text("{upgrade_cn}")',
+        f'a:has-text("{upgrade_cn}")',
+        'button:has-text("Upgrade")',
+        'a:has-text("Upgrade")',
+        'button:has-text("Try Plus")',
+        'a:has-text("Try Plus")',
+        'button:has-text("Get Plus")',
+        'a:has-text("Get Plus")',
+        'button:has-text("Plus")',
+        'a:has-text("Plus")',
+        'button:has-text("Subscribe")',
+        'a:has-text("Subscribe")',
+    )
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.is_visible(timeout=700) and await locator.is_enabled(timeout=700):
+                await locator.scroll_into_view_if_needed(timeout=1000)
+                await locator.click(timeout=2500)
+                log(f"{prefix} clicked offer entry: {selector}")
+                await page.wait_for_timeout(1800)
+                return True
+        except Exception:
+            continue
+
+    try:
+        clicked = await page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter(visible);
+                const patterns = [
+                    /\u9886\u53d6\u4f18\u60e0/,
+                    /\u514d\u8d39\u8bd5\u7528/,
+                    /\u5347\u7ea7/,
+                    /upgrade/i,
+                    /try\\s*plus/i,
+                    /get\\s*plus/i,
+                    /subscribe/i,
+                    /plus/i
+                ];
+                const target = nodes.find((node) => patterns.some((pattern) => pattern.test(textOf(node))));
+                if (!target) return "";
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+                target.click();
+                return textOf(target).slice(0, 120);
+            }"""
+        )
+        if clicked:
+            log(f"{prefix} clicked offer entry by JS: {clicked}")
+            await page.wait_for_timeout(1800)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _prepare_checkout_from_chatgpt_offer(
+    page,
+    item: dict[str, str],
+    cfg: dict[str, Any],
+    *,
+    proxy: str | None,
+    prefix: str,
+    watcher_enabled: bool,
+    flow_env: dict[str, str] | None = None,
+) -> None:
+    account = parse_mail_line(item.get("account_line", "")) or MailAccount(
+        email=item["email"],
+        mail_url=item.get("query_code") or None,
+        raw=item.get("account_line", "") or item["email"],
+    )
+    mail_cfg = cfg.get("mail", {})
+    fallback_source = str(mail_cfg.get("active_source") or mail_cfg.get("source") or "").strip() or "hotmail"
+    mail_provider = MailProvider(
+        source=_mail_source_for_account(account, fallback_source),
+        timeout_sec=int(mail_cfg.get("code_timeout_sec", 150)),
+        poll_interval_sec=int(mail_cfg.get("poll_interval_sec", 5)),
+        log_prefix=prefix,
+    )
+    register = ChatGPTRegister(
+        page=page,
+        page_getter=None,
+        start_url="https://chatgpt.com/auth/login",
+        entry_action="login",
+        mail_provider=mail_provider,
+        age_min=21,
+        age_max=45,
+        sms_selection=None,
+        log_prefix=prefix,
+        proxy=proxy,
+    )
+    await _install_click_watcher(page, item["email"], enabled=watcher_enabled, label="flow2_direct_offer")
+    log(f"{prefix} long link disabled; login ChatGPT and open offer checkout")
+    await register.run_until_logged_in(account, datetime.now(timezone.utc))
+    start_url = paypal_direct_checkout_start_url(flow_env or load_env(".env"))
+    await page.goto(start_url, wait_until="domcontentloaded", timeout=45_000)
+    await page.wait_for_timeout(2500)
+    await _install_click_watcher(page, item["email"], enabled=watcher_enabled, label="flow2_direct_offer")
+    await _dismiss_chatgpt_interstitials(page, prefix)
+    if await _checkout_surface_ready(page):
+        return
+    for attempt in range(1, 31):
+        if attempt in {1, 6, 11, 16, 21, 26}:
+            log(f"{prefix} waiting direct checkout surface via ChatGPT offer ({attempt}/30), url={page.url}")
+        if await _checkout_surface_ready(page):
+            return
+        await _dismiss_chatgpt_interstitials(page, prefix)
+        clicked = await _click_visible_offer_entry(page, prefix)
+        if await _checkout_surface_ready(page):
+            return
+        if not clicked and attempt in {8, 16, 24}:
+            try:
+                await page.goto("https://chatgpt.com/#pricing", wait_until="domcontentloaded", timeout=30_000)
+                await page.wait_for_timeout(1800)
+            except Exception:
+                pass
+        await page.wait_for_timeout(1500)
+    raise RuntimeError(
+        _zh(
+            r"\u5df2\u5173\u95ed\u957f\u94fe\uff0c\u4f46\u767b\u5f55\u540e\u672a\u80fd\u81ea\u52a8\u627e\u5230\u9886\u53d6\u4f18\u60e0/\u5347\u7ea7\u5165\u53e3\u6216\u652f\u4ed8\u9875\u5143\u7d20"
+        )
+    )
 
 
 def save_pending_auth(email: str, query_code: str, account_line: str | None = None) -> None:
@@ -569,10 +985,87 @@ def remove_from_link_pool(email: str) -> None:
     LINK_POOL_FILE.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
 
 
+def upsert_link_pool_item(email: str, account_line: str, payment_link: str) -> None:
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return
+    prefix = _strip_payment_link_from_account_line(account_line) or email.strip()
+    LINK_POOL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = LINK_POOL_FILE.read_text(encoding="utf-8").splitlines() if LINK_POOL_FILE.exists() else []
+    remaining = [line for line in lines if not line.strip().lower().startswith(normalized)]
+    remaining.append(f"{prefix}----{payment_link}")
+    LINK_POOL_FILE.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+
+
 def discard_flow2_link(email: str, *, reason: str) -> None:
     remove_from_link_pool(email)
     paypal_flow_state.append_discarded_emails([email], reason=reason)
     paypal_flow_state.mark_discarded_many([email], reason=reason)
+
+
+def mark_link_for_regeneration(email: str, *, account_line: str = "", reason: str, failed_link_method: str = "") -> None:
+    remove_from_link_pool(email)
+    paypal_flow_state.mark_needs_link(
+        email,
+        account_line=account_line,
+        reason=reason,
+        failed_link_method=failed_link_method,
+    )
+
+
+def _is_recreate_link_reason(reason: str | None) -> bool:
+    return str(reason or "").startswith(PAYPAL_FLOW2_RECREATE_LINK)
+
+
+async def regenerate_flow2_payment_link(
+    item: dict[str, str],
+    cfg: dict[str, Any],
+    *,
+    worker_id: int,
+    proxy: str | None,
+    flow2_region_mode: str,
+    mail_source: str = "",
+) -> tuple[str, str]:
+    from .paypal_register import login_existing_account_for_checkout
+
+    account_line = item.get("account_line", "") or _strip_payment_link_from_account_line(item.get("raw", ""))
+    account = parse_mail_line(account_line)
+    if not account:
+        raise RuntimeError(f"cannot recreate payment link: invalid account line for {item.get('email')}")
+    resolved_mail_source = mail_source or _mail_source_for_account(account, "hotmail")
+    region = "jp" if _normalize_flow2_region_mode(flow2_region_mode) == "jp" else "us"
+    method_sink: dict[str, str] = {}
+    log(
+        f"[paypal-pay-{worker_id:02d}][{account.email}] "
+        + _zh(r"\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe: ")
+        + " -> ".join(PAYPAL_FLOW2_RECREATE_METHOD_ORDER)
+    )
+    link = await login_existing_account_for_checkout(
+        account,
+        resolved_mail_source,
+        cfg,
+        worker_id=worker_id,
+        proxy=proxy,
+        create_payment_link=True,
+        session_source="paypal_flow2_recreate_link",
+        checkout_region=region,
+        checkout_skip_methods=set(),
+        checkout_preferred_methods=PAYPAL_FLOW2_RECREATE_METHOD_ORDER,
+        checkout_method_sink=method_sink,
+    )
+    if not link:
+        raise RuntimeError("cannot recreate payment link: generator returned empty link")
+    method = str(method_sink.get("method") or "").strip()
+    item["payment_link"] = str(link)
+    item["link_method"] = method
+    upsert_link_pool_item(account.email, account_line, str(link))
+    paypal_flow_state.mark_link_ready(account.email, account_line=account_line, payment_link=str(link), link_method=method)
+    log(
+        f"[paypal-pay-{worker_id:02d}][{account.email}] "
+        + _zh(r"\u65b0\u652f\u4ed8\u957f\u94fe\u5df2\u751f\u6210\uff0cmethod=")
+        + (method or "unknown")
+    )
+    return str(link), method
 
 
 _CHECKOUT_AMOUNT_KEYWORDS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -1105,8 +1598,15 @@ async def _fill_paypal_jp_identity(page, *, email: str, card: CardInfo) -> None:
 
 async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "US") -> None:
     """Stripe 页面：选 PayPal + 填地址 + Subscribe。"""
+    stripe_started_at = time.perf_counter()
     await page.wait_for_load_state("domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(8000)
+    try:
+        await page.locator(
+            '[data-testid="paypal-accordion-item-button"], #billingCountry, '
+            'select[name*="country" i], select[autocomplete="country"]'
+        ).first.wait_for(state="visible", timeout=5000)
+    except Exception:
+        await page.wait_for_timeout(1200)
 
     # 防御性修正：部分卡源会把 "CITY ZIP" 合并到 city 字段
     city_value = (card.city or "").strip()
@@ -1130,47 +1630,53 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
 
     # 国家选择 - 先等待下拉框可交互
     country_select = page.locator('#billingCountry, select[name*="country" i], select[autocomplete="country"]').first
+    country_started_at = time.perf_counter()
+    country_changed = False
     try:
-        await country_select.wait_for(state="visible", timeout=8000)
-        await country_select.select_option(desired_country, timeout=5000)
+        await country_select.wait_for(state="visible", timeout=3500)
+        await country_select.select_option(desired_country, timeout=2500)
+        country_changed = True
     except Exception:
         for lbl in desired_labels:
             try:
-                await country_select.select_option(label=lbl, timeout=3000)
+                await country_select.select_option(label=lbl, timeout=1500)
+                country_changed = True
                 break
             except Exception:
                 continue
 
     # 等待国家切换后页面重新渲染地址字段
-    await page.wait_for_timeout(3000)
+    await page.wait_for_timeout(1200 if country_changed else 500)
 
     # 验证国家是否选中目标国家
     try:
         current_val = await country_select.input_value()
         if current_val != desired_country:
             log(f"[Stripe] 国家仍为 {current_val}，再次尝试切到 {desired_country}...")
-            await country_select.select_option(desired_country, timeout=3000)
-            await page.wait_for_timeout(2000)
+            await country_select.select_option(desired_country, timeout=1800)
+            await page.wait_for_timeout(900)
     except Exception:
         pass
+    country_finished_at = time.perf_counter()
 
     # 手动输入地址
     try:
         manual = page.locator('text=手动输入地址, text=Enter address manually, a:has-text("手动"), a:has-text("manually")').first
-        await manual.click(timeout=5000)
-        await page.wait_for_timeout(1500)
+        if await manual.is_visible(timeout=1200):
+            await manual.click(timeout=1500)
+            await page.wait_for_timeout(600)
     except Exception:
         pass
 
-    async def _safe_fill(selector: str, value: str, timeout: int = 5000) -> bool:
+    async def _safe_fill(selector: str, value: str, timeout: int = 2500) -> bool:
         if not str(value or "").strip():
             return False
         val = str(value).strip()
         # 先尝试可见输入框
         try:
             loc = page.locator(f"{selector}:visible").first
-            if await loc.is_visible(timeout=1200):
-                await loc.fill("", timeout=2000)
+            if await loc.is_visible(timeout=600):
+                await loc.fill("", timeout=1000)
                 await loc.fill(val, timeout=timeout)
                 read_back = (await loc.input_value()).strip()
                 if read_back:
@@ -1254,29 +1760,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
         )
 
         async def _switch_stripe_prefecture_like_country(labels: list[str]) -> bool:
-            # 第一段：像国家切换一样，先尝试原生 select_option
-            try:
-                pref_sel = page.locator(
-                    pref_select_selector
-                ).first
-                if await pref_sel.is_visible(timeout=2000):
-                    for key in labels:
-                        if not key:
-                            continue
-                        try:
-                            await pref_sel.select_option(key, timeout=2000)
-                            return True
-                        except Exception:
-                            pass
-                        try:
-                            await pref_sel.select_option(label=key, timeout=2000)
-                            return True
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-
-            # 第二段：像国家切换一样，JS 遍历 select 的 options 做 value/label 匹配
+            # Fast path: scan native select options once instead of timing out per candidate.
             try:
                 result = await page.evaluate(
                     """(labels) => {
@@ -1664,7 +2148,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
                     continue
             return False
 
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(300)
         await _safe_fill(
             '#billingAddressLine1, input[name*="addressLine1" i], input[name*="address" i], input[placeholder*="地址" i], input[placeholder*="Address" i]',
             card.street,
@@ -1673,7 +2157,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
         city_selector = '#billingLocality, input[name*="locality" i], input[name*="city" i], input[placeholder*="城市" i], input[placeholder*="City" i]'
         city_ok = await _safe_fill(city_selector, city_value)
         if not city_ok:
-            await page.wait_for_timeout(600)
+            await page.wait_for_timeout(300)
             city_ok = await _safe_fill(city_selector, city_value)
         if not city_ok:
             log(f"[Stripe] ⚠️ 日本地址城市填充失败: city={city_value}")
@@ -1681,6 +2165,12 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
         # 地址阶段再统一执行都道府县选择与校验
         pref_ok = await _switch_stripe_prefecture_like_country(pref_keys)
         v_ok, v_reason = await _verify_prefecture_selected(pref_label, card.state)
+        if desired_country == "JP":
+            now = time.perf_counter()
+            log(
+                f"[Stripe][JP] address prep timing: country={country_finished_at - country_started_at:.1f}s "
+                f"fields={now - country_finished_at:.1f}s total={now - stripe_started_at:.1f}s"
+            )
         log(
             f"[Stripe][JP] pref step1 like-country: attempted={pref_ok} "
             f"committed={v_ok} reason={v_reason}"
@@ -1870,14 +2360,18 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
         except Exception:
             pass
 
-    # 勾选条款
+    # 勾选条款。该控件会随 Stripe 页面版本/地区变化而缺失，因此只作为诊断信号，不作为坏链硬判定。
     try:
         cb = page.locator('input[type="checkbox"], [role="checkbox"]').first
-        if await cb.is_visible(timeout=2000) and not await cb.is_checked():
-            await cb.click(force=True)
-            await page.wait_for_timeout(1000)
-    except Exception:
-        pass
+        if await cb.is_visible(timeout=2000):
+            if not await cb.is_checked():
+                await cb.click(force=True)
+                await page.wait_for_timeout(1000)
+            log("[Stripe] checkout agreement checkbox detected")
+        else:
+            log("[Stripe] checkout agreement checkbox not detected; keep as diagnostic only")
+    except Exception as exc:
+        log(f"[Stripe] checkout agreement checkbox probe skipped: {exc}")
 
     # 关闭可能弹出的地址建议下拉框（Google 地址自动补全）
     # 按 Escape 关闭下拉，再点击页面空白处确保焦点离开输入框
@@ -1893,6 +2387,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
     # Subscribe / 订阅 - 多种选择器兜底
     log("[Stripe] 点击订阅按钮...")
     subscribe_clicked = False
+    subscribe_attempted = False
     subscribe_selectors = [
         'button:has-text("Subscribe")',
         'button:has-text("订阅")',
@@ -1901,6 +2396,92 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
         '[data-testid="hosted-payment-submit-button"]',
         'button[type="submit"]',
     ]
+
+    async def _wait_stripe_subscribe_processing(timeout_ms: int = 4500) -> tuple[bool, str]:
+        deadline = time.perf_counter() + (timeout_ms / 1000)
+        last_reason = "not_checked"
+        while time.perf_counter() < deadline:
+            if "paypal.com" in page.url:
+                return True, "redirected"
+            try:
+                state = await page.evaluate(
+                    r"""() => {
+                        const processingText = /processing|loading|please\s*wait|\u6b63\u5728\u5904\u7406|\u5904\u7406\u4e2d|\u8bf7\u7a0d\u5019/i;
+                        const isVisible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width < 8 || rect.height < 8) return false;
+                            const style = window.getComputedStyle(el);
+                            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.05;
+                        };
+                        const nodes = Array.from(document.querySelectorAll(
+                            'button, [role="button"], input[type="submit"], [data-testid="hosted-payment-submit-button"]'
+                        )).filter(isVisible);
+                        const texts = [];
+                        for (const el of nodes) {
+                            const text = String(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim();
+                            const busy = String(el.getAttribute('aria-busy') || '').toLowerCase() === 'true';
+                            const disabled = !!el.disabled || String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                            texts.push(text || el.tagName);
+                            if (processingText.test(text)) {
+                                return { ok: true, reason: `processing_text:${text}` };
+                            }
+                            if (busy) {
+                                return { ok: true, reason: 'aria_busy' };
+                            }
+                            if (disabled && /subscribe|\u8ba2\u9605|submit/i.test(text + ' ' + (el.type || ''))) {
+                                return { ok: true, reason: 'disabled_after_click' };
+                            }
+                        }
+                        return { ok: false, reason: `visible_buttons:${texts.slice(0, 4).join('|')}` };
+                    }"""
+                )
+                if bool((state or {}).get("ok")):
+                    return True, str((state or {}).get("reason") or "processing")
+                last_reason = str((state or {}).get("reason") or last_reason)
+            except Exception as exc:
+                last_reason = f"state_error:{exc}"
+            await page.wait_for_timeout(250)
+        return False, last_reason
+
+    async def _retry_click_stripe_submit(attempt_no: int) -> bool:
+        for sel in subscribe_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=1200):
+                    await btn.click(timeout=10000)
+                    processing_ok, processing_reason = await _wait_stripe_subscribe_processing()
+                    log(
+                        f"[Stripe] retry submit attempt {attempt_no}/3 "
+                        f"selector={sel} processing={processing_ok} reason={processing_reason}"
+                    )
+                    return True
+            except Exception:
+                continue
+        try:
+            js_clicked = bool(await page.evaluate(r"""() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                for (const btn of buttons.reverse()) {
+                    const text = (btn.textContent || '').trim();
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0 && /Subscribe|\u8ba2\u9605|submit/i.test(text + btn.type)) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }"""))
+            if js_clicked:
+                processing_ok, processing_reason = await _wait_stripe_subscribe_processing()
+                log(
+                    f"[Stripe] retry submit attempt {attempt_no}/3 "
+                    f"selector=js_fallback processing={processing_ok} reason={processing_reason}"
+                )
+                return True
+        except Exception:
+            pass
+        return False
+
     for sel in subscribe_selectors:
         try:
             btn = page.locator(sel).first
@@ -1910,60 +2491,79 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
                 if is_disabled:
                     log(f"[Stripe] 按钮被禁用: {sel}，等待...")
                     await page.wait_for_timeout(3000)
-                await btn.click(timeout=10000)
-                subscribe_clicked = True
-                log(f"[Stripe] 订阅按钮已点击 (选择器: {sel})")
-                break
+                for click_attempt in range(2):
+                    await btn.click(timeout=10000)
+                    subscribe_attempted = True
+                    processing_ok, processing_reason = await _wait_stripe_subscribe_processing()
+                    if processing_ok:
+                        subscribe_clicked = True
+                        log(f"[Stripe] 订阅按钮已点击并进入处理状态 (选择器: {sel}, reason={processing_reason})")
+                        break
+                    if click_attempt == 0:
+                        log(
+                            f"[Stripe] Subscribe button did not enter processing state, retry click "
+                            f"(selector={sel}, reason={processing_reason})"
+                        )
+                    else:
+                        log(
+                            f"[Stripe] Subscribe button click state still not observed "
+                            f"(selector={sel}, reason={processing_reason})"
+                        )
+                if subscribe_clicked:
+                    break
         except Exception:
             continue
 
     if not subscribe_clicked:
         # 终极兜底：点击页面上最后一个可见的 submit 按钮
         log("[Stripe] 常规选择器未命中，尝试 JS 点击...")
-        await page.evaluate("""() => {
+        js_subscribe_attempted = bool(await page.evaluate(r"""() => {
             const buttons = Array.from(document.querySelectorAll('button'));
             for (const btn of buttons.reverse()) {
                 const text = (btn.textContent || '').trim();
                 const rect = btn.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0 && /Subscribe|订阅|submit/i.test(text + btn.type)) {
+                if (rect.width > 0 && rect.height > 0 && /Subscribe|\u8ba2\u9605|submit/i.test(text + btn.type)) {
                     btn.click();
-                    return;
+                    return true;
                 }
             }
-        }""")
+            return false;
+        }"""))
+        subscribe_attempted = subscribe_attempted or js_subscribe_attempted
+        if js_subscribe_attempted:
+            processing_ok, processing_reason = await _wait_stripe_subscribe_processing()
+            if processing_ok:
+                subscribe_clicked = True
+                log(f"[Stripe] JS fallback submit entered processing state: {processing_reason}")
+            else:
+                log(f"[Stripe] JS fallback submit did not enter processing state: {processing_reason}")
 
-    # 等跳转 PayPal - 如果 10 秒没跳转，再点一次订阅
+    if not subscribe_attempted:
+        raise RuntimeError("Stripe subscribe button was not clicked")
+
+    # 等跳转 PayPal；若提交已进入处理态但长时间不跳转，不再复用当前 checkout session。
+    # 该场景通常是生成的支付长链/Stripe session 没有 provider redirect，交给外层重新生成长链。
     jumped = False
-    for attempt in range(2):
-        for _ in range(30 if attempt == 0 else 30):
-            if "paypal.com" in page.url:
-                jumped = True
-                break
-            await page.wait_for_timeout(1000)
-        if jumped:
+    for _ in range(60):
+        if "paypal.com" in page.url:
+            jumped = True
             break
-        if attempt == 0:
-            log("[Stripe] 30s 未跳转 PayPal，检查是否有表单错误并重试点击...")
-            # 检查是否有错误提示
-            has_error = await page.evaluate("""() => {
-                const text = (document.body?.innerText || '');
-                return /This is required|必填|invalid|错误|error/i.test(text);
-            }""")
-            if has_error:
-                log("[Stripe] 检测到表单错误，可能地址未填完整")
-            # 再点一次
-            for sel in subscribe_selectors[:3]:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.is_visible(timeout=1000):
-                        await btn.click(timeout=5000)
-                        log(f"[Stripe] 重试点击订阅按钮: {sel}")
-                        break
-                except Exception:
-                    continue
-
+        await page.wait_for_timeout(1000)
     if not jumped:
-        raise RuntimeError(f"60s 内未跳转 PayPal，URL: {page.url}")
+        log(
+            _zh(r"[Stripe] 60s \u672a\u8df3\u8f6c PayPal\uff0c\u68c0\u67e5\u662f\u5426\u6709\u8868\u5355\u9519\u8bef...")
+        )
+        has_error = await page.evaluate("""() => {
+            const text = (document.body?.innerText || '');
+            return /This is required|必填|invalid|错误|error/i.test(text);
+        }""")
+        if has_error:
+            log("[Stripe] 检测到表单错误，仍按长链失效处理并重新生成支付链接")
+        raise RuntimeError(
+            f"{PAYPAL_FLOW2_RECREATE_LINK}: submit entered processing but did not redirect PayPal in 60s; "
+            f"form_error={bool(has_error)} url={page.url}"
+        )
+
     await page.wait_for_timeout(3000)
 
 
@@ -2695,9 +3295,17 @@ async def fill_paypal(
         except Exception as exc:
             if _looks_like_captcha_pointer_block(exc):
                 log("[PayPal] 创建账号按钮被 CAPTCHA 遮挡，处理后重试点击")
-                await handle_paypal_captcha(page, solver_proxy=proxy, force=True)
-                await _wait_captcha_cleared(page, timeout_seconds=30)
-                await create_btn.click(timeout=10000)
+                removed = await _cleanup_hosted_captcha_artifacts(page, timeout_ms=2500)
+                if removed:
+                    log(f"[PayPal] 已快速清理 hosted captcha 遮挡元素 {removed} 个，立即重试点击")
+                try:
+                    await create_btn.click(timeout=3000)
+                except Exception as retry_exc:
+                    if not _looks_like_captcha_pointer_block(retry_exc):
+                        raise
+                    await handle_paypal_captcha(page, solver_proxy=proxy, force=True)
+                    await _wait_captcha_cleared(page, timeout_seconds=10)
+                    await create_btn.click(timeout=5000)
             else:
                 raise
         await page.wait_for_timeout(2500)
@@ -2708,6 +3316,8 @@ async def fill_paypal(
 
         rejected = False
         for _ in range(6):
+            if await _is_paypal_verification_stage(page):
+                break
             if await _is_card_rejected():
                 rejected = True
                 break
@@ -3547,17 +4157,19 @@ async def fill_sms_code(
 
     try:
         btn = page.locator('button:has-text("Confirm"), button:has-text("Submit"), button:has-text("Verify"), button[type="submit"]').first
-        if await btn.is_visible(timeout=3000):
+        if await btn.is_visible(timeout=800):
             try:
-                await btn.click()
+                await btn.click(timeout=2500, no_wait_after=True)
             except Exception as exc:
-                    if _looks_like_captcha_pointer_block(exc):
-                        log("[PayPal] 提交按钮被 CAPTCHA 遮挡，处理后重试提交")
-                        await handle_paypal_captcha(page, solver_proxy=solver_proxy, force=True)
-                        await _wait_captcha_cleared(page, timeout_seconds=30)
-                        await btn.click(timeout=3000)
-                    else:
-                        raise
+                if _looks_like_captcha_pointer_block(exc):
+                    log("[PayPal] 提交按钮被 CAPTCHA 遮挡，处理后重试提交")
+                    await handle_paypal_captcha(page, solver_proxy=solver_proxy, force=True)
+                    await _wait_captcha_cleared(page, timeout_seconds=10)
+                    await btn.click(timeout=2500, no_wait_after=True)
+                else:
+                    raise
+        else:
+            await _click_paypal_otp_submit_by_dom(page)
     except Exception:
         pass
 
@@ -3582,6 +4194,36 @@ async def fill_sms_code(
         return False
     log(f"{prefix} 短信验证码已提交并通过")
     return True
+
+
+async def _click_paypal_otp_submit_by_dom(page) -> bool:
+    script = """() => {
+        const labels = /confirm|submit|verify|continue|确认|提交|验证|继续/i;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 10 || rect.height < 10) return false;
+            const style = window.getComputedStyle(el);
+            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.05;
+        };
+        const candidates = Array.from(document.querySelectorAll('button, input[type="submit"], div[role="button"], a[role="button"]'));
+        for (const el of candidates) {
+            const text = String(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim();
+            if (!isVisible(el)) continue;
+            if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+            if (!labels.test(text) && !el.matches('button[type="submit"], input[type="submit"]')) continue;
+            try { el.scrollIntoView({ block: 'center' }); } catch {}
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            }
+            return true;
+        }
+        return false;
+    }"""
+    try:
+        return bool(await page.evaluate(script))
+    except Exception:
+        return False
 
 
 async def check_phone_rejected(page) -> bool:
@@ -3710,6 +4352,7 @@ async def pay_one(
     proxy: str | None = None,
     flow2_region_mode: str = "default",
     last_error: dict[str, str] | None = None,
+    proxy_attempt: int = 1,
 ) -> bool:
     """执行一次 PayPal 支付。"""
     email = item["email"]
@@ -3734,12 +4377,14 @@ async def pay_one(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=email,
+        fingerprint_seed=f"{email}|flow2|{proxy or ''}|{proxy_attempt}|{time.time_ns()}",
     )
 
     phone: PhoneInfo | None = None
     try:
         flow_env = load_env(".env")
+        use_long_link = paypal_use_long_link(flow_env)
+        watcher_enabled = paypal_click_watcher_enabled(flow_env)
         working_card = card
         if region_mode == "jp":
             jp_billing = _generate_local_random_card(worker_id, email, flow_env, region_mode="jp")
@@ -3751,13 +4396,25 @@ async def pay_one(
 
         await session.__aenter__()
         page = await session.current_page()
+        await _install_click_watcher(page, email, enabled=watcher_enabled, label="flow2")
 
-        # 打开长链接
-        log(f"{prefix} 打开支付链接...")
-        await page.goto(payment_link, wait_until="domcontentloaded")
+        # 打开支付页。默认使用长链接；禁用长链接时从 ChatGPT 领取优惠入口进入。
+        if use_long_link:
+            log(f"{prefix} 打开支付链接...")
+            await page.goto(payment_link, wait_until="domcontentloaded")
+        else:
+            await _prepare_checkout_from_chatgpt_offer(
+                page,
+                item,
+                cfg,
+                proxy=proxy,
+                prefix=prefix,
+                watcher_enabled=watcher_enabled,
+                flow_env=flow_env,
+            )
         try:
             await page.locator(
-                'input[autocomplete="cc-number"], iframe[name*="__privateStripeFrame"], text=支付方式'
+                f'input[autocomplete="cc-number"], iframe[name*="__privateStripeFrame"], text={_zh(r"\u652f\u4ed8\u65b9\u5f0f")}'
             ).first.wait_for(timeout=2500)
         except Exception:
             pass
@@ -3902,14 +4559,18 @@ async def run_paypal_pay(
     log(f"PayPal flow2 code version: {PAYPAL_FLOW2_CODE_VERSION} file={Path(__file__).resolve()}")
     env = load_env(".env")
     resolved_region_mode = _normalize_flow2_region_mode(flow2_region_mode)
+    use_long_link = paypal_use_long_link(env)
     paypal_flow_state.sync_from_files(link_file=LINK_POOL_FILE, pending_file=PENDING_AUTH_FILE)
-    pool = load_link_pool()
+    pool = load_link_pool() if use_long_link else _load_direct_pay_accounts(selected_email or "")
     selected = (selected_email or "").strip().lower()
-    if selected:
+    if selected and use_long_link:
         pool = [item for item in pool if str(item.get("email") or "").strip().lower() == selected]
     if not pool:
         detail = f" (selected={selected_email})" if selected_email else ""
-        log(f"PayPal 流程2：长链接池为空，请先运行流程1{detail}")
+        if use_long_link:
+            log(f"PayPal 流程2：长链接池为空，请先运行流程1{detail}")
+        else:
+            log(f"PayPal 流程2：长链已关闭，但没有可直接登录的注册账号{detail}")
         return 0
 
     cards_file = env.get("PAYPAL_CARDS_FILE") or "data/paypal/cards.txt"
@@ -3967,7 +4628,8 @@ async def run_paypal_pay(
     capacity = min(len(pool), phone_pool.count()) if local_random_mode else min(len(pool), card_pool.count())
     target = min(count, capacity)
     card_desc = "本地随机" if local_random_mode else str(card_pool.count())
-    log(f"PayPal 流程2：长链接 {len(pool)} 个，卡 {card_desc} 张，手机号 {phone_pool.count()} 个，本次目标 {target}，并发 {workers}")
+    source_desc = "长链接" if use_long_link else "直接登录账号"
+    log(f"PayPal 流程2：{source_desc} {len(pool)} 个，卡 {card_desc} 张，手机号 {phone_pool.count()} 个，本次目标 {target}，并发 {workers}")
 
     success = 0
     skipped_nonzero = 0
@@ -4009,37 +4671,107 @@ async def run_paypal_pay(
                             active_slots = max(0, active_slots - 1)
                             failed_slots += 1
                         return
-                proxies = proxy_pool.sequence(item_number) if proxy_pool else [fallback_proxy or None]
+                proxies = proxy_pool.random_sequence() if proxy_pool else [fallback_proxy or None]
                 ok = False
                 flow2_discarded = False
+                flow2_recreate_link = False
                 for proxy_attempt, proxy in enumerate(proxies, start=1):
-                    last_error: dict[str, str] = {}
-                    ok = await pay_one(
-                        item,
-                        card,
-                        phone_pool,
-                        cfg,
-                        worker_id=index,
-                        max_phone_retries=max_retries,
-                        proxy=proxy,
-                        flow2_region_mode=resolved_region_mode,
-                        last_error=last_error,
-                    )
-                    reason = last_error.get("reason", "")
-                    if ok:
+                    link_attempt = 1
+                    while True:
+                        last_error: dict[str, str] = {}
+                        ok = await pay_one(
+                            item,
+                            card,
+                            phone_pool,
+                            cfg,
+                            worker_id=index,
+                            max_phone_retries=max_retries,
+                            proxy=proxy,
+                            flow2_region_mode=resolved_region_mode,
+                            last_error=last_error,
+                            proxy_attempt=proxy_attempt,
+                        )
+                        reason = last_error.get("reason", "")
+                        if ok:
+                            break
+                        if reason == PAYPAL_FLOW2_NONZERO_AMOUNT:
+                            skipped_nonzero += 1
+                            flow2_discarded = True
+                            async with queue_lock:
+                                active_slots = max(0, active_slots - 1)
+                            break
+                        if _is_recreate_link_reason(reason):
+                            if link_attempt >= PAYPAL_FLOW2_RECREATE_LINK_MAX:
+                                flow2_recreate_link = True
+                                mark_link_for_regeneration(
+                                    item["email"],
+                                    account_line=item.get("account_line", ""),
+                                    reason=reason,
+                                    failed_link_method=item.get("link_method", ""),
+                                )
+                                log(
+                                    f"[paypal-pay-{index:02d}][{item['email']}] "
+                                    + _zh(
+                                        r"\u652f\u4ed8\u957f\u94fe\u63d0\u4ea4 3 \u6b21\u4ecd\u672a\u8df3\u8f6c PayPal\uff0c"
+                                        r"\u5224\u5b9a\u957f\u94fe\u4e0d\u6b63\u786e\uff0c\u5df2\u9000\u56de\u5f85\u751f\u6210\u957f\u94fe\u72b6\u6001"
+                                    )
+                                )
+                                break
+                            link_attempt += 1
+                            log(
+                                f"[paypal-pay-{index:02d}][{item['email']}] "
+                                + _zh(r"\u63d0\u4ea4\u540e 60s \u672a\u8df3\u8f6c PayPal\uff0c\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe\u540e\u91cd\u8bd5 ")
+                                + f"({link_attempt}/{PAYPAL_FLOW2_RECREATE_LINK_MAX})"
+                            )
+                            try:
+                                await regenerate_flow2_payment_link(
+                                    item,
+                                    cfg,
+                                    worker_id=index,
+                                    proxy=proxy,
+                                    flow2_region_mode=resolved_region_mode,
+                                )
+                            except Exception as recreate_exc:  # noqa: BLE001
+                                reason = f"{PAYPAL_FLOW2_RECREATE_LINK}: recreate failed: {recreate_exc}"
+                                log(
+                                    f"[paypal-pay-{index:02d}][{item['email']}] "
+                                    + _zh(r"\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe\u5931\u8d25: ")
+                                    + str(recreate_exc)
+                                )
+                                if link_attempt >= PAYPAL_FLOW2_RECREATE_LINK_MAX:
+                                    flow2_recreate_link = True
+                                    mark_link_for_regeneration(
+                                        item["email"],
+                                        account_line=item.get("account_line", ""),
+                                        reason=reason,
+                                        failed_link_method=item.get("link_method", ""),
+                                    )
+                                    break
+                                if not proxy_pool or proxy_attempt >= len(proxies):
+                                    break
+                                retry_label = f"{proxy_attempt}/{len(proxies)}"
+                                log(
+                                    f"[paypal-pay-{index:02d}][{item['email']}] "
+                                    f"长链重建失败，随机切换代理 ({retry_label}): {_display_proxy(proxy)}"
+                                )
+                                break
+                            continue
+                        if not proxy_pool or proxy_attempt >= len(proxies):
+                            break
+                        if reason == PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT and proxy_attempt >= 4:
+                            log(
+                                f"[paypal-pay-{index:02d}][{item['email']}] "
+                                f"Stripe 60s no PayPal redirect, switched proxy {proxy_attempt - 1}/3 times; stop current link"
+                            )
+                            break
+                        retry_label = f"{proxy_attempt}/3" if reason == PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT else f"{proxy_attempt}/{len(proxies)}"
+                        log(
+                            f"[paypal-pay-{index:02d}][{item['email']}] "
+                            f"流程失败，随机切换代理 ({retry_label}): {_display_proxy(proxy)}"
+                        )
                         break
-                    if reason == PAYPAL_FLOW2_NONZERO_AMOUNT:
-                        skipped_nonzero += 1
-                        flow2_discarded = True
-                        async with queue_lock:
-                            active_slots = max(0, active_slots - 1)
+                    if ok or flow2_discarded or flow2_recreate_link:
                         break
-                    if not proxy_pool or proxy_attempt >= len(proxies) or not _is_proxy_failure(reason):
-                        break
-                    log(
-                        f"[paypal-pay-{index:02d}][{item['email']}] "
-                        f"代理失败，切换下一条代理 ({proxy_attempt}/{len(proxies)}): {_display_proxy(proxy)}"
-                    )
                 if ok and not local_random_mode:
                     card_pool.remove(card)
                 if ok:
@@ -4050,6 +4782,11 @@ async def run_paypal_pay(
                     async with queue_lock:
                         active_slots = max(0, active_slots - 1)
                         failed_slots += 1
+                    if flow2_recreate_link:
+                        log(
+                            f"[paypal-pay-{index:02d}][{item['email']}] "
+                            + _zh(r"\u8bf7\u5148\u91cd\u65b0\u751f\u6210\u8be5\u8d26\u53f7\u957f\u94fe\uff0c\u518d\u7ee7\u7eed\u6d41\u7a0b2")
+                        )
                     return
 
     tasks = [asyncio.create_task(worker(i + 1)) for i in range(max(1, workers))]

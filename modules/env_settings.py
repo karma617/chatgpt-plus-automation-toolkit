@@ -36,6 +36,18 @@ SETTINGS: list[SettingItem] = [
     SettingItem("FREE_MAIL_SOURCE", "Free 邮箱源", "基础设置", "choice", ("moemail", "hotmail", "icloud_query"), help_text="Free 注册专用邮箱源；当前建议使用 moemail。"),
     SettingItem("USE_PROXY", "浏览器代理", "基础设置", "bool", help_text="开启后浏览器会从代理池取代理。"),
     SettingItem("PROXY_FILE", "代理池文件", "基础设置"),
+    SettingItem("FLARESOLVERR_ENABLED", _u(r"FlareSolverr \u5f00\u5173"), _u(r"Cloudflare \u9a8c\u8bc1"), "bool", help_text=_u(r"\u767b\u5f55\u72b6\u6001\u673a\u9047\u5230 Cloudflare managed challenge \u4e14 Playwright \u4f4e\u9891\u70b9\u51fb/\u7b49\u5f85\u65e0\u6cd5\u63a8\u8fdb\u65f6\uff0c\u8c03\u7528 FlareSolverr \u83b7\u53d6\u5e76\u56de\u653e cookie\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_AUTO_START", _u(r"FlareSolverr \u81ea\u52a8\u542f\u52a8"), _u(r"Cloudflare \u9a8c\u8bc1"), "bool", help_text=_u(r"\u4e3b\u9762\u677f\u542f\u52a8\u6216\u4efb\u52a1\u5f00\u59cb\u524d\u81ea\u52a8\u68c0\u67e5\u5e76\u542f\u52a8\u672c\u5730 FlareSolverr\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_URL", _u(r"FlareSolverr \u63a5\u53e3\u5730\u5740"), _u(r"Cloudflare \u9a8c\u8bc1"), help_text=_u(r"\u53ef\u586b http://127.0.0.1:8191 \u6216 http://127.0.0.1:8191/v1\uff0c\u7a0b\u5e8f\u4f1a\u81ea\u52a8\u8865 /v1\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_EXECUTABLE_PATH", _u(r"FlareSolverr \u672c\u5730\u7a0b\u5e8f\u8def\u5f84"), _u(r"Cloudflare \u9a8c\u8bc1"), help_text=_u(r"\u9ed8\u8ba4 tools/flaresolverr/FlareSolverr.exe\uff1b\u4e0d\u5b58\u5728\u65f6\u5c1d\u8bd5 PATH \u91cc\u7684 flaresolverr \u6216 Docker\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_TIMEOUT_SECONDS", _u(r"FlareSolverr \u8d85\u65f6\u79d2\u6570"), _u(r"Cloudflare \u9a8c\u8bc1"), "int", help_text=_u(r"FlareSolverr request.get \u6700\u5927\u7b49\u5f85\u79d2\u6570\uff0c\u9ed8\u8ba4 120\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_WAIT_SECONDS", _u(r"FlareSolverr \u7b49\u5f85\u79d2\u6570"), _u(r"Cloudflare \u9a8c\u8bc1"), "int", help_text=_u(r"FlareSolverr \u6253\u5f00\u76ee\u6807\u9875\u540e\u989d\u5916\u7b49\u5f85\u79d2\u6570\uff0c\u9ed8\u8ba4 8\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_STARTUP_TIMEOUT_SECONDS", _u(r"FlareSolverr \u542f\u52a8\u7b49\u5f85\u79d2\u6570"), _u(r"Cloudflare \u9a8c\u8bc1"), "int", help_text=_u(r"\u81ea\u52a8\u542f\u52a8\u540e\u7b49\u5f85 API ready \u7684\u79d2\u6570\uff0c\u9ed8\u8ba4 45\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_DOCKER_ENABLED", _u(r"FlareSolverr Docker \u515c\u5e95"), _u(r"Cloudflare \u9a8c\u8bc1"), "bool", help_text=_u(r"\u672c\u5730 exe \u4e0d\u5b58\u5728\u6216\u542f\u52a8\u5931\u8d25\u65f6\uff0c\u5c1d\u8bd5 Docker \u542f\u52a8 FlareSolverr\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_DOCKER_IMAGE", _u(r"FlareSolverr Docker \u955c\u50cf"), _u(r"Cloudflare \u9a8c\u8bc1"), help_text=_u(r"\u9ed8\u8ba4 ghcr.io/flaresolverr/flaresolverr:latest\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_DOCKER_NAME", _u(r"FlareSolverr Docker \u5bb9\u5668\u540d"), _u(r"Cloudflare \u9a8c\u8bc1"), help_text=_u(r"\u9ed8\u8ba4 chatgpt-plus-flaresolverr\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_LOG_FILE", _u(r"FlareSolverr \u65e5\u5fd7\u6587\u4ef6"), _u(r"Cloudflare \u9a8c\u8bc1"), help_text=_u(r"\u6258\u7ba1\u672c\u5730 exe \u65f6\u7684\u8f93\u51fa\u65e5\u5fd7\uff0c\u9ed8\u8ba4 logs/flaresolverr.log\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
+    SettingItem("FLARESOLVERR_LOG_LEVEL", _u(r"FlareSolverr \u65e5\u5fd7\u7ea7\u522b"), _u(r"Cloudflare \u9a8c\u8bc1"), help_text=_u(r"\u4f20\u7ed9 FlareSolverr \u7684 LOG_LEVEL\uff0c\u9ed8\u8ba4 info\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
     SettingItem("MOEMAIL_BASE_URL", "MoeMail 地址", "邮箱设置"),
     SettingItem("MOEMAIL_API_KEY", "MoeMail API Key", "邮箱设置", masked=True),
     SettingItem("MOEMAIL_DOMAIN_WHITELIST", "MoeMail 域名", "邮箱设置"),
@@ -181,6 +193,28 @@ SETTINGS = [
     _with_choices(item, SMS_PROVIDER_CHOICES) if item.key in _SMS_PROVIDER_SETTING_KEYS else item
     for item in SETTINGS
 ]
+
+SETTINGS.extend(
+    [
+        SettingItem("PAYPAL_CHECKOUT_METHOD", _u(r"PayPal \u957f\u94fe\u751f\u6210\u65b9\u5f0f"), "PayPal Plus", "choice", (_u(r"\u81ea\u52a8\u515c\u5e95"), _u(r"\u5c0f\u9e21\u6bdb\u306e\u516c\u76ca\u4e91\u7aef"), _u(r"\u5c0f\u9e21\u6bdb\u306e\u516c\u76ca\u672c\u5730\u670d\u52a1"), _u(r"\u672c\u5730 hosted-url-helper"), _u(r"\u672c\u5730\u652f\u4ed8\u957f\u94fe\u751f\u6210\u5668"), _u(r"\u672c\u9879\u76ee\u6700\u521d\u7684\u751f\u6210\u5668")), help_text=_u(r"\u9009\u62e9\u7528\u54ea\u79cd\u957f\u94fe\u751f\u6210\u65b9\u5f0f\uff1b\u4ee3\u7801\u540c\u65f6\u517c\u5bb9 auto/external_api/local_service/hosted_url_helper/local_generator/browser_checkout \u65e7\u503c\u3002"), section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_FALLBACK_API_URL", _u(r"PayPal \u957f\u94fe\u63a5\u5916\u90e8\u4f18\u5148 API"), "PayPal Plus", help_text=_u(r"\u9ed8\u8ba4\u7559\u7a7a\u65f6\u4f7f\u7528 https://payurl.ark2.cn/api/checkout\u3002\u586b off \u6216 disabled \u53ef\u7981\u7528\uff1b\u4f18\u5148\u6309\u4f5c\u8005\u63d2\u4ef6\u534f\u8bae\u53d1\u9001 X-API-Key \u548c accessToken/paymentMethod/country/currency/requestId\uff0c\u540c\u65f6\u4fdd\u7559\u6293\u5305\u5b57\u6bb5\u517c\u5bb9\u3002\u5931\u8d25\u540e\u5148\u8d70\u672c\u5730\u540e\u7aef\u670d\u52a1\u7b97\u6cd5\uff08\u4efb\u52a1\u4ee3\u7406\u8bf7\u6c42\uff09\uff0c\u518d\u56de\u9000\u5185\u7f6e\u65b9\u5f0f\u3002"), section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_FALLBACK_API_KEY", _u(r"PayPal \u957f\u94fe\u5916\u90e8 API Key"), "PayPal Plus", masked=True, help_text=_u(r"\u4f5c\u8005\u4e91\u7aef\u957f\u94fe API Key\uff0c\u8bf7\u6c42\u65f6\u4f7f\u7528 X-API-Key \u53d1\u9001\uff0c\u5e76\u517c\u5bb9 Authorization: Bearer\u3002"), section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_FALLBACK_TIMEOUT", _u(r"PayPal \u957f\u94fe\u5916\u90e8\u8d85\u65f6"), "PayPal Plus", "int", section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_FALLBACK_PROXY", _u(r"PayPal \u957f\u94fe\u5916\u90e8\u4ee3\u7406"), "PayPal Plus", section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_FALLBACK_DEFAULT_PROXY_ID", _u(r"PayPal \u957f\u94fe\u5916\u90e8\u9ed8\u8ba4\u7ebf\u8def"), "PayPal Plus", section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_FALLBACK_STRIPE_PROXY_ID", _u(r"PayPal \u957f\u94fe Stripe \u7ebf\u8def"), "PayPal Plus", section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_FALLBACK_STRIPE_PROXY", _u(r"PayPal \u957f\u94fe Stripe \u4ee3\u7406"), "PayPal Plus", section="PayPal Plus"),
+        SettingItem("PAYPAL_USE_LONG_LINK", _u(r"PayPal \u65e5\u533a\u65e0\u5361\u4f7f\u7528\u957f\u94fe"), "PayPal Plus", "bool", help_text=_u(r"true=\u539f\u6d41\u7a0b\u4f7f\u7528\u957f\u94fe\uff1bfalse=\u6d41\u7a0b2 \u76f4\u63a5\u767b\u5f55\u5df2\u6ce8\u518c\u8d26\u53f7\uff0c\u70b9\u51fb ChatGPT \u9886\u53d6\u4f18\u60e0/\u5347\u7ea7\u5165\u53e3\u540e\u63a5\u7ba1\u652f\u4ed8\u9875\u3002"), section="PayPal Plus"),
+        SettingItem("PAYPAL_CLICK_WATCHER_ENABLED", _u(r"PayPal \u70b9\u51fb Watcher"), "PayPal Plus", "bool", help_text=_u(r"\u5f00\u542f\u540e\u8bb0\u5f55\u6d41\u7a0b2 \u6d4f\u89c8\u5668\u91cc\u7684\u70b9\u51fb\u5143\u7d20\uff0c\u4fdd\u5b58\u5230 output/paypal\u6ce8\u518c/debug/click_watcher/*.jsonl\uff0c\u4fbf\u4e8e\u624b\u52a8\u8dd1\u4e00\u6b21\u540e\u8865\u81ea\u52a8\u5316 selector\u3002"), section="PayPal Plus"),
+        SettingItem("PAYPAL_DIRECT_CHECKOUT_START_URL", _u(r"PayPal \u76f4\u63a5\u652f\u4ed8\u8d77\u59cb\u9875"), "PayPal Plus", help_text=_u(r"PAYPAL_USE_LONG_LINK=false \u65f6\u751f\u6548\u3002\u767b\u5f55 ChatGPT \u540e\u4f1a\u6253\u5f00\u8fd9\u4e2a\u9875\u9762\u5e76\u5bfb\u627e\u9886\u53d6\u4f18\u60e0/\u5347\u7ea7/Plus \u5165\u53e3\uff1b\u9ed8\u8ba4 https://chatgpt.com/\u3002"), section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_LOCAL_GENERATOR_LINK_TYPE", _u(r"\u672c\u5730\u751f\u6210\u5668\u94fe\u63a5\u7c7b\u578b"), "PayPal Plus", "choice", ("auto", "hosted", "paypal", "gopay"), help_text=_u(r"\u672c\u5730\u652f\u4ed8\u957f\u94fe\u751f\u6210\u5668\u4f7f\u7528\u3002auto \u65f6\u65e5\u533a\u9ed8\u8ba4 paypal\uff0c\u7f8e\u533a\u9ed8\u8ba4 hosted\u3002"), section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_LOCAL_GENERATOR_PAYMENT_LOCALE", _u(r"\u672c\u5730\u751f\u6210\u5668\u652f\u4ed8\u9875\u8bed\u8a00"), "PayPal Plus", section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_LOCAL_GENERATOR_STRIPE_PK", _u(r"\u672c\u5730\u751f\u6210\u5668 Stripe PK"), "PayPal Plus", section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_LOCAL_GENERATOR_USER_AGENT", _u(r"\u672c\u5730\u751f\u6210\u5668 User-Agent"), "PayPal Plus", section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_LOCAL_GENERATOR_UI_MODE", _u(r"\u672c\u5730\u751f\u6210\u5668 UI \u6a21\u5f0f"), "PayPal Plus", section="PayPal Plus"),
+        SettingItem("PAYPAL_CHECKOUT_HOSTED_HELPER_LOCALE", _u(r"Hosted Helper \u652f\u4ed8\u9875\u8bed\u8a00"), "PayPal Plus", help_text=_u(r"\u79fb\u690d hosted-url-helper \u6269\u5c55\u7684\u751f\u6210\u7b97\u6cd5\u65f6\u4f7f\u7528\uff0c\u9ed8\u8ba4 zh\uff0c\u53ef\u586b en/zh/ja\u3002"), section="PayPal Plus"),
+    ]
+)
 
 _SMS_SETTINGS_GROUP = _u(r"\u6d41\u7a0b\u4e00/\u4e09/Free \u63a5\u7801")
 _SMS_SETTINGS_SECTION = _u(r"\u624b\u673a\u53f7\u63a5\u7801")

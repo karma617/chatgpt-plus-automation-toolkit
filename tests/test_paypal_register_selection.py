@@ -1,7 +1,8 @@
 import asyncio
 
-from modules import paypal_register
+from modules import checkout, paypal_register
 from modules import paypal_flow_state
+from modules import proxy_pool as proxy_pool_module
 from modules.paypal_register import filter_accounts_by_email
 from modules.storage import MailAccount
 
@@ -103,6 +104,24 @@ def test_save_to_link_pool_keeps_full_mail_account_line(monkeypatch, tmp_path) -
     assert state["user@hotmail.com"]["status"] == paypal_flow_state.STATUS_LINK_READY
 
 
+def test_save_to_link_pool_records_checkout_method(monkeypatch, tmp_path) -> None:
+    state_file, _discard_file = _isolate_flow_state(monkeypatch, tmp_path)
+    link_file = tmp_path / "account.txt"
+    monkeypatch.setattr(paypal_register, "LINK_POOL_DIR", tmp_path)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_FILE", link_file)
+
+    paypal_register.save_to_link_pool(
+        "user@hotmail.com",
+        "user@hotmail.com",
+        "https://pay.example/checkout",
+        account_line="user@hotmail.com----pw----client----rt",
+        link_method=checkout.CHECKOUT_METHOD_LOCAL_SERVICE,
+    )
+
+    state = paypal_flow_state.load_state(state_file)
+    assert state["user@hotmail.com"]["link_method"] == checkout.CHECKOUT_METHOD_LOCAL_SERVICE
+
+
 def test_flow1_reuses_existing_unfinished_link_instead_of_failing(monkeypatch, tmp_path) -> None:
     _isolate_flow_state(monkeypatch, tmp_path)
     register_only_file = tmp_path / "registered_sessions.txt"
@@ -127,6 +146,261 @@ def test_flow1_reuses_existing_unfinished_link_instead_of_failing(monkeypatch, t
     )
 
     assert result == 1
+
+
+def test_flow1_logs_in_registered_account_instead_of_registering_again(monkeypatch, tmp_path) -> None:
+    _isolate_flow_state(monkeypatch, tmp_path)
+    register_only_file = tmp_path / "registered_sessions.txt"
+    link_file = tmp_path / "account.txt"
+    pending_file = tmp_path / "pending.txt"
+    register_only_file.write_text("first@hotmail.com----pw----client----rt\n", encoding="utf-8")
+    monkeypatch.setattr(paypal_register, "REGISTER_ONLY_SUMMARY_FILE", register_only_file)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_DIR", tmp_path)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_FILE", link_file)
+    monkeypatch.setattr(paypal_register, "PAYPAL_PENDING_AUTH_FILE", pending_file)
+    monkeypatch.setattr(paypal_register, "load_env", lambda path: {})
+    calls = []
+
+    async def fake_login(account, mail_source, cfg, **kwargs):
+        calls.append((account.email, mail_source, kwargs))
+        return "https://pay.example/checkout"
+
+    async def fail_register_again(*args, **kwargs):
+        raise AssertionError("registered_sessions accounts must not run signup again")
+
+    monkeypatch.setattr(paypal_register, "login_existing_account_for_checkout", fake_login)
+    monkeypatch.setattr(paypal_register, "register_one", fail_register_again)
+
+    result = asyncio.run(
+        paypal_register.run_paypal_register(
+            {"mail": {"active_source": "hotmail"}, "browser": {"headless": True}},
+            count=1,
+            workers=1,
+        )
+    )
+
+    assert result == 1
+    assert len(calls) == 1
+    email, mail_source, kwargs = calls[0]
+    assert (email, mail_source) == ("first@hotmail.com", "hotmail")
+    assert kwargs["worker_id"] == 1
+    assert kwargs["proxy"] == "http://127.0.0.1:7897"
+    assert kwargs["checkout_region"] == "us"
+    assert "last_error" in kwargs
+    assert link_file.read_text(encoding="utf-8") == (
+        "first@hotmail.com----pw----client----rt----https://pay.example/checkout\n"
+    )
+
+
+def test_flow1_proxy_precheck_skips_bad_proxy_and_uses_next(monkeypatch, tmp_path) -> None:
+    _isolate_flow_state(monkeypatch, tmp_path)
+    register_only_file = tmp_path / "registered_sessions.txt"
+    link_file = tmp_path / "account.txt"
+    pending_file = tmp_path / "pending.txt"
+    proxy_file = tmp_path / "proxies.txt"
+    register_only_file.write_text("first@hotmail.com----pw----client----rt\n", encoding="utf-8")
+    proxy_file.write_text("http://bad.proxy:1080\nhttp://good.proxy:1080\n", encoding="utf-8")
+    monkeypatch.setattr(paypal_register, "REGISTER_ONLY_SUMMARY_FILE", register_only_file)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_DIR", tmp_path)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_FILE", link_file)
+    monkeypatch.setattr(paypal_register, "PAYPAL_PENDING_AUTH_FILE", pending_file)
+    monkeypatch.setattr(
+        paypal_register,
+        "load_env",
+        lambda path: {
+            "PAYPAL_REGISTER_USE_PROXY": "true",
+            "PAYPAL_REGISTER_PROXY_FILE": str(proxy_file),
+        },
+    )
+    used_proxies: list[str | None] = []
+
+    def fake_probe(proxy, timeout_sec=12):
+        return (proxy == "http://good.proxy:1080", "bad proxy")
+
+    async def fake_login(account, mail_source, cfg, **kwargs):
+        used_proxies.append(kwargs.get("proxy"))
+        return "https://pay.example/checkout"
+
+    monkeypatch.setattr(paypal_register, "_probe_proxy", fake_probe)
+    monkeypatch.setattr(paypal_register, "login_existing_account_for_checkout", fake_login)
+
+    result = asyncio.run(
+        paypal_register.run_paypal_register(
+            {"mail": {"active_source": "hotmail"}, "browser": {"headless": True}},
+            count=1,
+            workers=1,
+        )
+    )
+
+    assert result == 1
+    assert used_proxies == ["http://good.proxy:1080"]
+
+
+def test_flow1_binds_random_proxy_and_rebinds_after_flow_error(monkeypatch, tmp_path) -> None:
+    _isolate_flow_state(monkeypatch, tmp_path)
+    register_only_file = tmp_path / "registered_sessions.txt"
+    link_file = tmp_path / "account.txt"
+    pending_file = tmp_path / "pending.txt"
+    proxy_file = tmp_path / "proxies.txt"
+    register_only_file.write_text("first@hotmail.com----pw----client----rt\n", encoding="utf-8")
+    proxy_file.write_text(
+        "http://good-proxy.example.test:1080\nhttp://bad-proxy.example.test:1080\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(paypal_register, "REGISTER_ONLY_SUMMARY_FILE", register_only_file)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_DIR", tmp_path)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_FILE", link_file)
+    monkeypatch.setattr(paypal_register, "PAYPAL_PENDING_AUTH_FILE", pending_file)
+    monkeypatch.setattr(
+        paypal_register,
+        "load_env",
+        lambda path: {
+            "PAYPAL_REGISTER_USE_PROXY": "true",
+            "PAYPAL_REGISTER_PROXY_FILE": str(proxy_file),
+        },
+    )
+    attempts: list[str | None] = []
+    shuffled: list[list[str]] = []
+
+    def fake_shuffle(values):
+        values.reverse()
+        shuffled.append(values[:])
+
+    async def fake_login(account, mail_source, cfg, **kwargs):
+        proxy = kwargs.get("proxy")
+        attempts.append(proxy)
+        if proxy and "bad-proxy" in proxy:
+            kwargs["last_error"]["reason"] = "flow failed before checkout"
+            return None
+        return "https://pay.example/checkout"
+
+    monkeypatch.setattr(paypal_register, "_probe_proxy", lambda proxy, timeout_sec=12: (True, "ok"))
+    monkeypatch.setattr(proxy_pool_module.random, "shuffle", fake_shuffle)
+    monkeypatch.setattr(paypal_register, "login_existing_account_for_checkout", fake_login)
+
+    result = asyncio.run(
+        paypal_register.run_paypal_register(
+            {"mail": {"active_source": "hotmail"}, "browser": {"headless": True}},
+            count=1,
+            workers=1,
+        )
+    )
+
+    assert result == 1
+    assert shuffled == [
+        [
+            "http://bad-proxy.example.test:1080",
+            "http://good-proxy.example.test:1080",
+        ]
+    ]
+    assert attempts == [
+        "http://bad-proxy.example.test:1080",
+        "http://good-proxy.example.test:1080",
+    ]
+
+
+def test_flow1_discards_account_after_three_mail_code_timeouts(monkeypatch, tmp_path) -> None:
+    state_file, discard_file = _isolate_flow_state(monkeypatch, tmp_path)
+    register_only_file = tmp_path / "registered_sessions.txt"
+    link_file = tmp_path / "account.txt"
+    pending_file = tmp_path / "pending.txt"
+    account_line = "timeout@hotmail.com----pw----client----rt"
+    register_only_file.write_text(account_line + "\n", encoding="utf-8")
+    monkeypatch.setattr(paypal_register, "REGISTER_ONLY_SUMMARY_FILE", register_only_file)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_DIR", tmp_path)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_FILE", link_file)
+    monkeypatch.setattr(paypal_register, "PAYPAL_PENDING_AUTH_FILE", pending_file)
+    monkeypatch.setattr(paypal_register, "load_env", lambda path: {})
+    monkeypatch.setattr(paypal_register, "paypal_register_local_proxy_url", lambda env: "")
+    attempts: list[str | None] = []
+
+    async def fake_login(account, mail_source, cfg, **kwargs):
+        attempts.append(kwargs.get("proxy"))
+        kwargs["last_error"]["kind"] = "mail_code_timeout"
+        kwargs["last_error"]["reason"] = "MAIL_CODE_TIMEOUT: no new verification code"
+        return None
+
+    monkeypatch.setattr(paypal_register, "login_existing_account_for_checkout", fake_login)
+
+    result = asyncio.run(
+        paypal_register.run_paypal_register(
+            {"mail": {"active_source": "hotmail"}, "browser": {"headless": True}},
+            count=1,
+            workers=1,
+        )
+    )
+
+    assert result == 0
+    assert attempts == [None, None, None]
+    state = paypal_flow_state.load_state(state_file)
+    assert state["timeout@hotmail.com"]["status"] == paypal_flow_state.STATUS_DISCARDED
+    assert "mail_code_timeout_after_3_attempts" in state["timeout@hotmail.com"]["reason"]
+    assert "timeout@hotmail.com" in discard_file.read_text(encoding="utf-8")
+
+
+def test_flow1_jp_forces_japan_proxy_and_skips_bad_checkout_methods(monkeypatch, tmp_path) -> None:
+    state_file, _discard_file = _isolate_flow_state(monkeypatch, tmp_path)
+    register_only_file = tmp_path / "registered_sessions.txt"
+    link_file = tmp_path / "account.txt"
+    pending_file = tmp_path / "pending.txt"
+    proxy_file = tmp_path / "proxies_jp.txt"
+    account_line = "jp@example.com----pw----client----rt"
+    bad_proxy = "http://bad-us-proxy.example.test:1080"
+    good_proxy = "http://good-jp-proxy.example.test:1080"
+    register_only_file.write_text(account_line + "\n", encoding="utf-8")
+    proxy_file.write_text(f"{bad_proxy}\n{good_proxy}\n", encoding="utf-8")
+    monkeypatch.setattr(paypal_register, "REGISTER_ONLY_SUMMARY_FILE", register_only_file)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_DIR", tmp_path)
+    monkeypatch.setattr(paypal_register, "LINK_POOL_FILE", link_file)
+    monkeypatch.setattr(paypal_register, "PAYPAL_PENDING_AUTH_FILE", pending_file)
+    monkeypatch.setattr(
+        paypal_register,
+        "load_env",
+        lambda path: {
+            "PAYPAL_REGISTER_USE_PROXY": "false",
+            "PAYPAL_PROXY_FILE_JP": str(proxy_file),
+        },
+    )
+    paypal_flow_state.mark_needs_link(
+        "jp@example.com",
+        account_line=account_line,
+        reason="previous bad link",
+        failed_link_method=checkout.CHECKOUT_METHOD_EXTERNAL_API,
+    )
+    checks: list[tuple[str, str]] = []
+    calls = []
+
+    def fake_probe_country(proxy, required_country_code, timeout_sec=12):
+        checks.append((proxy, required_country_code))
+        return (proxy == good_proxy, "country=JP" if proxy == good_proxy else "country mismatch: got=US required=JP")
+
+    async def fake_login(account, mail_source, cfg, **kwargs):
+        calls.append(kwargs)
+        kwargs["checkout_method_sink"]["method"] = checkout.CHECKOUT_METHOD_LOCAL_SERVICE
+        return "https://pay.example/checkout"
+
+    monkeypatch.setattr(paypal_register, "_probe_proxy_country", fake_probe_country)
+    monkeypatch.setattr(paypal_register, "login_existing_account_for_checkout", fake_login)
+
+    result = asyncio.run(
+        paypal_register.run_paypal_register(
+            {"mail": {"active_source": "hotmail"}, "browser": {"headless": True}},
+            count=1,
+            workers=1,
+            checkout_region="jp",
+        )
+    )
+
+    assert result == 1
+    assert checks == [(bad_proxy, "JP"), (good_proxy, "JP")]
+    assert len(calls) == 1
+    assert calls[0]["proxy"] == good_proxy
+    assert calls[0]["checkout_region"] == "jp"
+    assert calls[0]["checkout_skip_methods"] == {checkout.CHECKOUT_METHOD_EXTERNAL_API}
+    state = paypal_flow_state.load_state(state_file)
+    assert state["jp@example.com"]["status"] == paypal_flow_state.STATUS_LINK_READY
+    assert state["jp@example.com"]["link_method"] == checkout.CHECKOUT_METHOD_LOCAL_SERVICE
+    assert state["jp@example.com"]["bad_link_methods"] == [checkout.CHECKOUT_METHOD_EXTERNAL_API]
 
 
 def test_sync_from_registered_file_reopens_non_manual_discarded_accounts(monkeypatch, tmp_path) -> None:

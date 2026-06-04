@@ -9,7 +9,13 @@ from typing import Any
 
 from .storage import MailAccount
 from .utils import load_config, load_env, log, resolve_path
-from .paypal_register import run_paypal_register, LINK_POOL_FILE, register_one
+from .paypal_register import (
+    LINK_POOL_FILE,
+    _display_proxy,
+    _proxy_attempts,
+    login_existing_account_for_checkout,
+    run_paypal_register,
+)
 from .paypal_pay import load_link_pool, run_paypal_pay, PENDING_AUTH_FILE, PAYPAL_OUTPUT_ROOT, is_local_random_card_mode
 from .paypal_card_pool import CardPool
 from .paypal_card_redeem import ensure_card_supply
@@ -20,6 +26,10 @@ from .storage import parse_mail_line
 
 PAYPAL_SESSIOND_DIR = PAYPAL_OUTPUT_ROOT / "sessiond"
 PAYPAL_SESSION_CACHE_FILE = PAYPAL_SESSIOND_DIR / "session_cache.jsonl"
+
+
+def _u(text: str) -> str:
+    return text.encode("ascii").decode("unicode_escape")
 
 
 def _active_mail_source(cfg: dict[str, Any]) -> str:
@@ -75,6 +85,7 @@ async def _hydrate_session_via_flow1_login(
     index: int,
     total: int,
     proxy: str | None = None,
+    last_error: dict[str, str] | None = None,
 ) -> bool:
     email = str(record.get("account") or "").strip()
     prefix = f"[paypal-sessiond-{index:02d}][{email}]"
@@ -84,7 +95,7 @@ async def _hydrate_session_via_flow1_login(
         log(f"{prefix} 开始补录 session ({index}/{total})")
         if proxy:
             log(f"{prefix} 使用流程1代理补录 session")
-        link = await register_one(
+        link = await login_existing_account_for_checkout(
             account,
             mail_source,
             cfg,
@@ -93,9 +104,14 @@ async def _hydrate_session_via_flow1_login(
             create_payment_link=False,
             session_cache_path=cache_path,
             session_source="paypal_flow3_flow1_login_bootstrap",
+            last_error=last_error,
         )
+        if link is None and last_error is not None and not last_error.get("reason"):
+            last_error["reason"] = "session bootstrap returned no result"
         return link is not None
     except Exception as exc:  # noqa: BLE001
+        if last_error is not None:
+            last_error["reason"] = str(exc)
         log(f"{prefix} session 补录失败: {exc}")
         return False
 
@@ -305,12 +321,15 @@ def interactive_paypal(config_path: str = "config.yaml", cfg: dict[str, Any] | N
 
             # 流程1：生成长链接
             reg_success = asyncio.run(run_paypal_register(cfg, count=count, workers=workers_reg))
+            if reg_success <= 0:
+                ui_error(_u(r"\u6d41\u7a0b1\u672a\u751f\u6210\u672c\u8f6e\u957f\u94fe\u63a5\uff0c\u5168\u81ea\u52a8\u5df2\u505c\u6b62"))
+                continue
 
             # 刷新资源计数
             link_count_after = len(load_link_pool())
             pending_after = _count_authorizable_pending(str(PENDING_AUTH_FILE), str(PAYPAL_OUTPUT_ROOT / "授权成功"))
             phone_count_after = PhonePool(phones_file, max_uses=int(env.get("PAYPAL_PHONE_MAX_USES") or 5)).count()
-            if reg_success <= 0 and link_count_after <= 0 and pending_after <= 0:
+            if link_count_after <= 0:
                 ui_error("流程1后长链接池仍为空，全自动已停止")
                 continue
 
@@ -335,13 +354,16 @@ def interactive_paypal(config_path: str = "config.yaml", cfg: dict[str, Any] | N
                 pay_success = asyncio.run(
                     run_paypal_pay(cfg, count=pay_target, workers=max(1, pay_workers), card_source_mode=pay_mode)
                 )
+            else:
+                ui_error(_u(r"\u6d41\u7a0b2\u524d\u957f\u94fe\u63a5\u6c60\u4e3a\u7a7a\uff0c\u5168\u81ea\u52a8\u5df2\u505c\u6b62"))
+                continue
+
+            if pay_success <= 0:
+                ui_error(_u(r"\u6d41\u7a0b2\u672c\u8f6e\u672a\u4ea7\u751f\u5f85\u6388\u6743\u8d26\u53f7\uff0c\u5168\u81ea\u52a8\u5df2\u505c\u6b62"))
+                continue
 
             # 流程3：授权落盘
             pending_after = _count_authorizable_pending(str(PENDING_AUTH_FILE), str(PAYPAL_OUTPUT_ROOT / "授权成功"))
-            if pay_success <= 0 and pending_after <= 0:
-                ui_error("流程2未产生待授权账号，全自动已停止")
-                continue
-
             if pending_after <= 0:
                 ui_error("流程2后待授权池为空，全自动已停止")
                 continue
@@ -423,18 +445,38 @@ def _run_paypal_session_export(cfg: dict[str, Any] | None = None) -> int:
         lookup = _build_account_lookup(cfg)
         hydrated = 0
         for idx, record in enumerate(missing, 1):
-            proxy = proxy_pool.pick(idx) if proxy_pool else fallback_proxy or None
-            ok = asyncio.run(
-                _hydrate_session_via_flow1_login(
-                    record,
-                    cfg=cfg,
-                    cache_path=str(cache_path),
-                    lookup=lookup,
-                    index=idx,
-                    total=len(missing),
-                    proxy=proxy,
+            proxies = _proxy_attempts(proxy_pool, fallback_proxy)
+            ok = False
+            email = str(record.get("account") or "").strip()
+            for proxy_attempt, proxy in enumerate(proxies, start=1):
+                last_error: dict[str, str] = {}
+                if proxy:
+                    log(
+                        f"[paypal-sessiond-{idx:02d}][{email}] "
+                        f"bind proxy ({proxy_attempt}/{len(proxies)}): {_display_proxy(proxy)}"
+                    )
+                ok = asyncio.run(
+                    _hydrate_session_via_flow1_login(
+                        record,
+                        cfg=cfg,
+                        cache_path=str(cache_path),
+                        lookup=lookup,
+                        index=idx,
+                        total=len(missing),
+                        proxy=proxy,
+                        last_error=last_error,
+                    )
                 )
-            )
+                if ok:
+                    break
+                reason = last_error.get("reason") or "session hydrate returned false"
+                if not proxy_pool or proxy_attempt >= len(proxies):
+                    break
+                log(
+                    f"[paypal-sessiond-{idx:02d}][{email}] "
+                    f"session hydrate failed, rebind random proxy ({proxy_attempt}/{len(proxies)}): "
+                    f"{reason[:500]}"
+                )
             if not ok:
                 continue
             hydrated += 1

@@ -2,12 +2,37 @@
 
 import asyncio
 import contextlib
+import hashlib
+import json
+import platform
+import random
+import secrets
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from .utils import resolve_path
+
+
+_WINDOWS_VIEWPORTS = [
+    {"width": 1366, "height": 768},
+    {"width": 1440, "height": 900},
+    {"width": 1536, "height": 864},
+    {"width": 1600, "height": 900},
+    {"width": 1680, "height": 1050},
+    {"width": 1920, "height": 1080},
+]
+_US_TIMEZONES = [
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Phoenix",
+]
+_JP_TIMEZONES = ["Asia/Tokyo"]
+_DEFAULT_TIMEZONES = ["Asia/Shanghai", "Asia/Tokyo", "America/Los_Angeles"]
 
 
 def _normalize_proxy_raw(raw: str) -> str:
@@ -258,6 +283,92 @@ async def prepare_proxy_for_playwright(value: str | None) -> tuple[dict[str, str
     return proxy, None
 
 
+def _is_truthy(value: str | None, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _region_hint_from_proxy(proxy: str | None) -> str:
+    text = (proxy or "").lower()
+    if any(key in text for key in ("japan", ".jp", "tokyo", "osaka", "jp-")):
+        return "jp"
+    if any(key in text for key in ("us", "usa", "america", "losangeles", "newyork")):
+        return "us"
+    return ""
+
+
+def _actual_chrome_major() -> int:
+    # Keep the UA close to the bundled browser instead of hard-coding stale versions.
+    try:
+        from playwright._repo_version import version as playwright_version  # type: ignore
+
+        major = int(str(playwright_version).split(".", 1)[0])
+        if 100 <= major <= 160:
+            return major
+    except Exception:
+        pass
+    return 126
+
+
+def _build_fingerprint(seed: str | None, proxy: str | None) -> dict[str, object]:
+    randomize = _is_truthy(__import__("os").environ.get("BROWSER_RANDOM_FINGERPRINT"), True)
+    base = f"{seed or ''}|{proxy or ''}|{secrets.token_hex(8) if randomize else 'stable'}|{time.time_ns() if randomize else ''}"
+    digest = hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
+    rng = random.Random(int(digest[:16], 16))
+    viewport = dict(rng.choice(_WINDOWS_VIEWPORTS))
+    major = max(100, _actual_chrome_major() + rng.choice([-1, 0, 0, 1]))
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+    region = _region_hint_from_proxy(proxy)
+    if region == "jp":
+        timezone_id = rng.choice(_JP_TIMEZONES)
+        locale = "ja-JP"
+    elif region == "us":
+        timezone_id = rng.choice(_US_TIMEZONES)
+        locale = "en-US"
+    else:
+        timezone_id = rng.choice(_DEFAULT_TIMEZONES)
+        locale = rng.choice(["en-US", "ja-JP", "zh-CN"])
+    return {
+        "user_agent": user_agent,
+        "viewport": viewport,
+        "screen": dict(viewport),
+        "locale": locale,
+        "timezone_id": timezone_id,
+        "device_scale_factor": rng.choice([1, 1, 1.25, 1.5]),
+        "hardware_concurrency": rng.choice([4, 6, 8, 12, 16]),
+        "device_memory": rng.choice([4, 8, 8, 16]),
+        "platform": "Win32" if platform.system().lower() == "windows" else "Linux x86_64",
+    }
+
+
+async def _apply_context_fingerprint(context: BrowserContext, fingerprint: dict[str, object]) -> None:
+    payload = json.dumps(fingerprint, ensure_ascii=True)
+    script = """
+    (() => {
+        const fp = __FINGERPRINT_JSON__;
+        const define = (obj, key, value) => {
+            try { Object.defineProperty(obj, key, { get: () => value, configurable: true }); } catch {}
+        };
+        define(navigator, 'webdriver', undefined);
+        define(navigator, 'platform', fp.platform || 'Win32');
+        define(navigator, 'hardwareConcurrency', fp.hardware_concurrency || 8);
+        define(navigator, 'deviceMemory', fp.device_memory || 8);
+        define(navigator, 'languages', [fp.locale || 'en-US', 'en']);
+        const screen = fp.screen || fp.viewport || { width: 1366, height: 768 };
+        define(window.screen, 'width', screen.width || 1366);
+        define(window.screen, 'height', screen.height || 768);
+        define(window.screen, 'availWidth', screen.width || 1366);
+        define(window.screen, 'availHeight', Math.max(1, (screen.height || 768) - 40));
+        window.chrome = window.chrome || { runtime: {} };
+    })();
+    """.replace("__FINGERPRINT_JSON__", payload)
+    await context.add_init_script(script=script)
+
+
 class BrowserSession:
     def __init__(
         self,
@@ -267,6 +378,7 @@ class BrowserSession:
         timeout_ms: int,
         proxy: str | None = None,
         isolated: bool = False,
+        fingerprint_seed: str | None = None,
         **kwargs,
     ):
         self.profile_dir = resolve_path(profile_dir)
@@ -275,6 +387,8 @@ class BrowserSession:
         self.timeout_ms = timeout_ms
         self.proxy = proxy
         self.isolated = isolated
+        self.fingerprint_seed = fingerprint_seed
+        self.fingerprint = _build_fingerprint(fingerprint_seed, proxy)
         self._playwright = None
         self._browser: Browser | None = None
         self._proxy_bridge: Socks5AuthProxyBridge | None = None
@@ -300,22 +414,35 @@ class BrowserSession:
                     args=launch_args,
                     proxy=proxy,
                 )
-                self.context = await self._browser.new_context(viewport={"width": 1365, "height": 900})
+                self.context = await self._browser.new_context(**self._context_options())
             else:
                 self.context = await self._playwright.chromium.launch_persistent_context(
                     user_data_dir=str(self.profile_dir),
                     headless=self.headless,
                     slow_mo=self.slow_mo,
-                    viewport={"width": 1365, "height": 900},
                     args=launch_args,
                     proxy=proxy,
+                    **self._context_options(),
                 )
         except Exception:
             await self.__aexit__(None, None, None)
             raise
         self.context.set_default_timeout(self.timeout_ms)
+        await _apply_context_fingerprint(self.context, self.fingerprint)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         return self
+
+    def _context_options(self) -> dict[str, object]:
+        return {
+            "viewport": self.fingerprint["viewport"],
+            "screen": self.fingerprint["screen"],
+            "user_agent": self.fingerprint["user_agent"],
+            "locale": self.fingerprint["locale"],
+            "timezone_id": self.fingerprint["timezone_id"],
+            "device_scale_factor": self.fingerprint["device_scale_factor"],
+            "is_mobile": False,
+            "has_touch": False,
+        }
 
     async def current_page(self) -> Page:
         if not self.context:

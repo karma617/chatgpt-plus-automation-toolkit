@@ -37,6 +37,15 @@ FREE_CPA_DIR = "cpa号池"
 _ACCOUNT_WRITE_LOCK = asyncio.Lock()
 
 
+def _pick_task_proxy(proxy_pool: ProxyPool | None, fallback_proxy: str | None = "", seed: int = 1) -> str | None:
+    if proxy_pool:
+        values = proxy_pool.random_sequence()
+        if values:
+            return values[0]
+        return proxy_pool.pick(seed)
+    return fallback_proxy or None
+
+
 @dataclass(frozen=True)
 class FreeOutputPaths:
     root: Path
@@ -367,7 +376,7 @@ async def run_free_register_once(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=account.email,
+        fingerprint_seed=f"{account.email}|free-phone|{proxy or ''}|{time.time_ns()}",
     )
     success = False
     try:
@@ -648,7 +657,7 @@ async def run_free_register_once_email(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=account.email,
+        fingerprint_seed=f"{account.email}|free-email|{proxy or ''}|{time.time_ns()}",
     )
     success = False
     try:
@@ -885,7 +894,7 @@ async def run_free_register_many(cfg: dict[str, Any], *, count: int, workers: in
                 attempt_no = attempts
             log(f"[free-{worker_id:02d}] 开始第 {attempt_no}/{max_attempts} 次尝试，目标成功 {success}/{count}")
             # 每次尝试都轮换代理，避免同一 worker 被单个代理绑死
-            proxy = proxy_pool.pick(attempt_no) if proxy_pool else fallback_proxy or None
+            proxy = _pick_task_proxy(proxy_pool, fallback_proxy, seed=attempt_no)
             worker_sms_selection = {**sms_selection} if sms_selection else None
             if register_mode == "email":
                 ok = await run_free_register_once_email(cfg, sms_selection=worker_sms_selection, worker_id=worker_id, proxy=proxy)

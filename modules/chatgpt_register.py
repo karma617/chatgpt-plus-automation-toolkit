@@ -4,10 +4,11 @@ import asyncio
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
+from .flaresolverr_client import flaresolverr_enabled, inject_flaresolverr_solution, solve_with_flaresolverr
 from .hero_sms_provider import HeroSMSProvider, PhoneCountry, SmsActivation, local_phone_number, phone_matches_country
 from .mail_provider import MailProvider
 from .sms_provider_factory import (
@@ -22,6 +23,17 @@ from .utils import log, random_profile
 
 
 UNKNOWN_PAGE_RETRY_WAIT_MS = 5000
+CLOUDFLARE_CHALLENGE_RETRYABLE = "cloudflare_turnstile_not_solved"
+SIGNIN_PROBLEM_RETRY_CURRENT_FLOW = "SIGNIN_PROBLEM_RETRY_CURRENT_FLOW"
+PHONE_ENTRY_ACTIONS = {"signup_phone", "phone_signup", "phone"}
+
+
+def _zh(text: str) -> str:
+    return text.encode("ascii").decode("unicode_escape")
+
+
+def is_signin_problem_retry_reason(reason: str | None) -> bool:
+    return str(reason or "").strip().startswith(SIGNIN_PROBLEM_RETRY_CURRENT_FLOW)
 
 
 class FatalAccountError(RuntimeError):
@@ -29,6 +41,10 @@ class FatalAccountError(RuntimeError):
 
 
 class ManualInterventionNeeded(RuntimeError):
+    pass
+
+
+class CloudflareChallengeError(RuntimeError):
     pass
 
 
@@ -44,6 +60,7 @@ class ChatGPTRegister:
         age_max: int,
         sms_selection: dict[str, object] | None = None,
         log_prefix: str = "",
+        proxy: str | None = None,
     ):
         self.page = page
         self.page_getter = page_getter
@@ -54,14 +71,20 @@ class ChatGPTRegister:
         self.age_max = age_max
         self.sms_selection = sms_selection
         self.log_prefix = log_prefix
+        self.proxy = proxy
         self.generated_name: str | None = None
         self.generated_age: str | None = None
         self.bad_codes: set[str] = set()
         self.unknown_count = 0
         self.entry_count = 0
+        self.phone_switch_attempts = 0
+        self.signin_problem_attempts = 0
 
     def log(self, message: str) -> None:
         log(f"{self.log_prefix} {message}".strip())
+
+    def is_phone_signup_mode(self) -> bool:
+        return self.entry_action.lower() in PHONE_ENTRY_ACTIONS
 
     async def run_until_logged_in(self, account: MailAccount, since: datetime) -> None:
         if self.start_url != "current":
@@ -81,9 +104,17 @@ class ChatGPTRegister:
                     self.log("检测到误入第三方登录页，返回 ChatGPT 登录入口")
                     await self.page.goto(self.start_url, wait_until="domcontentloaded")
                     continue
+                if state == "account_picker":
+                    self.log(_zh(r"\u68c0\u6d4b\u5230\u5df2\u767b\u5f55\u8d26\u53f7\u9009\u62e9\u9875\uff0c\u5c1d\u8bd5\u81ea\u52a8\u9009\u62e9\u5f53\u524d\u8d26\u53f7"))
+                    await self.handle_account_picker(account)
+                    continue
+                if state == "signin_problem":
+                    self.log(_zh(r"\u68c0\u6d4b\u5230\u767b\u5f55\u95ee\u9898\u9875\uff0c\u5c1d\u8bd5\u70b9\u51fb\u9875\u9762\u6309\u94ae\u6062\u590d"))
+                    await self.handle_signin_problem()
+                    continue
                 if state == "entry":
                     self.entry_count += 1
-                    if self.entry_count >= 3 and self.entry_action.lower() in {"signup_phone", "phone_signup", "phone"}:
+                    if self.entry_count >= 3 and self.is_phone_signup_mode():
                         self.log("入口页: 多次点击未推进，直接打开登录页再切手机注册")
                         await self.page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded")
                         await settle(self.page)
@@ -94,14 +125,20 @@ class ChatGPTRegister:
                 if state == "phone_login":
                     if not self.sms_selection:
                         raise FatalAccountError("账号进入手机号登录/注册页，未启用手机号接码，按规则废弃当前账号")
+                    self.phone_switch_attempts = 0
                     self.log("手机号页: 已启用接码，开始自动获取手机号")
                     await self.handle_phone_required()
                     continue
                 if state == "email":
-                    if self.entry_action.lower() in {"signup_phone", "phone_signup", "phone"} and self.sms_selection:
-                        self.log("邮箱页: Free 注册配置为手机号优先，尝试切换到手机登录")
-                        if await self.click_phone_switch():
-                            continue
+                    if self.is_phone_signup_mode():
+                        if not self.sms_selection:
+                            raise FatalAccountError(
+                                _zh(
+                                    r"\u624b\u673a\u53f7\u6ce8\u518c\u6a21\u5f0f\u672a\u542f\u7528\u63a5\u7801\u914d\u7f6e\uff0c\u7981\u6b62\u56de\u9000\u90ae\u7bb1\u6ce8\u518c"
+                                )
+                            )
+                        await self.force_phone_login_entry()
+                        continue
                     self.log(f"邮箱页: 填入邮箱 {account.email}")
                     await self.fill_email(account.email)
                     continue
@@ -126,6 +163,13 @@ class ChatGPTRegister:
                     continue
                 if state == "captcha_or_unknown":
                     self.unknown_count += 1
+                    challenge_result = await self.try_cloudflare_turnstile_challenge()
+                    if challenge_result == "solved":
+                        self.log("[Cloudflare] Turnstile/managed challenge handled, retry page state")
+                        self.unknown_count = 0
+                        continue
+                    if challenge_result == "blocked":
+                        raise CloudflareChallengeError(CLOUDFLARE_CHALLENGE_RETRYABLE)
                     await dump_unknown_page(self.page, self.unknown_count)
                     if self.unknown_count >= 4:
                         raise ManualInterventionNeeded("连续检测到未知页/人工验证，账号已退回号池")
@@ -134,6 +178,8 @@ class ChatGPTRegister:
                     continue
                 self.unknown_count = 0
             except FatalAccountError:
+                raise
+            except CloudflareChallengeError:
                 raise
             except Exception as exc:
                 if is_page_closed_error(exc):
@@ -156,6 +202,10 @@ class ChatGPTRegister:
             return "external_oauth"
         if is_fatal_account_error(low, text):
             return "fatal_account_error"
+        if await is_account_picker_page(self.page, low, text):
+            return "account_picker"
+        if is_signin_problem_page(low, text):
+            return "signin_problem"
         if "404" in text and "找不到页面" in text:
             return "entry"
         if "chatgpt.com" in url and (
@@ -173,6 +223,8 @@ class ChatGPTRegister:
             return "phone_login"
         if is_entry_page(low, text):
             return "entry"
+        if await page_looks_like_profile_page(self.page):
+            return "profile"
         if await visible_input_count(self.page, r"email|username") > 0:
             return "email"
         if any(key in low for key in ["tell us about yourself", "full name", "birthday", "date of birth", "age"]) or any(
@@ -259,6 +311,144 @@ class ChatGPTRegister:
                 return
         raise RuntimeError(f"入口页未找到可点击按钮: entry_action={self.entry_action}")
 
+    async def handle_account_picker(self, account: MailAccount) -> None:
+        mode = self.entry_action.lower()
+        clicked = await click_account_picker_session(
+            self.page,
+            account.email,
+            allow_single_fallback=mode in {"login", "signin", "log_in"},
+        )
+        if clicked:
+            self.log(_zh(r"\u8d26\u53f7\u9009\u62e9\u9875: \u5df2\u70b9\u51fb\u5df2\u767b\u5f55\u8d26\u53f7"))
+            return
+        if mode in {"login", "signin", "log_in"}:
+            if await click_account_picker_link(self.page, "login"):
+                self.log(_zh(r"\u8d26\u53f7\u9009\u62e9\u9875: \u672a\u5339\u914d\u5230\u5f53\u524d\u8d26\u53f7\uff0c\u5df2\u5207\u6362\u5230\u5176\u4ed6\u8d26\u53f7\u767b\u5f55"))
+                return
+        if await click_account_picker_link(self.page, "create"):
+            self.log(_zh(r"\u8d26\u53f7\u9009\u62e9\u9875: \u672a\u5339\u914d\u5230\u5f53\u524d\u8d26\u53f7\uff0c\u5df2\u5207\u6362\u5230\u521b\u5efa\u8d26\u53f7"))
+            return
+        raise RuntimeError("ACCOUNT_PICKER_NO_USABLE_ACCOUNT")
+
+    async def handle_signin_problem(self) -> None:
+        self.signin_problem_attempts += 1
+        if self.signin_problem_attempts > 2:
+            raise RuntimeError(f"{SIGNIN_PROBLEM_RETRY_CURRENT_FLOW}: repeated signin problem page")
+        before_url = self.page.url
+        before_text = await body_text(self.page)
+        clicked = await click_signin_problem_action(self.page)
+        if not clicked:
+            raise RuntimeError(f"{SIGNIN_PROBLEM_RETRY_CURRENT_FLOW}: problem page button not found")
+        await self.page.wait_for_timeout(3500)
+        await settle(self.page)
+        await self.refresh_page()
+        after_text = await body_text(self.page)
+        if is_signin_problem_page(after_text.lower(), after_text):
+            raise RuntimeError(f"{SIGNIN_PROBLEM_RETRY_CURRENT_FLOW}: problem page button no response")
+        if self.page.url == before_url and after_text.strip()[:500] == before_text.strip()[:500]:
+            raise RuntimeError(f"{SIGNIN_PROBLEM_RETRY_CURRENT_FLOW}: problem page unchanged")
+        self.log(_zh(r"\u767b\u5f55\u95ee\u9898\u9875: \u9875\u9762\u5df2\u54cd\u5e94\uff0c\u7ee7\u7eed\u68c0\u6d4b\u767b\u5f55\u72b6\u6001"))
+
+    async def try_cloudflare_turnstile_challenge(self, timeout_ms: int = 38_000) -> str:
+        state = await cloudflare_turnstile_state(self.page)
+        if not state.get("present"):
+            return "absent"
+        token_len = int(state.get("tokenLength") or 0)
+        self.log(
+            f"[Cloudflare] Turnstile/managed challenge detected "
+            f"token_len={token_len} iframe={state.get('iframeCount')} widget={state.get('widgetCount')} "
+            f"url={short_url(self.page.url)}"
+        )
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        last_click = 0.0
+        click_count = 0
+        last_token_len = token_len
+        stagnant_since = asyncio.get_running_loop().time()
+        no_widget_logged = False
+        while asyncio.get_running_loop().time() < deadline:
+            state = await cloudflare_turnstile_state(self.page)
+            if not state.get("present"):
+                await settle(self.page)
+                return "solved"
+            if state.get("successVisible"):
+                self.log("[Cloudflare] managed challenge success text visible, wait auth redirect")
+                await self.page.wait_for_timeout(3000)
+                state_name = await self.detect_state()
+                if state_name != "captcha_or_unknown":
+                    self.log(f"[Cloudflare] challenge page advanced to state={state_name}")
+                    return "solved"
+                continue
+            token_len = int(state.get("tokenLength") or 0)
+            if token_len >= 80:
+                await sync_cloudflare_turnstile_token(self.page)
+                await settle(self.page)
+                return "solved"
+            if token_len != last_token_len:
+                last_token_len = token_len
+                stagnant_since = asyncio.get_running_loop().time()
+            now = asyncio.get_running_loop().time()
+            if state.get("clickableHint") and click_count < 2 and now - last_click >= 12:
+                last_click = now
+                click_result = await click_cloudflare_turnstile_widget(self.page)
+                if click_result:
+                    click_count += 1
+                    self.log(f"[Cloudflare] clicked Turnstile/managed challenge widget ({click_count}/2)")
+                else:
+                    if not no_widget_logged:
+                        no_widget_logged = True
+                        self.log("[Cloudflare] no clickable Turnstile widget found, wait for auto challenge")
+            elif not state.get("clickableHint") and not no_widget_logged:
+                no_widget_logged = True
+                self.log("[Cloudflare] managed challenge has no visible widget/iframe, wait for auto challenge")
+            await self.page.wait_for_timeout(1500)
+            state_name = await self.detect_state()
+            if state_name != "captcha_or_unknown":
+                self.log(f"[Cloudflare] challenge page advanced to state={state_name}")
+                return "solved"
+            if (click_count >= 2 or not state.get("clickableHint")) and now - stagnant_since >= 22:
+                self.log("[Cloudflare] challenge token not progressing after low-frequency clicks; try FlareSolverr or rotate proxy/session")
+                break
+        state = await cloudflare_turnstile_state(self.page)
+        if int(state.get("tokenLength") or 0) >= 80 or not state.get("present"):
+            return "solved"
+        if await self.try_flaresolverr_challenge():
+            return "solved"
+        return "blocked"
+
+    async def try_flaresolverr_challenge(self) -> bool:
+        if not flaresolverr_enabled():
+            self.log("[Cloudflare] FlareSolverr disabled, rotate proxy/session")
+            return False
+        target_url = self.page.url or self.start_url or "https://chatgpt.com/"
+        self.log("[Cloudflare] FlareSolverr enabled, requesting challenge solution")
+        try:
+            result = await asyncio.to_thread(solve_with_flaresolverr, target_url, proxy=self.proxy)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[Cloudflare] FlareSolverr exception: {exc}")
+            return False
+        if not result.ok:
+            self.log(f"[Cloudflare] FlareSolverr failed: {result.reason}")
+            return False
+        try:
+            await inject_flaresolverr_solution(self.page, result)
+            self.log(
+                f"[Cloudflare] FlareSolverr cookies injected: cookies={len(result.cookies)} "
+                f"status={result.status_code or ''}"
+            )
+            await self.page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
+            await self.page.wait_for_timeout(2500)
+            state = await cloudflare_turnstile_state(self.page)
+            if not state.get("present") or int(state.get("tokenLength") or 0) >= 80:
+                return True
+            self.log(
+                f"[Cloudflare] FlareSolverr cookies injected but challenge still present "
+                f"token_len={state.get('tokenLength')} iframe={state.get('iframeCount')} widget={state.get('widgetCount')}"
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[Cloudflare] FlareSolverr cookie replay failed: {exc}")
+            return False
+
     async def click_email_switch(self) -> None:
         if await click_by_visible_text(self.page, "继续使用电子邮件地址登录"):
             await settle(self.page)
@@ -284,6 +474,33 @@ class ChatGPTRegister:
             await settle(self.page)
             return
         raise RuntimeError("电话登录页未找到切换到邮箱登录按钮")
+
+    async def force_phone_login_entry(self) -> None:
+        self.phone_switch_attempts += 1
+        if self.phone_switch_attempts > 3:
+            raise FatalAccountError(
+                _zh(
+                    r"\u624b\u673a\u53f7\u6ce8\u518c\u6a21\u5f0f\u672a\u80fd\u5207\u6362\u5230\u624b\u673a\u53f7\u767b\u5f55\u9875\uff0c\u7981\u6b62\u56de\u9000\u90ae\u7bb1\u6ce8\u518c"
+                )
+            )
+        self.log(
+            _zh(r"\u90ae\u7bb1\u9875: Free \u6ce8\u518c\u914d\u7f6e\u4e3a\u624b\u673a\u53f7\u6ce8\u518c\uff0c\u5f3a\u5236\u5207\u6362\u5230\u624b\u673a\u53f7\u767b\u5f55")
+            + f" ({self.phone_switch_attempts}/3)"
+        )
+        if await self.click_phone_switch():
+            text = await body_text(self.page)
+            if await is_phone_login_page(self.page, text.lower(), text):
+                return
+            self.log(
+                _zh(
+                    r"\u624b\u673a\u53f7\u5207\u6362\u6309\u94ae\u5df2\u70b9\u51fb\uff0c\u4f46\u9875\u9762\u4ecd\u672a\u8fdb\u5165\u624b\u673a\u53f7\u8f93\u5165\uff0c\u5c1d\u8bd5\u76f4\u63a5\u6253\u5f00\u624b\u673a\u53f7\u5165\u53e3"
+                )
+            )
+        phone_url = "https://chatgpt.com/auth/login?usernamekind=phone_number"
+        if self.phone_switch_attempts >= 2:
+            phone_url = "https://chatgpt.com/auth/login?screen_hint=phone"
+        await self.page.goto(phone_url, wait_until="domcontentloaded")
+        await settle(self.page)
 
     async def click_phone_switch(self) -> bool:
         labels = ["使用电话号码继续", "使用手机号继续", "手机登录", "手机号登录", "继续使用手机登录", "Continue with phone", "Continue with phone number", "Phone number", "Phone"]
@@ -357,6 +574,10 @@ class ChatGPTRegister:
         if not self.generated_name or not self.generated_age:
             self.generated_name, self.generated_age = random_profile(self.age_min, self.age_max)
             self.log(f"已生成资料: {self.generated_name} / {self.generated_age}")
+        if await fill_profile_stable_fields(self.page, self.generated_name, self.generated_age, self.log):
+            await click_profile_submit_by_js(self.page)
+            self.log("资料页: 已点击完成创建")
+            return
         if await fill_profile_by_js(self.page, self.generated_name, self.generated_age, self.log):
             await click_profile_submit_by_js(self.page)
             self.log("资料页: 已点击完成创建")
@@ -463,6 +684,40 @@ async def find_phone_input(page: Page) -> Locator | None:
         if found:
             return found
     return None
+
+
+async def page_looks_like_profile_page(page: Page) -> bool:
+    lower_url = (page.url or "").lower()
+    if "/about-you" in lower_url:
+        return True
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        if (!el || !el.getBoundingClientRect) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const nameInput = document.querySelector('input[name="name"], input[autocomplete="name"]');
+                    const ageInput = document.querySelector('input[name="age"], input[inputmode="numeric"], input[type="number"]');
+                    if (visible(nameInput) && visible(ageInput)) return true;
+                    const text = String(document.body?.innerText || '').toLowerCase();
+                    return (
+                        text.includes('tell us about yourself') ||
+                        text.includes('full name') ||
+                        text.includes('date of birth') ||
+                        text.includes('birthday') ||
+                        text.includes('\\u6c0f\\u540d') ||
+                        text.includes('\\u5e74\\u9f62') ||
+                        text.includes('\\u751f\\u5e74\\u6708\\u65e5')
+                    );
+                }"""
+            )
+        )
+    except Exception:
+        return False
 
 
 async def select_phone_country(page: Page, country: PhoneCountry, logger: Callable[[str], None]) -> None:
@@ -922,6 +1177,77 @@ async def fatal_error_message(page: Page) -> str:
     return "账号注册进入不可恢复错误页，跳过当前账号"
 
 
+async def is_account_picker_page(page: Page, low: str, text: str) -> bool:
+    url = (page.url or "").lower()
+    text_hint = any(
+        marker in low or marker in text
+        for marker in (
+            "choose an account",
+            "select an account",
+            "select existing session",
+            _zh(r"\u304a\u5e30\u308a\u306a\u3055\u3044"),
+            _zh(r"\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u9078\u629e"),
+            _zh(r"\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044"),
+        )
+    )
+    if "/choose-an-account" in url:
+        return True
+    if not text_hint:
+        return False
+    try:
+        state = await page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const sessionCount = Array.from(document.querySelectorAll(
+                    'button[name="session_id"], button[data-dd-action-name*="Select existing session" i]'
+                )).filter(visible).length;
+                const chooseForm = Boolean(document.querySelector('form[action*="choose-an-account"]'));
+                const loginLink = Boolean(document.querySelector('a[href*="log-in-or-create-account"]'));
+                const createLink = Boolean(document.querySelector('a[href*="create-account"]'));
+                return { sessionCount, chooseForm, loginLink, createLink };
+            }"""
+        )
+    except Exception:
+        state = {}
+    return bool(
+        state.get("sessionCount")
+        or state.get("chooseForm")
+        or (text_hint and (state.get("loginLink") or state.get("createLink")))
+    )
+
+
+def is_signin_problem_page(low: str, text: str) -> bool:
+    return any(
+        marker in low or marker in text
+        for marker in (
+            "problem signing in",
+            "there was a problem signing in",
+            "something went wrong",
+            "please wait a moment and try again",
+            _zh(r"\u554f\u984c\u304c\u767a\u751f\u3057\u307e\u3057\u305f"),
+            _zh(r"\u30b5\u30a4\u30f3\u30a4\u30f3\u4e2d\u306b\u554f\u984c"),
+            _zh(r"\u5c11\u3057\u5f85\u3063\u3066\u304b\u3089"),
+            _zh(r"\u767b\u5f55\u65f6\u51fa\u73b0\u95ee\u9898"),
+            _zh(r"\u7a0d\u540e\u518d\u8bd5"),
+        )
+    ) and any(
+        marker in low or marker in text
+        for marker in (
+            "back",
+            "try again",
+            "retry",
+            _zh(r"\u623b\u308b"),
+            _zh(r"\u8fd4\u56de"),
+            _zh(r"\u91cd\u8bd5"),
+        )
+    )
+
+
 async def dump_unknown_page(page: Page, index: int) -> None:
     try:
         out = Path(__file__).resolve().parents[1] / "output" / "debug"
@@ -1001,26 +1327,59 @@ def is_chatgpt_success_landing(url: str, low: str, text: str) -> bool:
 
 
 async def is_phone_login_page(page: Page, low: str, text: str) -> bool:
-    url = page.url.lower()
-    if "usernamekind=phone_number" in url or "screen_hint=phone" in url:
-        return True
+    url = (page.url or "").lower()
+    phone_url = "usernamekind=phone_number" in url or "screen_hint=phone" in url
+    switch_to_email = any(
+        marker in low or marker in text
+        for marker in (
+            "continue with email",
+            "continue with email address",
+            _zh(r"\u7ee7\u7eed\u4f7f\u7528\u7535\u5b50\u90ae\u4ef6\u5730\u5740\u767b\u5f55"),
+            _zh(r"\u7ee7\u7eed\u4f7f\u7528\u7535\u5b50\u90ae\u4ef6"),
+            _zh(r"\u30e1\u30fc\u30eb\u30a2\u30c9\u30ec\u30b9\u3067\u7d9a\u884c"),
+        )
+    )
+    switch_to_phone = any(
+        marker in low or marker in text
+        for marker in (
+            "continue with phone",
+            "continue with phone number",
+            _zh(r"\u7ee7\u7eed\u4f7f\u7528\u624b\u673a\u53f7"),
+            _zh(r"\u7ee7\u7eed\u4f7f\u7528\u7535\u8bdd\u53f7\u7801"),
+            _zh(r"\u96fb\u8a71\u756a\u53f7\u3067\u7d9a\u884c"),
+        )
+    )
 
-    email_inputs = await visible_input_count(page, r"email|username")
-    if email_inputs > 0:
-        return False
-
-    phone_inputs = await visible_input_count(page, r"phone|tel|电话号码|手机号")
+    phone_inputs = await visible_input_count(
+        page,
+        "phone|tel|mobile|"
+        + _zh(r"\u7535\u8bdd\u53f7\u7801|\u624b\u673a\u53f7|\u624b\u673a|\u96fb\u8a71\u756a\u53f7|\u643a\u5e2f"),
+    )
     if phone_inputs > 0 and (
-        "电话号码" in text
-        or "手机号" in text
+        phone_url
+        or switch_to_email
         or "phone number" in low
         or "mobile number" in low
+        or _zh(r"\u7535\u8bdd\u53f7\u7801") in text
+        or _zh(r"\u624b\u673a\u53f7") in text
+        or _zh(r"\u96fb\u8a71\u756a\u53f7") in text
     ):
         return True
 
-    return (
-        ("继续使用电子邮件地址登录" in text and ("电话号码" in text or "手机号" in text))
-        or ("continue with email" in low and ("phone number" in low or "mobile number" in low))
+    email_inputs = await visible_input_count(page, r"email")
+    if email_inputs > 0 or (switch_to_phone and not switch_to_email):
+        return False
+
+    username_inputs = await visible_input_count(page, r"username")
+    if username_inputs > 0 and (phone_url or switch_to_email) and not switch_to_phone:
+        return True
+
+    return switch_to_email and (
+        "phone number" in low
+        or "mobile number" in low
+        or _zh(r"\u7535\u8bdd\u53f7\u7801") in text
+        or _zh(r"\u624b\u673a\u53f7") in text
+        or _zh(r"\u96fb\u8a71\u756a\u53f7") in text
     )
 
 
@@ -1109,6 +1468,79 @@ async def human_fill(locator: Locator, value: str, force_mouse: bool = False) ->
         }""",
         str(value),
     )
+
+
+async def fill_profile_stable_fields(page: Page, full_name: str, age: str, logger: Callable[[str], None] | None = None) -> bool:
+    result = await page.evaluate(
+        """({ fullName, age }) => {
+            const visible = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const setValue = (el, value) => {
+                if (!el) return;
+                el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                if (setter) setter.call(el, String(value));
+                else el.value = String(value);
+                el.setAttribute('value', String(value));
+                el.focus();
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: String(value) }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Tab', code: 'Tab' }));
+                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Tab', code: 'Tab' }));
+            };
+            const firstVisible = (selectors) => {
+                for (const selector of selectors) {
+                    for (const el of document.querySelectorAll(selector)) {
+                        if (visible(el) && !el.disabled && !el.readOnly) return el;
+                    }
+                }
+                return null;
+            };
+            const nameEl = firstVisible([
+                'input[name="name"]',
+                'input[autocomplete="name"]',
+                'input[id$="-name"]',
+            ]);
+            const ageEl = firstVisible([
+                'input[name="age"]',
+                'input[id$="-age"]',
+                'input[type="number"][min][max]',
+                'input[inputmode="numeric"][min][max]',
+            ]);
+            if (nameEl) setValue(nameEl, fullName);
+            if (ageEl) setValue(ageEl, age);
+            const ageNumber = Math.max(5, Math.min(130, parseInt(String(age || ''), 10) || 30));
+            const birthday = document.querySelector('input[name="birthday"][type="hidden"]');
+            if (birthday) {
+                const now = new Date();
+                const value = `${now.getFullYear() - ageNumber}-01-15`;
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                if (setter) setter.call(birthday, value);
+                else birthday.value = value;
+                birthday.setAttribute('value', value);
+                birthday.dispatchEvent(new Event('input', { bubbles: true }));
+                birthday.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            return {
+                name: Boolean(nameEl),
+                age: Boolean(ageEl),
+                nameValue: String(nameEl?.value || ''),
+                ageValue: String(ageEl?.value || ''),
+                birthdayValue: String(birthday?.value || ''),
+            };
+        }""",
+        {"fullName": full_name, "age": age},
+    )
+    if result.get("name") and result.get("age") and not str(result.get("nameValue") or "").strip().isdigit() and str(result.get("ageValue") or "").strip().isdigit():
+        (logger or log)(f"profile stable fields filled: {result}")
+        return True
+    (logger or log)(f"profile stable fields not matched: {result}")
+    return False
 
 
 async def fill_profile_by_js(page: Page, full_name: str, age: str, logger: Callable[[str], None] | None = None) -> bool:
@@ -1466,6 +1898,331 @@ async def click_by_visible_text(page: Page, label: str) -> bool:
             except Exception:
                 continue
     return False
+
+
+async def click_account_picker_session(page: Page, email: str, *, allow_single_fallback: bool = False) -> bool:
+    clicked = await page.evaluate(
+        r"""({ email, allowSingleFallback }) => {
+            const wantedEmail = String(email || '').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const textOf = (el) => String(
+                el?.innerText ||
+                el?.textContent ||
+                el?.getAttribute?.('aria-label') ||
+                ''
+            ).replace(/\s+/g, ' ').trim();
+            const disabled = (el) => el.disabled || String(el.getAttribute?.('aria-disabled') || '').toLowerCase() === 'true';
+            const buttons = Array.from(document.querySelectorAll(
+                'button[name="session_id"], button[data-dd-action-name*="Select existing session" i]'
+            )).filter((el) => visible(el) && !disabled(el));
+            if (!buttons.length) return { clicked: false, reason: 'no_session_button' };
+            let target = null;
+            if (wantedEmail) {
+                target = buttons.find((el) => textOf(el).toLowerCase().includes(wantedEmail));
+            }
+            if (!target && allowSingleFallback && buttons.length === 1) {
+                target = buttons[0];
+            }
+            if (!target) return { clicked: false, reason: 'no_matching_session', count: buttons.length };
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            target.focus?.();
+            target.click();
+            return { clicked: true, label: textOf(target).slice(0, 160), count: buttons.length };
+        }""",
+        {"email": email, "allowSingleFallback": allow_single_fallback},
+    )
+    if isinstance(clicked, dict) and clicked.get("clicked"):
+        await settle(page)
+        return True
+    return False
+
+
+async def click_account_picker_link(page: Page, mode: str) -> bool:
+    clicked = await page.evaluate(
+        r"""({ mode }) => {
+            const wantedMode = String(mode || '').toLowerCase();
+            const visible = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const textOf = (el) => String(
+                el?.innerText ||
+                el?.textContent ||
+                el?.getAttribute?.('aria-label') ||
+                ''
+            ).replace(/\s+/g, ' ').trim();
+            const metaOf = (el) => [
+                textOf(el),
+                el?.getAttribute?.('href') || '',
+                el?.getAttribute?.('aria-label') || '',
+                el?.outerHTML || '',
+            ].join(' ').toLowerCase();
+            const nodes = Array.from(document.querySelectorAll('a[href], button, [role="button"]')).filter(visible);
+            const loginPatterns = [
+                /log[\s-]*in[\s-]*or[\s-]*create/i,
+                /login/i,
+                /log in/i,
+                /\u5225\u306e\u30a2\u30ab\u30a6\u30f3\u30c8\u306b\u30ed\u30b0\u30a4\u30f3\u3059\u308b/,
+                /\u5176\u4ed6\u8d26\u53f7/,
+                /\u767b\u5f55/,
+            ];
+            const createPatterns = [
+                /create[\s-]*account/i,
+                /sign up/i,
+                /register/i,
+                /\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210\u3059\u308b/,
+                /\u521b\u5efa\u8d26\u53f7/,
+                /\u6ce8\u518c/,
+            ];
+            const patterns = wantedMode === 'login' ? loginPatterns : createPatterns;
+            let target = nodes.find((el) => patterns.some((pattern) => pattern.test(metaOf(el))));
+            if (!target && wantedMode === 'login') {
+                target = nodes.find((el) => String(el.getAttribute?.('href') || '').includes('/log-in-or-create-account'));
+            }
+            if (!target && wantedMode !== 'login') {
+                target = nodes.find((el) => String(el.getAttribute?.('href') || '').includes('/create-account'));
+            }
+            if (!target) return { clicked: false, reason: 'not_found' };
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            target.focus?.();
+            target.click();
+            return { clicked: true, label: textOf(target).slice(0, 160) };
+        }""",
+        {"mode": mode},
+    )
+    if isinstance(clicked, dict) and clicked.get("clicked"):
+        await settle(page)
+        return True
+    return False
+
+
+async def click_signin_problem_action(page: Page) -> bool:
+    clicked = await page.evaluate(
+        r"""() => {
+            const visible = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const textOf = (el) => String(
+                el?.innerText ||
+                el?.textContent ||
+                el?.value ||
+                el?.getAttribute?.('aria-label') ||
+                ''
+            ).replace(/\s+/g, ' ').trim();
+            const metaOf = (el) => [
+                textOf(el),
+                el?.getAttribute?.('href') || '',
+                el?.getAttribute?.('aria-label') || '',
+                el?.outerHTML || '',
+            ].join(' ').toLowerCase();
+            const nodes = Array.from(document.querySelectorAll('button, a[href], [role="button"], input[type="button"], input[type="submit"]'))
+                .filter((el) => visible(el) && !el.disabled);
+            const patterns = [
+                /^back$/i,
+                /try\s*again/i,
+                /retry/i,
+                /continue/i,
+                /\u623b\u308b/,
+                /\u3082\u3046\u4e00\u5ea6/,
+                /\u518d\u8a66\u884c/,
+                /\u8fd4\u56de/,
+                /\u91cd\u8bd5/,
+                /\u7ee7\u7eed/,
+            ];
+            const target = nodes.find((el) => patterns.some((pattern) => pattern.test(textOf(el) || metaOf(el)))) || nodes[0];
+            if (!target) return { clicked: false, reason: 'not_found' };
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            target.focus?.();
+            target.click();
+            return { clicked: true, label: textOf(target).slice(0, 160) };
+        }"""
+    )
+    return bool(isinstance(clicked, dict) and clicked.get("clicked"))
+
+
+async def cloudflare_turnstile_state(page: Page) -> dict[str, Any]:
+    try:
+        return dict(
+            await page.evaluate(
+                """() => {
+                    const value = (node) => String((node && node.value) || '').trim();
+                    const text = String(document.body?.innerText || '').toLowerCase();
+                    const html = String(document.documentElement?.innerHTML || '').toLowerCase();
+                    const title = String(document.title || '').toLowerCase();
+                    const input = document.querySelector('input[name="cf-turnstile-response"]');
+                    const iframeCount = document.querySelectorAll(
+                        'iframe[src*="turnstile"], iframe[src*="challenge-platform"], iframe[title*="Cloudflare" i], iframe[title*="challenge" i]'
+                    ).length;
+                    const widgetCount = document.querySelectorAll(
+                        'div.cf-turnstile, [data-sitekey], input[name="cf-turnstile-response"], script[src*="challenge-platform"], script[src*="turnstile"]'
+                    ).length;
+                    const visible = (el) => {
+                        if (!el || !el.getBoundingClientRect) return false;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 8 || rect.height < 8) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.05;
+                    };
+                    const clickableNodes = Array.from(document.querySelectorAll(
+                        'iframe[src*="turnstile"], iframe[src*="challenge-platform"], iframe[title*="Cloudflare" i], iframe[title*="challenge" i], div.cf-turnstile, [data-sitekey], [role="checkbox"], input[type="checkbox"]'
+                    )).filter((node) => visible(node) && node.getAttribute('type') !== 'hidden');
+                    const successNode = document.querySelector('#challenge-success-text');
+                    const successVisible = visible(successNode) || text.includes('\\u691c\\u8a3c\\u306b\\u6210\\u529f') || text.includes('verification successful');
+                    const challengeText = (
+                        title.includes('just a moment') ||
+                        title.includes('cloudflare') ||
+                        text.includes('checking your browser') ||
+                        text.includes('verify you are human') ||
+                        text.includes('security verification') ||
+                        text.includes('\\u30bb\\u30ad\\u30e5\\u30ea\\u30c6\\u30a3\\u691c\\u8a3c') ||
+                        text.includes('\\u30dc\\u30c3\\u30c8\\u3067\\u306f\\u306a\\u3044') ||
+                        text.includes('cloudflare') ||
+                        html.includes('cf-turnstile') ||
+                        html.includes('cf_chl') ||
+                        html.includes('__cf_chl') ||
+                        html.includes('_cf_chl_opt') ||
+                        html.includes('challenge-platform') ||
+                        html.includes('challenges.cloudflare.com')
+                    );
+                    const token = value(input);
+                    return {
+                        present: Boolean(input || iframeCount || widgetCount || challengeText),
+                        tokenLength: token.length,
+                        token,
+                        iframeCount,
+                        widgetCount,
+                        clickableHint: clickableNodes.length > 0,
+                        successVisible,
+                        challengeText,
+                        title,
+                    };
+                }"""
+            )
+        )
+    except Exception:
+        return {
+            "present": False,
+            "tokenLength": 0,
+            "token": "",
+            "iframeCount": 0,
+            "widgetCount": 0,
+            "clickableHint": False,
+            "successVisible": False,
+            "challengeText": False,
+            "title": "",
+        }
+
+
+async def sync_cloudflare_turnstile_token(page: Page) -> int:
+    try:
+        return int(
+            await page.evaluate(
+                """() => {
+                    const input = document.querySelector('input[name="cf-turnstile-response"]');
+                    if (!input) return 0;
+                    const token = String(
+                        input.value ||
+                        (window.turnstile && typeof window.turnstile.getResponse === 'function' ? window.turnstile.getResponse() : '') ||
+                        ''
+                    ).trim();
+                    if (!token) return 0;
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                    if (setter) setter.call(input, token);
+                    else input.value = token;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    return String(input.value || '').trim().length;
+                }"""
+            )
+            or 0
+        )
+    except Exception:
+        return 0
+
+
+async def click_cloudflare_turnstile_widget(page: Page) -> bool:
+    for frame in page.frames:
+        try:
+            frame_url = str(frame.url or "").lower()
+        except Exception:
+            frame_url = ""
+        if frame != page.main_frame and not any(key in frame_url for key in ("turnstile", "cloudflare", "challenge")):
+            continue
+        for selector in ("input[type='checkbox']", "[role='checkbox']", "label", "button"):
+            try:
+                loc = frame.locator(selector).first
+                if await loc.count() <= 0:
+                    continue
+                if not await loc.is_visible(timeout=700):
+                    continue
+                await loc.scroll_into_view_if_needed(timeout=700)
+                await loc.click(timeout=1200, force=True)
+                return True
+            except Exception:
+                continue
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                        if (!el || !el.getBoundingClientRect) return false;
+                        const r = el.getBoundingClientRect();
+                        const s = getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                    };
+                    const dispatchClick = (target) => {
+                        if (!target) return false;
+                        target.scrollIntoView({ block: 'center', inline: 'center' });
+                        const r = target.getBoundingClientRect();
+                        const x = Math.max(1, Math.floor(r.left + Math.min(r.width / 2, 24)));
+                        const y = Math.max(1, Math.floor(r.top + Math.min(r.height / 2, 24)));
+                        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                            target.dispatchEvent(new MouseEvent(type, {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                                clientX: x,
+                                clientY: y,
+                                screenX: x,
+                                screenY: y,
+                            }));
+                        }
+                        try { target.click(); } catch {}
+                        return true;
+                    };
+                    const selectors = [
+                        'div.cf-turnstile',
+                        '[data-sitekey]',
+                        'iframe[src*="turnstile"]',
+                        'iframe[src*="challenge-platform"]',
+                        'iframe[title*="Cloudflare" i]',
+                        'iframe[title*="challenge" i]',
+                        '[role="checkbox"]',
+                        'input[type="checkbox"]',
+                    ];
+                    for (const selector of selectors) {
+                        const node = document.querySelector(selector);
+                        if (!node) continue;
+                        if (node.getAttribute('type') === 'hidden') continue;
+                        const target = visible(node) ? node : node.closest('label, div.cf-turnstile, [data-sitekey]');
+                        if (visible(target) && dispatchClick(target)) return true;
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
 
 
 async def settle(page: Page) -> None:

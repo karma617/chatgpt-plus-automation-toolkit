@@ -112,6 +112,11 @@ def test_known_env_fields_include_api_keys() -> None:
     assert "PAYPAL_PROXY_FILE_US" in fields
     assert "PAYPAL_PROXY_FILE_JP" in fields
     assert "PAYPAL_REGISTER_PROXY_FILE" in fields
+    assert "FLARESOLVERR_ENABLED" in fields
+    assert "FLARESOLVERR_AUTO_START" in fields
+    assert "FLARESOLVERR_URL" in fields
+    assert "FLARESOLVERR_EXECUTABLE_PATH" in fields
+    assert "FLARESOLVERR_DOCKER_ENABLED" in fields
     assert "REGISTER_LOCAL_PROXY_URL" in fields
     assert "REGISTER_TOOL_ROOT" not in fields
     assert "REGISTER_TOOL_PROXY" not in fields
@@ -188,6 +193,9 @@ def test_known_env_fields_include_dropdown_choices_for_enum_values() -> None:
     assert _field_by_key("PAYPAL_CAPTCHA_MODE").choices == ("manual", "api")
     assert _field_by_key("CAPTCHA_API_PROVIDER").choices == ("capsolver", "twocaptcha", "yescaptcha")
     assert _field_by_key("PAYPAL_USE_PROXY").choices == ("true", "false")
+    assert _field_by_key("FLARESOLVERR_ENABLED").choices == ("true", "false")
+    assert _field_by_key("FLARESOLVERR_AUTO_START").choices == ("true", "false")
+    assert _field_by_key("FLARESOLVERR_DOCKER_ENABLED").choices == ("true", "false")
     assert _field_by_key("SMS_PROVIDER").choices == SMS_PROVIDER_CHOICES
     assert _field_by_key("FLOW1_SMS_PROVIDER").choices == SMS_PROVIDER_CHOICES
     assert _field_by_key("FLOW3_SMS_PROVIDER").choices == SMS_PROVIDER_CHOICES

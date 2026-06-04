@@ -6,6 +6,7 @@ import re
 import secrets
 import shutil
 import string
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,8 @@ from .browser import BrowserSession
 from .checkout import checkout_billing_for_region, create_plus_checkout_link, get_chatgpt_session, normalize_checkout_region
 from .free_browser_flow import FreeBrowserFlow
 from .free_register import FreeProfile, FreeRegisterError, generate_free_profile, random_birth_date
-from .mail_provider import MailProvider
+from .chatgpt_register import ChatGPTRegister, is_signin_problem_retry_reason
+from .mail_provider import MailCodeTimeoutError, MailProvider
 from .proxy_config import paypal_register_local_proxy_url, paypal_register_proxy_enabled, paypal_register_proxy_file
 from .proxy_pool import ProxyPool
 from . import paypal_flow_state
@@ -37,6 +39,8 @@ REGISTER_ONLY_SUMMARY_FILE = resolve_path("output/register_only/registered_sessi
 REGISTER_ONLY_FLOW1_USED_FILE = resolve_path("output/register_only/paypal_flow1_used_emails.txt")
 PAYPAL_PENDING_AUTH_FILE = PAYPAL_OUTPUT_ROOT / "\u5f85\u6388\u6743\u8d26\u53f7" / "account.txt"
 _LAST_RUN_DETAIL: dict[str, str] = {"message": "", "account": "", "path": ""}
+MAIL_CODE_TIMEOUT_DISCARD_THRESHOLD = 3
+SIGNIN_PROBLEM_RETRY_CURRENT_FLOW_THRESHOLD = 3
 
 
 def _set_last_run_detail(message: str = "", *, account: str = "", path: str = "") -> None:
@@ -67,6 +71,61 @@ def _is_network_navigation_error(exc: Exception) -> bool:
     )
 
 
+def _short_error(exc: Exception) -> str:
+    text = str(exc).strip().replace("\r", "\n")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return (lines[0] if lines else exc.__class__.__name__)[:500]
+
+
+def _display_proxy(proxy: str | None) -> str:
+    if not proxy:
+        return "direct"
+    text = proxy.strip()
+    if "@" not in text:
+        return text
+    prefix, suffix = text.rsplit("@", 1)
+    scheme = prefix.split("://", 1)[0] + "://" if "://" in prefix else ""
+    return f"{scheme}***:***@{suffix}"
+
+
+def _proxy_attempts(proxy_pool: ProxyPool | None, fallback_proxy: str | None = "") -> list[str | None]:
+    if proxy_pool:
+        return proxy_pool.random_sequence()
+    return [fallback_proxy or None]
+
+
+def _is_mail_code_timeout_reason(reason: str | None) -> bool:
+    text = str(reason or "").lower()
+    return "mail_code_timeout" in text or "验证码等待超时" in text or "没有新验证码" in text
+
+
+def _discard_flow1_account_for_mail_timeout(email: str, *, reason: str) -> None:
+    safe_reason = str(reason or "mail_code_timeout").strip()[:500]
+    discard_reason = f"mail_code_timeout_after_{MAIL_CODE_TIMEOUT_DISCARD_THRESHOLD}_attempts: {safe_reason}"
+    paypal_flow_state.mark_discarded_many([email], reason=discard_reason)
+    paypal_flow_state.append_discarded_emails([email], reason=discard_reason)
+
+
+async def _fetch_chatgpt_session_with_retry(page, prefix: str, attempts: int = 4) -> dict[str, Any]:
+    last_error = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            chatgpt_session = await get_chatgpt_session(page)
+            if str(chatgpt_session.get("accessToken") or ""):
+                return chatgpt_session
+            last_error = "session missing accessToken"
+        except Exception as exc:  # noqa: BLE001
+            last_error = _short_error(exc)
+        if attempt < attempts:
+            log(f"{prefix} accessToken/session fetch failed, retry after page settles ({attempt}/{attempts}): {last_error}")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=6000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(2500)
+    raise RuntimeError(last_error or "failed to fetch ChatGPT session")
+
+
 def _probe_proxy(proxy: str, timeout_sec: int = 12) -> tuple[bool, str]:
     urls = (
         "https://api.ipify.org",
@@ -89,6 +148,78 @@ def _probe_proxy(proxy: str, timeout_sec: int = 12) -> tuple[bool, str]:
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{url} -> {type(exc).__name__}: {exc}")
     return False, " | ".join(errors[:3]) if errors else "unknown proxy precheck error"
+
+
+def _country_matches(value: str, required_country_code: str) -> bool:
+    text = str(value or "").strip().lower()
+    required = str(required_country_code or "").strip().upper()
+    if not required:
+        return True
+    if required == "JP":
+        return text in {"jp", "jpn", "japan", "日本"} or "japan" in text or "日本" in text
+    return text == required.lower()
+
+
+def _probe_proxy_country(proxy: str, required_country_code: str, timeout_sec: int = 12) -> tuple[bool, str]:
+    required = str(required_country_code or "").strip().upper()
+    if not required:
+        return _probe_proxy(proxy, timeout_sec=timeout_sec)
+    urls = (
+        "https://ipwho.is/",
+        "https://ipapi.co/json/",
+        "https://ipinfo.io/json",
+    )
+    errors: list[str] = []
+    with httpx.Client(proxy=proxy, timeout=timeout_sec, follow_redirects=True) as c:
+        for url in urls:
+            try:
+                r = c.get(url)
+                body = (r.text or "").strip()
+                if r.status_code != 200:
+                    errors.append(f"{url} -> http {r.status_code}: {body[:120]}")
+                    continue
+                try:
+                    data = r.json()
+                except Exception:
+                    errors.append(f"{url} -> non-json: {body[:120]}")
+                    continue
+                country_code = str(
+                    data.get("country_code")
+                    or data.get("countryCode")
+                    or data.get("country")
+                    or data.get("cc")
+                    or ""
+                ).strip()
+                country_name = str(data.get("country_name") or data.get("country") or "").strip()
+                ip = str(data.get("ip") or data.get("query") or "").strip()
+                if _country_matches(country_code, required) or _country_matches(country_name, required):
+                    return True, f"country={country_code or country_name or required} ip={ip}"
+                if country_code or country_name:
+                    return False, f"country mismatch: got={country_code or country_name} required={required} ip={ip}"
+                errors.append(f"{url} -> no country field")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{url} -> {type(exc).__name__}: {exc}")
+    return False, " | ".join(errors[:3]) if errors else "unknown proxy country precheck error"
+
+
+def _precheck_proxy_pool(
+    proxy_pool: ProxyPool,
+    *,
+    max_checks: int = 5,
+    required_country_code: str = "",
+) -> tuple[list[str], list[str]]:
+    usable: list[str] = []
+    errors: list[str] = []
+    for proxy in proxy_pool.sequence(1)[: max(1, max_checks)]:
+        if required_country_code:
+            ok, reason = _probe_proxy_country(proxy, required_country_code)
+        else:
+            ok, reason = _probe_proxy(proxy)
+        if ok:
+            usable.append(proxy)
+        else:
+            errors.append(f"{proxy}: {reason}")
+    return usable, errors
 
 
 def generate_chatgpt_password() -> str:
@@ -167,13 +298,20 @@ def _mark_domain163_email_used(email: str) -> None:
         fh.write(value + "\n")
 
 
-def save_to_link_pool(email: str, query_code: str, payment_link: str, account_line: str | None = None) -> None:
+def save_to_link_pool(
+    email: str,
+    query_code: str,
+    payment_link: str,
+    account_line: str | None = None,
+    *,
+    link_method: str = "",
+) -> None:
     LINK_POOL_DIR.mkdir(parents=True, exist_ok=True)
     raw = str(account_line or "").strip()
     prefix = raw if raw and raw.split("----", 1)[0].strip().lower() == email.strip().lower() else f"{email}----{query_code}"
     with LINK_POOL_FILE.open("a", encoding="utf-8") as f:
         f.write(f"{prefix}----{payment_link}\n")
-    paypal_flow_state.mark_link_ready(email, account_line=prefix, payment_link=payment_link)
+    paypal_flow_state.mark_link_ready(email, account_line=prefix, payment_link=payment_link, link_method=link_method)
 
 
 def remove_from_icloud_file(email: str, path: Path | None = None) -> None:
@@ -343,6 +481,10 @@ async def register_one(
     session_cache_path: str | Path | None = None,
     session_source: str = "paypal_flow1",
     checkout_region: str = "us",
+    last_error: dict[str, str] | None = None,
+    checkout_skip_methods: set[str] | None = None,
+    checkout_preferred_methods: list[str] | tuple[str, ...] | None = None,
+    checkout_method_sink: dict[str, str] | None = None,
 ) -> str | None:
     email = account.email
     prefix = f"[paypal-reg-{worker_id:02d}][{email}]"
@@ -375,7 +517,7 @@ async def register_one(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=email,
+        fingerprint_seed=f"{email}|paypal-register|{proxy or ''}|{time.time_ns()}",
     )
     session = BrowserSession(**session_kwargs)
 
@@ -484,12 +626,8 @@ async def register_one(
         if not access_page_opened:
             raise FreeRegisterError("failed to open ChatGPT page for accessToken")
         await page.wait_for_timeout(2000)
-        chatgpt_session = await get_chatgpt_session(page)
+        chatgpt_session = await _fetch_chatgpt_session_with_retry(page, prefix)
         access_token = str(chatgpt_session.get("accessToken") or "")
-        if not access_token:
-            await page.wait_for_timeout(3000)
-            chatgpt_session = await get_chatgpt_session(page)
-            access_token = str(chatgpt_session.get("accessToken") or "")
         if not access_token:
             raise FreeRegisterError("failed to fetch accessToken")
 
@@ -499,7 +637,16 @@ async def register_one(
             billing = checkout_billing_for_region(region)
             chatgpt_cfg = {**cfg["chatgpt"], "billing_country": billing["country"], "currency": billing["currency"]}
             log(f"{prefix} create Plus checkout link: mode={region.upper()} billing={billing['country']}/{billing['currency']}")
-            payment_link = await create_plus_checkout_link(page, access_token, chatgpt_cfg, checkout_region=region, proxy=proxy)
+            payment_link = await create_plus_checkout_link(
+                page,
+                access_token,
+                chatgpt_cfg,
+                checkout_region=region,
+                proxy=proxy,
+                skip_methods=checkout_skip_methods,
+                preferred_methods=checkout_preferred_methods,
+                method_sink=checkout_method_sink,
+            )
         source_format = "hotmail" if account.client_id and account.refresh_token else ("icloud_query" if email.lower().endswith("@icloud.com") else "code_address")
         code_address = (account.code_address or account.mail_url or "").strip()
         session_record = session_export.extract_session_record(
@@ -516,12 +663,19 @@ async def register_one(
         cache_path = session_export.upsert_session_cache(session_record, path=cache_target)
         log(f"{prefix} session cached: {cache_path}")
         if create_payment_link:
-            log(f"{prefix} link ok")
+            method = str((checkout_method_sink or {}).get("method") or "unknown").strip() or "unknown"
+            log(f"{prefix} link ok method={method}")
             return payment_link
         log(f"{prefix} session bootstrap ok")
         return ""
 
     except Exception as exc:
+        if last_error is not None:
+            last_error["reason"] = str(exc)
+            if is_signin_problem_retry_reason(str(exc)):
+                last_error["kind"] = "retry_current_flow"
+            elif isinstance(exc, MailCodeTimeoutError):
+                last_error["kind"] = "mail_code_timeout"
         if page is not None:
             try:
                 current_url = page.url
@@ -533,6 +687,132 @@ async def register_one(
         if flow is not None:
             try:
                 await flow.screenshot("paypal_reg_failed.png")
+            except Exception:
+                pass
+        log(f"{prefix} failed: {exc}")
+        traceback.print_exc()
+        return None
+    finally:
+        await session.__aexit__(None, None, None)
+
+
+async def login_existing_account_for_checkout(
+    account: MailAccount,
+    mail_source: str,
+    cfg: dict[str, Any],
+    worker_id: int = 1,
+    proxy: str | None = None,
+    create_payment_link: bool = True,
+    session_cache_path: str | Path | None = None,
+    session_source: str = "paypal_flow1_existing_login",
+    checkout_region: str = "us",
+    last_error: dict[str, str] | None = None,
+    checkout_skip_methods: set[str] | None = None,
+    checkout_preferred_methods: list[str] | tuple[str, ...] | None = None,
+    checkout_method_sink: dict[str, str] | None = None,
+) -> str | None:
+    """Log in an already registered account and optionally create a checkout link."""
+    email = account.email
+    prefix = f"[paypal-login-{worker_id:02d}][{email}]"
+    mail_provider = MailProvider(
+        source=mail_source,
+        timeout_sec=int(cfg.get("mail", {}).get("code_timeout_sec", 150)),
+        poll_interval_sec=int(cfg.get("mail", {}).get("poll_interval_sec", 5)),
+        log_prefix=prefix,
+    )
+    browser_cfg = cfg.get("browser", {})
+    profile_dir = resolve_path("profiles") / f"paypal_login_{safe_filename(email)}"
+    session = BrowserSession(
+        profile_dir=profile_dir,
+        headless=bool(browser_cfg.get("headless", False)),
+        slow_mo=int(browser_cfg.get("slow_mo", 80)),
+        timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
+        proxy=proxy,
+        isolated=True,
+        fingerprint_seed=f"{email}|paypal-login|{proxy or ''}|{time.time_ns()}",
+    )
+    page = None
+    try:
+        await session.__aenter__()
+        page = await session.current_page()
+        register = ChatGPTRegister(
+            page=page,
+            page_getter=session.current_page,
+            start_url="https://chatgpt.com/auth/login",
+            entry_action="login",
+            mail_provider=mail_provider,
+            age_min=int(cfg.get("register_profile", {}).get("age_min", 21)),
+            age_max=int(cfg.get("register_profile", {}).get("age_max", 45)),
+            sms_selection=None,
+            log_prefix=prefix,
+            proxy=proxy,
+        )
+        log(f"{prefix} login existing registered account")
+        await register.run_until_logged_in(account, now_utc())
+        page = await session.current_page()
+        if "chatgpt.com" not in (page.url or ""):
+            await page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=45_000)
+        await page.wait_for_timeout(1500)
+        chatgpt_session = await _fetch_chatgpt_session_with_retry(page, prefix)
+        access_token = str(chatgpt_session.get("accessToken") or "")
+        if not access_token:
+            raise FreeRegisterError("failed to fetch accessToken")
+
+        payment_link = ""
+        if create_payment_link:
+            region = normalize_checkout_region(checkout_region)
+            billing = checkout_billing_for_region(region)
+            chatgpt_cfg = {**cfg["chatgpt"], "billing_country": billing["country"], "currency": billing["currency"]}
+            log(f"{prefix} create Plus checkout link from existing login: mode={region.upper()} billing={billing['country']}/{billing['currency']}")
+            payment_link = await create_plus_checkout_link(
+                page,
+                access_token,
+                chatgpt_cfg,
+                checkout_region=region,
+                proxy=proxy,
+                skip_methods=checkout_skip_methods,
+                preferred_methods=checkout_preferred_methods,
+                method_sink=checkout_method_sink,
+            )
+
+        source_format = "hotmail" if account.client_id and account.refresh_token else ("icloud_query" if email.lower().endswith("@icloud.com") else "code_address")
+        code_address = (account.code_address or account.mail_url or "").strip()
+        session_record = session_export.extract_session_record(
+            chatgpt_session,
+            email=email,
+            mail_source=mail_source,
+            source_format=source_format,
+            code_address=code_address,
+            payment_link=payment_link,
+            profile_dir=str(profile_dir),
+            source=session_source,
+        )
+        cache_target = session_cache_path or PAYPAL_SESSION_CACHE_FILE
+        cache_path = session_export.upsert_session_cache(session_record, path=cache_target)
+        log(f"{prefix} session cached: {cache_path}")
+        if create_payment_link:
+            method = str((checkout_method_sink or {}).get("method") or "unknown").strip() or "unknown"
+            log(f"{prefix} link ok method={method}")
+            return payment_link
+        log(f"{prefix} session bootstrap ok")
+        return ""
+    except Exception as exc:
+        if last_error is not None:
+            last_error["reason"] = str(exc)
+            if isinstance(exc, MailCodeTimeoutError):
+                last_error["kind"] = "mail_code_timeout"
+        if page is not None:
+            try:
+                current_url = page.url
+                title = await page.title()
+                body = await page.evaluate("() => (document.body?.innerText || '').slice(0, 1200)")
+                log(f"{prefix} debug page: url={current_url} title={title!r} body={body!r}")
+            except Exception:
+                pass
+            try:
+                out = resolve_path("output/paypal\u6ce8\u518c/debug")
+                out.mkdir(parents=True, exist_ok=True)
+                await page.screenshot(path=str(out / f"{safe_filename(email)}_login_failed.png"), full_page=True)
             except Exception:
                 pass
         log(f"{prefix} failed: {exc}")
@@ -615,7 +895,8 @@ async def run_paypal_register(
         _set_last_run_detail(message, path=str(REGISTER_ONLY_SUMMARY_FILE))
         return 0
 
-    use_proxy = paypal_register_proxy_enabled(env)
+    required_proxy_country = "JP" if region == "jp" else ""
+    use_proxy = paypal_register_proxy_enabled(env) or bool(required_proxy_country)
     proxy_pool: ProxyPool | None = None
     fallback_proxy = ""
     if use_proxy:
@@ -623,21 +904,66 @@ async def run_paypal_register(
         proxy_pool = ProxyPool(proxy_file)
         if proxy_pool.count() == 0:
             fallback_proxy = paypal_register_local_proxy_url(env)
-            proxy_pool = None
-            log(f"PayPal flow1: proxy pool empty, fallback local proxy: {proxy_file} -> {fallback_proxy or 'direct'}")
+            if required_proxy_country and fallback_proxy:
+                ok, reason = _probe_proxy_country(fallback_proxy, required_proxy_country)
+                if ok:
+                    proxy_pool = None
+                    log(
+                        f"PayPal flow1: proxy pool empty, fallback local proxy verified "
+                        f"{required_proxy_country}: {proxy_file} -> {fallback_proxy}"
+                    )
+                else:
+                    message = (
+                        f"JP checkout link requires Japan IP; proxy pool empty and fallback is not JP: "
+                        f"{proxy_file} -> {reason}"
+                    )
+                    log(f"PayPal flow1: {message}")
+                    _set_last_run_detail(message, path=str(proxy_file))
+                    return 0
+            else:
+                proxy_pool = None
+                log(f"PayPal flow1: proxy pool empty, fallback local proxy: {proxy_file} -> {fallback_proxy or 'direct'}")
         if proxy_pool is not None:
             log(f"PayPal flow1: proxy enabled, pool size={proxy_pool.count()}, file={proxy_file}")
-            # Preflight check first proxy to fail fast with actionable reason.
-            first_proxy = proxy_pool.pick(1)
-            if first_proxy:
-                ok, reason = _probe_proxy(first_proxy)
-                if not ok:
-                    log(f"PayPal flow1: proxy precheck failed: {reason}")
-                    log("PayPal flow1: cliproxy is required for JP region, stop this run")
+            usable_proxies, proxy_errors = _precheck_proxy_pool(
+                proxy_pool,
+                max_checks=proxy_pool.count() if required_proxy_country else 5,
+                required_country_code=required_proxy_country,
+            )
+            if usable_proxies:
+                proxy_pool.proxies = usable_proxies
+                if proxy_errors:
+                    suffix = f", required_country={required_proxy_country}" if required_proxy_country else ""
+                    log(f"PayPal flow1: proxy precheck skipped bad proxies={len(proxy_errors)}, usable={len(usable_proxies)}{suffix}")
+                else:
+                    suffix = f" ({required_proxy_country})" if required_proxy_country else ""
+                    log(f"PayPal flow1: proxy precheck passed{suffix}")
+            else:
+                reason = " | ".join(proxy_errors[:3]) if proxy_errors else "no usable proxy"
+                fallback_proxy = paypal_register_local_proxy_url(env)
+                if fallback_proxy and required_proxy_country:
+                    ok, fallback_reason = _probe_proxy_country(fallback_proxy, required_proxy_country)
+                    if ok:
+                        proxy_pool = None
+                        log(
+                            f"PayPal flow1: proxy precheck found no usable pool proxy, "
+                            f"fallback local proxy verified {required_proxy_country}: {reason} -> {fallback_proxy}"
+                        )
+                    else:
+                        message = (
+                            f"JP checkout link requires Japan IP; no usable JP proxy: "
+                            f"{reason}; fallback_not_jp={fallback_reason}"
+                        )
+                        log(f"PayPal flow1: {message}")
+                        _set_last_run_detail(message, path=str(proxy_file))
+                        return 0
+                elif fallback_proxy:
+                    proxy_pool = None
+                    log(f"PayPal flow1: proxy precheck found no usable pool proxy, fallback local proxy: {reason} -> {fallback_proxy}")
+                else:
+                    log(f"PayPal flow1: proxy precheck failed, no usable proxy: {reason}")
                     _set_last_run_detail(f"proxy precheck failed: {reason}", path=str(proxy_file))
                     return 0
-                else:
-                    log("PayPal flow1: proxy precheck passed")
     else:
         fallback_proxy = paypal_register_local_proxy_url(env)
         if fallback_proxy:
@@ -655,21 +981,87 @@ async def run_paypal_register(
     async def worker(index: int, account: MailAccount) -> None:
         nonlocal success
         async with sem:
-            proxy = proxy_pool.pick(index) if proxy_pool else fallback_proxy or None
-            if proxy:
-                log(f"[paypal-reg-{index:02d}] using proxy: {proxy}")
             account_mail_source = _mail_source_for_registered_account(account, active_source)
-            link = await register_one(
-                account,
-                account_mail_source,
-                cfg,
-                worker_id=index,
-                proxy=proxy,
-                checkout_region=region,
-            )
+            proxies = _proxy_attempts(proxy_pool, fallback_proxy)
+            link = None
+            link_method = ""
+            bad_methods = paypal_flow_state.bad_link_methods(account.email)
+            mail_code_timeout_count = 0
+            last_mail_code_timeout_reason = ""
+            signin_problem_retry_count = 0
+            for proxy_attempt, proxy in enumerate(proxies, start=1):
+                last_error: dict[str, str] = {}
+                method_sink: dict[str, str] = {}
+                if proxy:
+                    log(
+                        f"[paypal-reg-{index:02d}][{account.email}] "
+                        f"bind proxy ({proxy_attempt}/{len(proxies)}): {_display_proxy(proxy)}"
+                    )
+                if bad_methods:
+                    log(
+                        f"[paypal-reg-{index:02d}][{account.email}] "
+                        f"skip previously invalid checkout methods: {', '.join(sorted(bad_methods))}"
+                    )
+                link = await login_existing_account_for_checkout(
+                    account,
+                    account_mail_source,
+                    cfg,
+                    worker_id=index,
+                    proxy=proxy,
+                    checkout_region=region,
+                    last_error=last_error,
+                    checkout_skip_methods=bad_methods,
+                    checkout_method_sink=method_sink,
+                )
+                if link:
+                    link_method = method_sink.get("method", "")
+                    break
+                reason = last_error.get("reason") or "flow1 returned no payment link"
+                if last_error.get("kind") == "retry_current_flow" or is_signin_problem_retry_reason(reason):
+                    signin_problem_retry_count += 1
+                    log(
+                        f"[paypal-reg-{index:02d}][{account.email}] "
+                        f"signin problem page retry current flow "
+                        f"({signin_problem_retry_count}/{SIGNIN_PROBLEM_RETRY_CURRENT_FLOW_THRESHOLD}): "
+                        f"{_short_error(RuntimeError(reason))}"
+                    )
+                    if signin_problem_retry_count < SIGNIN_PROBLEM_RETRY_CURRENT_FLOW_THRESHOLD:
+                        proxies.insert(proxy_attempt, proxy)
+                        continue
+                if last_error.get("kind") == "mail_code_timeout" or _is_mail_code_timeout_reason(reason):
+                    mail_code_timeout_count += 1
+                    last_mail_code_timeout_reason = reason
+                    log(
+                        f"[paypal-reg-{index:02d}][{account.email}] "
+                        f"mail code timeout ({mail_code_timeout_count}/{MAIL_CODE_TIMEOUT_DISCARD_THRESHOLD})"
+                    )
+                    if mail_code_timeout_count >= MAIL_CODE_TIMEOUT_DISCARD_THRESHOLD:
+                        _discard_flow1_account_for_mail_timeout(
+                            account.email,
+                            reason=last_mail_code_timeout_reason,
+                        )
+                        log(
+                            f"[paypal-reg-{index:02d}][{account.email}] "
+                            "mail code timeout reached limit; account marked discarded"
+                        )
+                        return
+                    if proxy_attempt >= len(proxies):
+                        proxies.append(proxy)
+                    log(
+                        f"[paypal-reg-{index:02d}][{account.email}] "
+                        "retry login for new email code after timeout"
+                    )
+                    continue
+                if not proxy_pool or proxy_attempt >= len(proxies):
+                    break
+                log(
+                    f"[paypal-reg-{index:02d}][{account.email}] "
+                    f"flow failed, rebind random proxy ({proxy_attempt}/{len(proxies)}): "
+                    f"{_short_error(RuntimeError(reason))}"
+                )
             if link:
                 code_address = account.code_address or "mail"
-                save_to_link_pool(account.email, code_address, link, account_line=account.raw)
+                save_to_link_pool(account.email, code_address, link, account_line=account.raw, link_method=link_method)
                 if active_source == "domain163":
                     _mark_domain163_email_used(account.email)
                 success += 1

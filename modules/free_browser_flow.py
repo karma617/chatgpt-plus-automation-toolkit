@@ -41,12 +41,26 @@ class FreeBrowserFlow:
                         const widgetCount = document.querySelectorAll(
                             'div.cf-turnstile, [data-sitekey], script[src*="turnstile"], input[name="cf-turnstile-response"]'
                         ).length;
+                        const visible = (el) => {
+                            if (!el || !el.getBoundingClientRect) return false;
+                            const r = el.getBoundingClientRect();
+                            if (r.width < 8 || r.height < 8) return false;
+                            const s = window.getComputedStyle(el);
+                            return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || '1') > 0.05;
+                        };
+                        const clickableNodes = Array.from(document.querySelectorAll(
+                            'iframe[src*="turnstile"], iframe[src*="challenge-platform"], iframe[title*="Cloudflare" i], iframe[title*="challenge" i], div.cf-turnstile, [data-sitekey], [role="checkbox"], input[type="checkbox"]'
+                        )).filter((node) => visible(node) && node.getAttribute('type') !== 'hidden');
+                        const successNode = document.querySelector('#challenge-success-text');
+                        const successVisible = visible(successNode) || text.includes('\\u691c\\u8a3c\\u306b\\u6210\\u529f') || text.includes('verification successful');
                         const challengeText = (
                             title.includes('just a moment') ||
                             title.includes('cloudflare') ||
                             text.includes('checking your browser') ||
                             text.includes('verify you are human') ||
                             text.includes('\\u8bf7\\u9a8c\\u8bc1\\u60a8\\u662f\\u771f\\u4eba') ||
+                            text.includes('\\u30bb\\u30ad\\u30e5\\u30ea\\u30c6\\u30a3\\u691c\\u8a3c') ||
+                            text.includes('\\u30dc\\u30c3\\u30c8\\u3067\\u306f\\u306a\\u3044') ||
                             text.includes('cloudflare') ||
                             html.includes('cf-turnstile') ||
                             html.includes('challenges.cloudflare.com') ||
@@ -60,6 +74,8 @@ class FreeBrowserFlow:
                             token,
                             iframeCount,
                             widgetCount,
+                            clickableHint: clickableNodes.length > 0,
+                            successVisible,
                             challengeText,
                             title,
                         };
@@ -73,6 +89,8 @@ class FreeBrowserFlow:
                 "token": "",
                 "iframeCount": 0,
                 "widgetCount": 0,
+                "clickableHint": False,
+                "successVisible": False,
                 "challengeText": False,
                 "title": "",
             }
@@ -119,12 +137,13 @@ class FreeBrowserFlow:
                 "label",
                 "[role='checkbox']",
                 "button",
-                "body",
             ]
             for selector in selectors:
                 try:
                     loc = frame.locator(selector).first
                     if await loc.count() <= 0:
+                        continue
+                    if not await loc.is_visible(timeout=700):
                         continue
                     await loc.scroll_into_view_if_needed(timeout=700)
                     await loc.click(timeout=1200, force=True)
@@ -146,9 +165,10 @@ class FreeBrowserFlow:
                             return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
                         };
                         const nodes = Array.from(document.querySelectorAll(
-                            'div.cf-turnstile, [data-sitekey], iframe[src*="turnstile"], input[name="cf-turnstile-response"]'
+                            'div.cf-turnstile, [data-sitekey], iframe[src*="turnstile"], iframe[src*="challenge-platform"], [role="checkbox"], input[type="checkbox"]'
                         ));
                         for (const node of nodes) {
+                            if (node.getAttribute('type') === 'hidden') continue;
                             const target = node.closest('label, div, form') || node;
                             if (!visible(target)) continue;
                             target.scrollIntoView({ block: 'center', inline: 'center' });
@@ -181,6 +201,10 @@ class FreeBrowserFlow:
             token_len = int(state.get("tokenLength") or 0)
             if not state.get("present"):
                 return True
+            if state.get("successVisible"):
+                self.say("[Cloudflare] managed challenge success text visible, waiting redirect")
+                await self.sleep(3000)
+                continue
             if token_len >= 80:
                 self.say(f"[Cloudflare] Turnstile passed token_len={token_len}")
                 return True
@@ -189,7 +213,7 @@ class FreeBrowserFlow:
                 self.say(f"[Cloudflare] Turnstile challenge detected{suffix}, waiting token_len={token_len}")
                 logged = True
             now = time.monotonic()
-            if now - last_retry >= 3:
+            if state.get("clickableHint") and now - last_retry >= 12:
                 last_retry = now
                 try:
                     await self.page.evaluate(

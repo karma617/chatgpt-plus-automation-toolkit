@@ -443,6 +443,120 @@ def test_paypal_auto_jp_nocard_reuses_ready_registered_account_without_registeri
     assert event["status"] == "success"
 
 
+def test_paypal_auto_jp_nocard_without_long_link_skips_flow1(monkeypatch, capsys) -> None:
+    args = panel_runner.parse_args(
+        [
+            "paypal-auto-jp-nocard",
+            "--count",
+            "1",
+            "--workers",
+            "1",
+            "--mail-source",
+            "hotmail",
+        ]
+    )
+    calls = []
+    pending_calls = {"count": 0}
+
+    async def fail_flow1(*args, **kwargs):
+        raise AssertionError("flow1 should be skipped when PAYPAL_USE_LONG_LINK=false")
+
+    async def fake_flow2(*args, **kwargs):
+        calls.append(("flow2", kwargs))
+        return 1
+
+    def fake_pending_count(*args, **kwargs):
+        pending_calls["count"] += 1
+        return 1 if pending_calls["count"] >= 2 else 0
+
+    def fake_authorize(**kwargs):
+        calls.append(("flow3", kwargs))
+        return 0
+
+    monkeypatch.setattr(
+        panel_runner,
+        "_load_panel_config",
+        lambda *args, **kwargs: {
+            "mail": {"source": "hotmail"},
+            "mail_sources": {"hotmail": {"source": "hotmail", "accounts_file": "hotmail.txt"}},
+        },
+    )
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_USE_LONG_LINK": "false"})
+    monkeypatch.setattr(panel_runner, "_count_flow1_ready_registered", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_direct_pay_ready", lambda selected_email="": 1)
+    monkeypatch.setattr(panel_runner, "_count_payment_links", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_pending_auth", fake_pending_count)
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fail_flow1)
+    monkeypatch.setattr(panel_runner, "run_paypal_pay", fake_flow2)
+    monkeypatch.setattr(panel_runner, "_run_paypal_authorize", fake_authorize)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 0
+    assert [name for name, _kwargs in calls] == ["flow2", "flow3"]
+    assert calls[0][1]["card_source_mode"] == "local_random"
+    assert calls[0][1]["flow2_region_mode"] == "jp"
+    event = json.loads(capsys.readouterr().out)
+    assert event["status"] == "success"
+
+
+def test_paypal_auto_jp_nocard_without_long_link_registers_then_direct_pay(monkeypatch, capsys) -> None:
+    args = panel_runner.parse_args(
+        [
+            "paypal-auto-jp-nocard",
+            "--count",
+            "1",
+            "--workers",
+            "1",
+            "--mail-source",
+            "hotmail",
+        ]
+    )
+    calls = []
+    direct_counts = iter([0, 1, 1])
+    pending_counts = iter([0, 1])
+
+    def fake_register_tool_only(*args, **kwargs):
+        calls.append(("register-only", kwargs))
+        return SimpleNamespace(ok=True, success_count=1, target_count=1, returncode=0, summary_file="registered_sessions.txt")
+
+    async def fail_flow1(*args, **kwargs):
+        raise AssertionError("flow1 should still be skipped after register-only when PAYPAL_USE_LONG_LINK=false")
+
+    async def fake_flow2(*args, **kwargs):
+        calls.append(("flow2", kwargs))
+        return 1
+
+    def fake_authorize(**kwargs):
+        calls.append(("flow3", kwargs))
+        return 0
+
+    monkeypatch.setattr(
+        panel_runner,
+        "_load_panel_config",
+        lambda *args, **kwargs: {
+            "mail": {"source": "hotmail"},
+            "mail_sources": {"hotmail": {"source": "hotmail", "accounts_file": "hotmail.txt"}},
+        },
+    )
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_USE_LONG_LINK": "false"})
+    monkeypatch.setattr(panel_runner, "_count_flow1_ready_registered", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_direct_pay_ready", lambda selected_email="": next(direct_counts))
+    monkeypatch.setattr(panel_runner, "_count_payment_links", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_pending_auth", lambda selected_email="": next(pending_counts))
+    monkeypatch.setattr(panel_runner, "run_register_tool_only", fake_register_tool_only)
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fail_flow1)
+    monkeypatch.setattr(panel_runner, "run_paypal_pay", fake_flow2)
+    monkeypatch.setattr(panel_runner, "_run_paypal_authorize", fake_authorize)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 0
+    assert [name for name, _kwargs in calls] == ["register-only", "flow2", "flow3"]
+    event = json.loads(capsys.readouterr().out)
+    assert event["status"] == "success"
+
+
 def test_register_only_run_action_delegates_to_bridge(monkeypatch, tmp_path, capsys) -> None:
     cfg = {
         "mail": {"source": "default"},
@@ -458,6 +572,7 @@ def test_register_only_run_action_delegates_to_bridge(monkeypatch, tmp_path, cap
         workers: int,
         mail_source: str,
         selected_email: str,
+        env=None,
     ):
         captured.update(
             {
@@ -466,6 +581,7 @@ def test_register_only_run_action_delegates_to_bridge(monkeypatch, tmp_path, cap
                 "workers": workers,
                 "mail_source": mail_source,
                 "selected_email": selected_email,
+                "env": env,
             }
         )
         return SimpleNamespace(
@@ -499,6 +615,7 @@ def test_register_only_run_action_delegates_to_bridge(monkeypatch, tmp_path, cap
     assert captured["workers"] == 3
     assert captured["mail_source"] == "hotmail"
     assert captured["selected_email"] == "user@example.com"
+    assert isinstance(captured["env"], dict)
     assert captured["cfg"]["mail"]["active_source"] == "hotmail"
     output = capsys.readouterr().out
     event = json.loads(output)

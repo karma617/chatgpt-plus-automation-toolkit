@@ -54,12 +54,12 @@ def register_only_mode(env: dict[str, str] | None = None) -> str:
     aliases = {
         "email": "email",
         "mail": "email",
-        "邮箱": "email",
-        "邮箱注册": "email",
+        _zh(r"\u90ae\u7bb1"): "email",
+        _zh(r"\u90ae\u7bb1\u6ce8\u518c"): "email",
         "phone": "phone",
         "sms": "phone",
-        "手机号": "phone",
-        "手机号注册": "phone",
+        _zh(r"\u624b\u673a\u53f7"): "phone",
+        _zh(r"\u624b\u673a\u53f7\u6ce8\u518c"): "phone",
     }
     return aliases.get(value, "email")
 
@@ -85,6 +85,7 @@ def run_register_tool_only(
     workers: int,
     mail_source: str = "",
     selected_email: str = "",
+    env: dict[str, str] | None = None,
 ) -> RegisterOnlyRunResult:
     """Run the migrated one-click registration path using this project's config chain."""
     del mail_source
@@ -94,6 +95,7 @@ def run_register_tool_only(
             count=max(1, int(count or 1)),
             workers=max(1, int(workers or 1)),
             selected_email=selected_email,
+            env=env,
         )
     )
 
@@ -104,11 +106,12 @@ async def run_register_only_many(
     count: int,
     workers: int,
     selected_email: str = "",
+    env: dict[str, str] | None = None,
 ) -> RegisterOnlyRunResult:
     import main as main_app
 
-    register_cfg = clone_register_only_config(cfg, selected_email=selected_email)
-    mode = register_only_mode()
+    mode = register_only_mode(env)
+    register_cfg = clone_register_only_config(cfg, selected_email=selected_email, register_mode=mode)
     ensure_output_files()
     store = main_app.create_store(register_cfg)
     apply_paypal_blocked_emails(store)
@@ -152,7 +155,7 @@ async def run_register_only_many(
         while True:
             if not await counter.acquire_slot():
                 return
-            proxy = proxy_pool.pick(worker_id) if proxy_pool else main_app.fallback_proxy_from_env() or None
+            proxy = main_app.pick_task_proxy(proxy_pool, main_app.fallback_proxy_from_env(), seed=worker_id)
             result = await main_app.run_account(
                 register_cfg,
                 store,
@@ -184,13 +187,22 @@ async def run_register_only_many(
     )
 
 
-def clone_register_only_config(cfg: dict[str, Any], *, selected_email: str = "") -> dict[str, Any]:
+def clone_register_only_config(
+    cfg: dict[str, Any],
+    *,
+    selected_email: str = "",
+    register_mode: str = "",
+) -> dict[str, Any]:
     cloned = dict(cfg)
     output_cfg = dict(cloned.get("output") or {})
     output_cfg["success_file"] = str(REGISTER_ONLY_SUMMARY_FILE)
     output_cfg["failed_file"] = str(REGISTER_ONLY_FAILED_FILE)
     output_cfg["in_progress_file"] = str(REGISTER_ONLY_IN_PROGRESS_FILE)
     cloned["output"] = output_cfg
+    if register_mode == "phone":
+        chatgpt_cfg = dict(cloned.get("chatgpt") or {})
+        chatgpt_cfg["entry_action"] = "signup_phone"
+        cloned["chatgpt"] = chatgpt_cfg
     if selected_email:
         mail_cfg = dict(cloned.get("mail") or {})
         source_path = resolve_path(str(mail_cfg.get("accounts_file") or ""))

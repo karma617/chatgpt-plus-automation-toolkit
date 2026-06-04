@@ -33,6 +33,13 @@ def _env_int(env: dict[str, str], key: str, default: int, minimum: int = 0) -> i
         return default
 
 
+def _env_float(env: dict[str, str], key: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(str(env.get(key) or "").strip()))
+    except ValueError:
+        return default
+
+
 def normalize_base_url(value: str) -> str:
     raw = str(value or "").strip().rstrip("/")
     if not raw:
@@ -255,11 +262,15 @@ def upload_cpa(bundle: dict[str, Any], env: dict[str, str], account_type: str = 
     api_key = _env_first(env, "CPA_SERVER_API_KEY", "AUTH_SERVER_API_KEY", "ACCOUNT_POOL_API_KEY")
     if not base_url or not api_key:
         return UploadResult("cpa", ok=False, skipped=True, error="missing_cpa_url_or_api_key")
-    return _post_cpa_auth_file(
-        normalize_cpa_auth_files_url(base_url),
-        cpa_upload_payload(bundle, account_type=account_type),
-        api_key,
-        timeout=30,
+    return _retry_upload(
+        lambda: _post_cpa_auth_file(
+            normalize_cpa_auth_files_url(base_url),
+            cpa_upload_payload(bundle, account_type=account_type),
+            api_key,
+            timeout=30,
+        ),
+        attempts=_env_int(env, "AUTH_UPLOAD_RETRY", 3, 1),
+        interval=_env_float(env, "AUTH_UPLOAD_RETRY_INTERVAL", 2.0, 0.0),
     )
 
 
@@ -273,12 +284,16 @@ def upload_sub2api(bundle: dict[str, Any], env: dict[str, str]) -> UploadResult:
     headers = _sub2api_auth_headers(env, api_key)
     headers["Idempotency-Key"] = f"import-{int(time.time())}"
     group_ids = resolve_sub2api_group_ids(env, base_url, api_key, timeout)
-    return _post_json(
-        "sub2api",
-        join_url(base_url, import_path),
-        sub2api_upload_payload(bundle, env, group_ids=group_ids),
-        headers,
-        timeout,
+    return _retry_upload(
+        lambda: _post_json(
+            "sub2api",
+            join_url(base_url, import_path),
+            sub2api_upload_payload(bundle, env, group_ids=group_ids),
+            headers,
+            timeout,
+        ),
+        attempts=_env_int(env, "AUTH_UPLOAD_RETRY", 3, 1),
+        interval=_env_float(env, "AUTH_UPLOAD_RETRY_INTERVAL", 2.0, 0.0),
     )
 
 
@@ -340,6 +355,27 @@ def _post_json(target: str, url: str, payload: dict[str, Any], headers: dict[str
         return UploadResult(target, ok=True, status_code=resp.status_code)
     except Exception as exc:  # noqa: BLE001
         return UploadResult(target, ok=False, error=str(exc))
+
+
+def _retry_upload(call, *, attempts: int, interval: float) -> UploadResult:
+    attempts = max(1, int(attempts or 1))
+    last_result: UploadResult | None = None
+    for attempt in range(1, attempts + 1):
+        result = call()
+        if result.ok or result.skipped:
+            return result
+        last_result = result
+        if attempt < attempts and interval > 0:
+            time.sleep(interval)
+    if last_result and attempts > 1 and last_result.error:
+        return UploadResult(
+            last_result.target,
+            ok=False,
+            skipped=last_result.skipped,
+            status_code=last_result.status_code,
+            error=f"{last_result.error} (attempts={attempts})",
+        )
+    return last_result or UploadResult("unknown", ok=False, error="upload_failed")
 
 
 def _post_cpa_auth_file(url: str, payload: dict[str, Any], api_key: str, timeout: int) -> UploadResult:

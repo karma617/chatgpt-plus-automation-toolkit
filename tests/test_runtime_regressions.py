@@ -38,8 +38,143 @@ def test_browser_session_supports_isolated_non_persistent_context() -> None:
 
     assert "isolated: bool = False" in source
     assert "chromium.launch(" in source
-    assert "new_context(viewport=" in source
+    assert "new_context(**self._context_options())" in source
     assert "launch_persistent_context(" in source
+    assert "add_init_script(script=script)" in source
+
+
+def test_browser_session_uses_random_legal_fingerprint_surface() -> None:
+    source = (ROOT / "modules" / "browser.py").read_text(encoding="utf-8")
+
+    assert "_build_fingerprint" in source
+    assert "BROWSER_RANDOM_FINGERPRINT" in source
+    assert "Chrome/{major}.0.0.0" in source
+    assert "timezone_id" in source
+    assert "device_scale_factor" in source
+    assert "hardwareConcurrency" in source
+
+
+def test_chatgpt_register_turnstile_backoff_is_low_frequency() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+
+    assert "click_count < 2" in source
+    assert "now - last_click >= 12" in source
+    assert "rotate proxy/session" in source
+    assert "clickableHint" in source
+    assert "successVisible" in source
+    assert "managed challenge has no visible widget/iframe" in source
+    assert '"body"' not in source[source.index("async def click_cloudflare_turnstile_widget") :]
+
+
+def test_turnstile_click_does_not_target_hidden_response_input() -> None:
+    chatgpt_source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    free_source = (ROOT / "modules" / "free_browser_flow.py").read_text(encoding="utf-8")
+
+    assert "input[name=\"cf-turnstile-response\"]" in chatgpt_source
+    assert "'input[name=\"cf-turnstile-response\"]'," not in chatgpt_source[
+        chatgpt_source.index("async def click_cloudflare_turnstile_widget") :
+    ]
+    assert "node.getAttribute('type') === 'hidden'" in chatgpt_source
+    assert "body" not in free_source[free_source.index("selectors = [") : free_source.index("if clicked:")]
+    assert "node.getAttribute('type') === 'hidden'" in free_source
+    assert "\\\\u30bb\\\\u30ad\\\\u30e5\\\\u30ea\\\\u30c6\\\\u30a3\\\\u691c\\\\u8a3c" in chatgpt_source
+
+
+def test_chatgpt_register_runtime_wires_flaresolverr_fallback() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    client_source = (ROOT / "modules" / "flaresolverr_client.py").read_text(encoding="utf-8")
+    service_source = (ROOT / "modules" / "flaresolverr_service.py").read_text(encoding="utf-8")
+    runner_source = (ROOT / "panel_runner.py").read_text(encoding="utf-8")
+
+    assert "from .flaresolverr_client import" in source
+    assert "await self.try_flaresolverr_challenge()" in source
+    assert "solve_with_flaresolverr" in source
+    assert "proxy=self.proxy" in source
+    assert "try FlareSolverr or rotate proxy/session" in source
+    assert "page.context.add_cookies(result.cookies)" in client_source
+    assert "add_init_script(" in client_source
+    assert "tools/flaresolverr/FlareSolverr.exe" in service_source
+    assert "ghcr.io/flaresolverr/flaresolverr:latest" in service_source
+    assert "ensure_flaresolverr_service(env_values" in runner_source
+
+
+def test_chatgpt_register_profile_fill_uses_stable_japanese_dom_fields() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    fill_profile = source[source.index("async def fill_profile(self)") : source.index("async def handle_phone_required")]
+
+    assert "async def page_looks_like_profile_page" in source
+    assert "async def fill_profile_stable_fields" in source
+    assert 'input[name="name"], input[autocomplete="name"]' in source
+    assert 'input[name="age"], input[inputmode="numeric"], input[type="number"]' in source
+    assert 'input[name="birthday"][type="hidden"]' in source
+    assert fill_profile.index("fill_profile_stable_fields") < fill_profile.index("fill_profile_by_js")
+
+
+def test_phone_register_mode_never_falls_back_to_email_fill() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    email_branch = source[source.index('if state == "email":') : source.index('if state == "password":')]
+    phone_gate = email_branch[email_branch.index("if self.is_phone_signup_mode()") : email_branch.index("self.log(f")]
+
+    assert "await self.force_phone_login_entry()" in phone_gate
+    assert "continue" in phone_gate
+    assert "await self.fill_email(account.email)" not in phone_gate
+    assert "PHONE_ENTRY_ACTIONS" in source
+    assert "async def force_phone_login_entry" in source
+
+
+def test_phone_login_detection_requires_dom_evidence_not_url_only() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    helper = source[source.index("async def is_phone_login_page") : source.index("async def visible_input_count")]
+
+    assert "phone_url =" in helper
+    assert "phone_inputs = await visible_input_count" in helper
+    assert "username_inputs = await visible_input_count" in helper
+    assert 'if "usernamekind=phone_number" in url or "screen_hint=phone" in url:' not in helper
+
+
+def test_login_state_machine_handles_account_picker_and_signin_problem_pages() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    run_loop = source[source.index("async def run_until_logged_in") : source.index("async def refresh_page")]
+
+    assert 'if state == "account_picker":' in run_loop
+    assert "await self.handle_account_picker(account)" in run_loop
+    assert 'if state == "signin_problem":' in run_loop
+    assert "await self.handle_signin_problem()" in run_loop
+    assert "SIGNIN_PROBLEM_RETRY_CURRENT_FLOW" in source
+
+
+def test_account_picker_and_signin_problem_click_helpers_are_wired() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    account_picker = source[source.index("async def handle_account_picker") : source.index("async def handle_signin_problem")]
+    signin_problem = source[source.index("async def handle_signin_problem") : source.index("async def try_cloudflare_turnstile_challenge")]
+
+    assert "async def is_account_picker_page" in source
+    assert "async def click_account_picker_session" in source
+    assert "button[name=\"session_id\"]" in source
+    assert "Select existing session" in source
+    assert "await click_account_picker_session" in account_picker
+    assert "await click_account_picker_link" in account_picker
+    assert "def is_signin_problem_page" in source
+    assert "async def click_signin_problem_action" in source
+    assert "await click_signin_problem_action" in signin_problem
+    assert "problem page button no response" in signin_problem
+
+
+def test_signin_problem_retry_marker_is_handled_by_outer_flows() -> None:
+    chatgpt_source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    paypal_register_source = (ROOT / "modules" / "paypal_register.py").read_text(encoding="utf-8")
+    paypal_pay_source = (ROOT / "modules" / "paypal_pay.py").read_text(encoding="utf-8")
+
+    assert 'SIGNIN_PROBLEM_RETRY_CURRENT_FLOW = "SIGNIN_PROBLEM_RETRY_CURRENT_FLOW"' in chatgpt_source
+    assert "def is_signin_problem_retry_reason" in chatgpt_source
+    assert "startswith(SIGNIN_PROBLEM_RETRY_CURRENT_FLOW)" in chatgpt_source
+    assert 'last_error["kind"] = "retry_current_flow"' in paypal_register_source
+    assert "SIGNIN_PROBLEM_RETRY_CURRENT_FLOW_THRESHOLD = 3" in paypal_register_source
+    assert 'last_error.get("kind") == "retry_current_flow"' in paypal_register_source
+    assert "proxies.insert(proxy_attempt, proxy)" in paypal_register_source
+    assert "signin problem page retry current flow" in paypal_register_source
+    assert "from .chatgpt_register import ChatGPTRegister, is_signin_problem_retry_reason" in paypal_pay_source
+    assert "if is_signin_problem_retry_reason(reason):" in paypal_pay_source
 
 
 def test_register_and_paypal_flows_use_isolated_browser_sessions() -> None:

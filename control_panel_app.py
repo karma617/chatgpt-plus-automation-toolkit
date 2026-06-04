@@ -43,6 +43,7 @@ from control_panel.file_registry import PanelFile, get_panel_files
 from control_panel.proxy_tools import add_proxy_schemes
 from control_panel.sms_options import dynamic_env_options, parse_dynamic_display
 from control_panel.text_pool_service import clear_file, dedupe_lines, export_txt, import_txt, read_text, save_text
+from modules.flaresolverr_service import ensure_flaresolverr_service
 
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
@@ -55,6 +56,17 @@ def _u(value: str) -> str:
 
 def strip_ansi_for_display(text: str) -> str:
     return ANSI_RE.sub("", text)
+
+
+def _env_bool_value(values: dict[str, str], key: str, default: bool = False) -> bool:
+    raw = str(values.get(key) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on", "y"}:
+        return True
+    if raw in {"0", "false", "no", "off", "disabled", "none", "n"}:
+        return False
+    return default
 
 
 def app_root() -> Path:
@@ -769,6 +781,17 @@ class RunPage(ttk.Frame):
         if self.process and self.process.poll() is None:
             messagebox.showwarning("任务运行中", "请先停止当前任务")
             return
+        if action == "paypal-flow1-jp":
+            env = read_env(self.root_path / ".env")
+            if not _env_bool_value(env, "PAYPAL_USE_LONG_LINK", True):
+                messagebox.showinfo(
+                    _u(r"\u957f\u94fe\u751f\u6210\u5df2\u5173\u95ed"),
+                    _u(
+                        r"\u5f53\u524d PAYPAL_USE_LONG_LINK=false\uff0c\u5df2\u5173\u95ed\u65e5\u533a\u65e0\u5361\u957f\u94fe\u751f\u6210\u3002\n"
+                        r"\u8bf7\u76f4\u63a5\u70b9\u51fb\u201c\u6d41\u7a0b2 \u65e5\u672c\u4ee3\u7406(\u65e0\u5361)\u201d\uff0c\u7a0b\u5e8f\u4f1a\u767b\u5f55\u5df2\u6ce8\u518c\u8d26\u53f7\u5e76\u4ece ChatGPT \u9886\u53d6\u4f18\u60e0/\u5347\u7ea7\u5165\u53e3\u63a5\u7ba1\u652f\u4ed8\u6d41\u7a0b\u3002"
+                    ),
+                )
+                return
         cmd = self._runner_command(action)
         self._append_log(f"> {' '.join(cmd)}\n")
         self.process = subprocess.Popen(
@@ -945,7 +968,12 @@ class ControlPanelApp(tk.Tk):
 
 def main() -> int:
     root_path = app_root()
+    env_path = root_path / ".env"
     app = ControlPanelApp(root_path)
+    threading.Thread(
+        target=lambda: ensure_flaresolverr_service(read_env(env_path)),
+        daemon=True,
+    ).start()
     app.mainloop()
     return 0
 

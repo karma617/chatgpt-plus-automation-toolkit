@@ -151,7 +151,7 @@ if (-not (Test-Path $DistRoot)) {
     throw "PyInstaller output not found: $DistRoot"
 }
 
-$CopyDirs = @("data", "output", "profiles")
+$CopyDirs = @("data", "output", "profiles", "tools")
 foreach ($dir in $CopyDirs) {
     $src = Join-Path $ProjectRoot $dir
     $dst = Join-Path $DistRoot $dir
