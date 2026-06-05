@@ -51,6 +51,9 @@ class RunAccountStore:
     def complete(self, email):
         self.completed.append(email)
 
+    def finish_claim(self, email):
+        self.completed.append(email)
+
     def return_to_pool(self, account):
         self.returned.append(account.email)
 
@@ -282,6 +285,56 @@ def test_run_register_only_many_uses_runtime_env_for_phone_mode(monkeypatch, tmp
     assert captured["run_cfg"]["chatgpt"]["entry_action"] == "signup_phone"
     assert captured["ensure_cfg"]["chatgpt"]["entry_action"] == "signup_phone"
     assert captured["kwargs"]["sms_selection"] is sms_selection
+
+
+def test_run_register_only_many_stops_after_attempt_limit(monkeypatch, tmp_path) -> None:
+    output_dir = tmp_path / "output" / "register_only"
+    session_dir = output_dir / "sessiond"
+    session_cache = session_dir / "session_cache.jsonl"
+    summary_file = output_dir / "registered_sessions.txt"
+    used_file = output_dir / "used_emails.txt"
+    in_progress_file = output_dir / "in_progress.txt"
+    failed_file = output_dir / "failed_accounts.txt"
+    created_store = SimpleNamespace(name="store")
+    calls = []
+
+    async def fake_ensure_register_accounts(cfg, store, desired_count: int) -> int:
+        return desired_count
+
+    async def fake_run_account(cfg, store, worker_id: int, **kwargs):
+        calls.append(worker_id)
+        return False
+
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_SESSION_DIR", session_dir)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_SESSION_CACHE_FILE", session_cache)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_SUMMARY_FILE", summary_file)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_USED_FILE", used_file)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_IN_PROGRESS_FILE", in_progress_file)
+    monkeypatch.setattr(bridge, "REGISTER_ONLY_FAILED_FILE", failed_file)
+    monkeypatch.setattr(bridge, "register_only_mode", lambda env=None: "email")
+    monkeypatch.setattr(main, "create_store", lambda cfg: created_store)
+    monkeypatch.setattr(main, "ensure_register_accounts", fake_ensure_register_accounts)
+    monkeypatch.setattr(main, "create_proxy_pool", lambda cfg: None)
+    monkeypatch.setattr(main, "run_account", fake_run_account)
+    monkeypatch.setattr(main, "log", lambda message: None)
+    monkeypatch.setattr(main, "worker_log", lambda worker_id, message: None)
+
+    result = asyncio.run(
+        bridge.run_register_only_many(
+            {
+                "mail": {"source": "hotmail"},
+                "output": {"success_file": "old-success.txt", "failed_file": "old-failed.txt"},
+            },
+            count=1,
+            workers=1,
+            env={"REGISTER_ONLY_MAX_ATTEMPTS": "2"},
+        )
+    )
+
+    assert result.returncode == 1
+    assert result.success_count == 0
+    assert len(calls) == 2
 
 
 def test_run_register_tool_only_passes_runtime_env(monkeypatch) -> None:
@@ -531,6 +584,53 @@ def test_run_account_phone_bind_failure_does_not_save_success(monkeypatch, tmp_p
     assert store.completed == []
     assert store.returned == ["phone-bind-fail@example.com"]
     assert store.failed and store.failed[0][0] == "phone-bind-fail@example.com"
+
+
+def test_run_account_register_only_cloudflare_block_does_not_return_to_pool(monkeypatch, tmp_path) -> None:
+    from modules.chatgpt_register import CLOUDFLARE_CHALLENGE_RETRYABLE
+    from modules.storage import MailAccount
+
+    mail_account = MailAccount(
+        email="cloudflare@example.com",
+        password="pw",
+        client_id="client",
+        refresh_token="rt",
+        raw="cloudflare@example.com----pw----client----rt",
+    )
+    store = RunAccountStore(mail_account)
+    store.blocked_emails = set()
+
+    class BlockingChatGPTRegister:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def run_until_logged_in(self, account, since) -> None:
+            raise RuntimeError(CLOUDFLARE_CHALLENGE_RETRYABLE)
+
+    monkeypatch.setattr(main, "BrowserSession", FakeRunAccountSession)
+    monkeypatch.setattr(main, "ChatGPTRegister", BlockingChatGPTRegister)
+    monkeypatch.setattr(main, "log", lambda message: None)
+
+    result = asyncio.run(
+        main.run_account(
+            {
+                "mail": {"source": "hotmail"},
+                "browser": {"headless": False, "slow_mo": 0, "timeout_ms": 1000},
+                "chatgpt": {"start_url": "https://chatgpt.com", "entry_action": "signup"},
+                "register_profile": {"age_min": 21, "age_max": 45},
+            },
+            store,
+            worker_id=1,
+            create_payment_link=False,
+            session_cache_path=tmp_path / "session_cache.jsonl",
+        )
+    )
+
+    assert result is None
+    assert store.returned == []
+    assert store.failed == [("cloudflare@example.com", CLOUDFLARE_CHALLENGE_RETRYABLE)]
+    assert "cloudflare@example.com" in store.completed
+    assert "cloudflare@example.com" in store.blocked_emails
 
 
 def test_apply_paypal_blocked_emails_blocks_discarded_registered_and_linked(monkeypatch, tmp_path) -> None:

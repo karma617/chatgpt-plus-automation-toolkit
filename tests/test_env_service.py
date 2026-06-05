@@ -82,6 +82,7 @@ def test_known_env_fields_include_api_keys() -> None:
     fields = get_known_env_fields()
 
     assert "REGISTER_ONLY_MODE" in fields
+    assert "REGISTER_ONLY_MAX_ATTEMPTS" in fields
     assert "MOEMAIL_BASE_URL" in fields
     assert "MAIL_ACCOUNT_MODE" in fields
     assert "HERO_SMS_POLL_INTERVAL" in fields
@@ -188,6 +189,7 @@ def test_sms_provider_fields_are_grouped_by_platform() -> None:
 
 def test_known_env_fields_include_dropdown_choices_for_enum_values() -> None:
     assert _field_by_key("REGISTER_ONLY_MODE").choices == ("email", "phone")
+    assert _field_by_key("REGISTER_ONLY_MAX_ATTEMPTS").choices == ()
     assert _field_by_key("MAIL_ACCOUNT_MODE").choices == ("pool", "api")
     assert _field_by_key("MOEMAIL_DOMAIN_MODE").choices == ("random", "fixed", "rotate")
     assert _field_by_key("MOEMAIL_CREATE_MODE").choices == ("human", "random")

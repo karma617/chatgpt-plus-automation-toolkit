@@ -26,6 +26,7 @@ UNKNOWN_PAGE_RETRY_WAIT_MS = 5000
 CLOUDFLARE_CHALLENGE_RETRYABLE = "cloudflare_turnstile_not_solved"
 SIGNIN_PROBLEM_RETRY_CURRENT_FLOW = "SIGNIN_PROBLEM_RETRY_CURRENT_FLOW"
 PHONE_ENTRY_ACTIONS = {"signup_phone", "phone_signup", "phone"}
+AUTH_ERROR_PATHS = ("/api/auth/error", "/auth/error")
 
 
 def _zh(text: str) -> str:
@@ -34,6 +35,11 @@ def _zh(text: str) -> str:
 
 def is_signin_problem_retry_reason(reason: str | None) -> bool:
     return str(reason or "").strip().startswith(SIGNIN_PROBLEM_RETRY_CURRENT_FLOW)
+
+
+def is_auth_error_url(url: str | None) -> bool:
+    value = str(url or "").lower()
+    return any(path in value for path in AUTH_ERROR_PATHS)
 
 
 class FatalAccountError(RuntimeError):
@@ -61,6 +67,9 @@ class ChatGPTRegister:
         sms_selection: dict[str, object] | None = None,
         log_prefix: str = "",
         proxy: str | None = None,
+        manual_challenge: bool = False,
+        manual_challenge_timeout_ms: int = 600_000,
+        headless: bool = False,
     ):
         self.page = page
         self.page_getter = page_getter
@@ -72,6 +81,9 @@ class ChatGPTRegister:
         self.sms_selection = sms_selection
         self.log_prefix = log_prefix
         self.proxy = proxy
+        self.manual_challenge = manual_challenge
+        self.manual_challenge_timeout_ms = max(30_000, int(manual_challenge_timeout_ms or 600_000))
+        self.headless = bool(headless)
         self.generated_name: str | None = None
         self.generated_age: str | None = None
         self.bad_codes: set[str] = set()
@@ -167,6 +179,7 @@ class ChatGPTRegister:
                     if challenge_result == "solved":
                         self.log("[Cloudflare] Turnstile/managed challenge handled, retry page state")
                         self.unknown_count = 0
+                        await self.recover_from_auth_error(account)
                         continue
                     if challenge_result == "blocked":
                         raise CloudflareChallengeError(CLOUDFLARE_CHALLENGE_RETRYABLE)
@@ -193,6 +206,17 @@ class ChatGPTRegister:
     async def refresh_page(self) -> None:
         if self.page_getter:
             self.page = await self.page_getter()
+
+    async def recover_from_auth_error(self, account: MailAccount) -> None:
+        if not is_auth_error_url(self.page.url):
+            return
+        if self.is_phone_signup_mode():
+            self.log(_zh(r"\u4eba\u673a\u9a8c\u8bc1\u5b8c\u6210\u540e\u4ecd\u5728 auth error\uff0c\u91cd\u65b0\u6253\u5f00\u624b\u673a\u53f7\u5165\u53e3"))
+            await self.page.goto("https://chatgpt.com/auth/login?usernamekind=phone_number", wait_until="domcontentloaded")
+        else:
+            self.log(_zh(r"\u4eba\u673a\u9a8c\u8bc1\u5b8c\u6210\u540e\u4ecd\u5728 auth error\uff0c\u91cd\u65b0\u6253\u5f00\u90ae\u7bb1\u767b\u5f55\u5165\u53e3"))
+            await self.page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded")
+        await settle(self.page)
 
     async def detect_state(self) -> str:
         url = self.page.url.lower()
@@ -227,10 +251,6 @@ class ChatGPTRegister:
             return "profile"
         if await visible_input_count(self.page, r"email|username") > 0:
             return "email"
-        if any(key in low for key in ["tell us about yourself", "full name", "birthday", "date of birth", "age"]) or any(
-            key in text for key in ["姓名", "名字", "年龄", "生日", "出生"]
-        ):
-            return "profile"
         return "captcha_or_unknown"
 
     async def click_entry(self) -> None:
@@ -432,6 +452,46 @@ class ChatGPTRegister:
             return "solved"
         if await self.try_flaresolverr_challenge():
             return "solved"
+        if self.manual_challenge:
+            return await self.wait_for_manual_challenge_completion()
+        return "blocked"
+
+    async def wait_for_manual_challenge_completion(self) -> str:
+        if self.headless:
+            self.log("[Cloudflare] manual challenge wait skipped because browser is headless")
+            return "blocked"
+        timeout_ms = self.manual_challenge_timeout_ms
+        self.log(
+            "[Cloudflare] "
+            + _zh(
+                r"\u81ea\u52a8\u5904\u7406\u672a\u901a\u8fc7\uff0c\u4fdd\u6301\u5f53\u524d\u6d4f\u89c8\u5668\u6253\u5f00\uff0c"
+                r"\u8bf7\u624b\u52a8\u5b8c\u6210\u4eba\u673a\u9a8c\u8bc1"
+            )
+            + f" timeout={timeout_ms // 1000}s"
+        )
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        last_log_second = -1
+        while asyncio.get_running_loop().time() < deadline:
+            await self.refresh_page()
+            state = await cloudflare_turnstile_state(self.page)
+            if not state.get("present"):
+                await settle(self.page)
+                self.log("[Cloudflare] manual challenge completed, continue current browser session")
+                return "solved"
+            state_name = await self.detect_state()
+            if state_name != "captcha_or_unknown":
+                self.log(f"[Cloudflare] manual challenge advanced to state={state_name}")
+                return "solved"
+            remaining = int(max(0, deadline - asyncio.get_running_loop().time()))
+            if last_log_second < 0 or remaining // 30 != last_log_second // 30:
+                last_log_second = remaining
+                self.log(
+                    "[Cloudflare] "
+                    + _zh(r"\u7b49\u5f85\u624b\u52a8\u5b8c\u6210\u4eba\u673a\u9a8c\u8bc1\uff0c\u4e0d\u4f1a\u5173\u95ed\u5f53\u524d\u6d4f\u89c8\u5668")
+                    + f" remaining={remaining}s"
+                )
+            await self.page.wait_for_timeout(2000)
+        self.log("[Cloudflare] manual challenge wait timed out")
         return "blocked"
 
     async def try_flaresolverr_challenge(self) -> bool:
@@ -754,17 +814,18 @@ async def page_looks_like_profile_page(page: Page) -> bool:
                     };
                     const nameInput = document.querySelector(
                         'input[name="name"], input[autocomplete="name"], input[id*="name" i], ' +
-                        'input[aria-label*="name" i], input[placeholder*="name" i], input[aria-label*="\\u6c0f\\u540d"], ' +
+                        'input[data-testid*="name" i], input[aria-label*="name" i], input[placeholder*="name" i], input[aria-label*="\\u6c0f\\u540d"], ' +
                         'input[placeholder*="\\u6c0f\\u540d"], input[aria-label*="\\u540d\\u524d"], input[placeholder*="\\u540d\\u524d"]'
                     );
                     const ageInput = document.querySelector(
                         'input[name="age"], input[inputmode="numeric"], input[type="number"], input[id*="age" i], ' +
+                        'input[data-testid*="age" i], input[autocomplete="bday"], input[autocomplete="bday-year"], ' +
                         'input[aria-label*="age" i], input[placeholder*="age" i], input[aria-label*="\\u5e74\\u9f62"], ' +
                         'input[placeholder*="\\u5e74\\u9f62"]'
                     );
                     if (visible(nameInput) && visible(ageInput)) return true;
                     const text = String(document.body?.innerText || '').toLowerCase();
-                    return (
+                    const hint = (
                         text.includes('tell us about yourself') ||
                         text.includes('full name') ||
                         text.includes('date of birth') ||
@@ -773,6 +834,11 @@ async def page_looks_like_profile_page(page: Page) -> bool:
                         text.includes('\\u5e74\\u9f62') ||
                         text.includes('\\u751f\\u5e74\\u6708\\u65e5')
                     );
+                    if (!hint) return false;
+                    const fields = [...document.querySelectorAll('input:not([type=file]), textarea')]
+                        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+                        .filter((el) => !/email|password|hidden|checkbox|radio|submit|button/i.test(el.type || ''));
+                    return fields.length >= 2;
                 }"""
             )
         )
@@ -1594,6 +1660,7 @@ async def fill_profile_stable_fields(page: Page, full_name: str, age: str, logge
                 'input[autocomplete="name"]',
                 'input[id$="-name"]',
                 'input[id*="name" i]',
+                'input[data-testid*="name" i]',
                 'input[aria-label*="name" i]',
                 'input[placeholder*="name" i]',
                 'input[aria-label*="\\u6c0f\\u540d"]',
@@ -1605,8 +1672,11 @@ async def fill_profile_stable_fields(page: Page, full_name: str, age: str, logge
                 'input[name="age"]',
                 'input[id$="-age"]',
                 'input[id*="age" i]',
+                'input[data-testid*="age" i]',
                 'input[type="number"][min][max]',
                 'input[inputmode="numeric"][min][max]',
+                'input[autocomplete="bday"]',
+                'input[autocomplete="bday-year"]',
                 'input[aria-label*="age" i]',
                 'input[placeholder*="age" i]',
                 'input[aria-label*="\\u5e74\\u9f62"]',
@@ -1655,7 +1725,7 @@ async def fill_profile_by_js(page: Page, full_name: str, age: str, logger: Calla
             const labelFor = (el) => {
                 const bits = [
                     el.name, el.id, el.type, el.inputMode, el.placeholder, el.autocomplete,
-                    el.getAttribute('aria-label'), el.getAttribute('data-testid')
+                    el.getAttribute('aria-label'), el.getAttribute('data-testid'), el.getAttribute('aria-describedby')
                 ];
                 if (el.id) {
                     const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
@@ -1683,7 +1753,7 @@ async def fill_profile_by_js(page: Page, full_name: str, age: str, logger: Calla
             let ageEl = null;
             for (const el of fields) {
                 const meta = labelFor(el);
-                if (!ageEl && (/\\bage\\b|年龄|\\u5e74\\u9f62|\\u751f\\u5e74\\u6708\\u65e5|birthday|birth|year/i.test(meta) || /number|numeric|tel/i.test([el.type, el.inputMode].join(' ')))) ageEl = el;
+                if (!ageEl && (/\\bage\\b|年龄|\\u5e74\\u9f62|\\u751f\\u5e74\\u6708\\u65e5|birthday|birth|bday|year/i.test(meta) || /number|numeric|tel/i.test([el.type, el.inputMode].join(' ')))) ageEl = el;
             }
             for (const el of fields) {
                 if (el === ageEl) continue;

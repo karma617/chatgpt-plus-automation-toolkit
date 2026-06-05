@@ -4,6 +4,7 @@ import struct
 
 import modules.browser as browser_module
 from modules.browser import (
+    BrowserSession,
     Socks5AuthProxyBridge,
     get_or_create_account_fingerprint,
     parse_proxy,
@@ -95,6 +96,97 @@ def test_account_fingerprint_refreshes_legacy_records(tmp_path, monkeypatch) -> 
     assert fingerprint["profile_id"] != "legacy"
     assert fingerprint["schema_version"] == browser_module._FINGERPRINT_SCHEMA_VERSION
     assert "webgl_renderer" in fingerprint
+    assert store[key]["fingerprint"]["profile_id"] == fingerprint["profile_id"]
+
+
+def test_fingerprint_languages_are_limited_to_chinese_or_english(monkeypatch) -> None:
+    monkeypatch.setenv("BROWSER_RANDOM_FINGERPRINT", "0")
+
+    for proxy in (
+        "socks5h://japan.example:1080",
+        "http://us.example:8080",
+        "",
+    ):
+        fingerprint = browser_module._build_fingerprint("language-test", proxy)
+        languages = fingerprint["languages"]
+
+        assert fingerprint["locale"] in {"en-US", "zh-CN"}
+        assert all(str(item).split("-", 1)[0] in {"en", "zh"} for item in languages)
+        assert not any(str(item).startswith("ja") for item in languages)
+
+
+def test_accept_language_header_follows_fingerprint_language() -> None:
+    assert browser_module._accept_language_header(["zh-CN", "zh", "en-US", "en"]) == (
+        "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+    )
+    assert browser_module._accept_language_header(["en-US", "en"]) == "en-US,en;q=0.9"
+
+
+def test_browser_session_disables_fingerprint_by_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("BROWSER_FINGERPRINT_ENABLED", raising=False)
+
+    session = BrowserSession(
+        profile_dir=tmp_path / "profile",
+        headless=True,
+        slow_mo=0,
+        timeout_ms=1000,
+        proxy="socks5h://japan.example:1080",
+        fingerprint_seed="seed",
+        account_id="user@example.com",
+    )
+
+    assert session.fingerprint is None
+    assert session._context_options() == {}
+
+
+def test_browser_session_fingerprint_can_be_enabled_explicitly(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BROWSER_FINGERPRINT_ENABLED", "1")
+    monkeypatch.setenv("BROWSER_RANDOM_FINGERPRINT", "0")
+
+    session = BrowserSession(
+        profile_dir=tmp_path / "profile",
+        headless=True,
+        slow_mo=0,
+        timeout_ms=1000,
+        proxy="http://us.example:8080",
+        fingerprint_seed="seed",
+    )
+    options = session._context_options()
+
+    assert session.fingerprint
+    assert options["user_agent"] == session.fingerprint["user_agent"]
+    assert options["locale"] == session.fingerprint["locale"]
+    assert options["extra_http_headers"]["Accept-Language"] == browser_module._accept_language_header(
+        session.fingerprint.get("languages")
+    )
+
+
+def test_account_fingerprint_refreshes_cached_non_english_chinese_language(tmp_path, monkeypatch) -> None:
+    store_path = tmp_path / "account_fingerprints.json"
+    key = browser_module._account_fingerprint_key("jp-cache@example.com")
+    stale = browser_module._build_fingerprint("stale", "socks5h://japan.example:1080", force_random=True)
+    stale["schema_version"] = browser_module._FINGERPRINT_SCHEMA_VERSION
+    stale["locale"] = "ja-JP"
+    stale["languages"] = ["ja-JP", "ja", "en-US", "en"]
+    store_path.write_text(
+        json.dumps(
+            {
+                key: {
+                    "account": "jp-cache@example.com",
+                    "fingerprint": stale,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(browser_module, "_fingerprint_store_path", lambda: store_path)
+
+    fingerprint = get_or_create_account_fingerprint("jp-cache@example.com", "socks5h://japan.example:1080")
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+
+    assert fingerprint["profile_id"] != stale["profile_id"]
+    assert fingerprint["locale"] in {"en-US", "zh-CN"}
+    assert not any(str(item).startswith("ja") for item in fingerprint["languages"])
     assert store[key]["fingerprint"]["profile_id"] == fingerprint["profile_id"]
 
 

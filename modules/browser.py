@@ -35,8 +35,11 @@ _US_TIMEZONES = [
 ]
 _JP_TIMEZONES = ["Asia/Tokyo"]
 _DEFAULT_TIMEZONES = ["Asia/Shanghai", "Asia/Tokyo", "America/Los_Angeles"]
+_ALLOWED_BROWSER_LOCALES = ("en-US", "zh-CN")
+_ALLOWED_BROWSER_LANGUAGE_BASES = ("en", "zh")
 _FINGERPRINT_STORE_LOCK = threading.Lock()
-_FINGERPRINT_SCHEMA_VERSION = 2
+_FINGERPRINT_SCHEMA_VERSION = 3
+_BROWSER_FINGERPRINT_ENABLED_ENV = "BROWSER_FINGERPRINT_ENABLED"
 
 
 def _u(value: str) -> str:
@@ -297,6 +300,10 @@ def _is_truthy(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _browser_fingerprint_enabled() -> bool:
+    return _is_truthy(os.environ.get(_BROWSER_FINGERPRINT_ENABLED_ENV), False)
+
+
 def _region_hint_from_proxy(proxy: str | None) -> str:
     text = (proxy or "").lower()
     if any(key in text for key in ("japan", ".jp", "tokyo", "osaka", "jp-")):
@@ -317,6 +324,35 @@ def _actual_chrome_major() -> int:
     except Exception:
         pass
     return 126
+
+
+def _browser_languages_for_locale(locale: str) -> list[str]:
+    normalized = str(locale or "").strip()
+    if normalized.lower().startswith("zh"):
+        return ["zh-CN", "zh", "en-US", "en"]
+    return ["en-US", "en"]
+
+
+def _accept_language_header(languages: object) -> str:
+    values = [str(item or "").strip() for item in languages if str(item or "").strip()] if isinstance(languages, list) else []
+    if values and values[0].lower().startswith("zh"):
+        return "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+    return "en-US,en;q=0.9"
+
+
+def _browser_fingerprint_language_allowed(fingerprint: dict[str, object]) -> bool:
+    locale = str(fingerprint.get("locale") or "")
+    if locale not in _ALLOWED_BROWSER_LOCALES:
+        return False
+    raw_languages = fingerprint.get("languages")
+    if not isinstance(raw_languages, list) or not raw_languages:
+        return False
+    for item in raw_languages:
+        value = str(item or "")
+        base = value.split("-", 1)[0].lower()
+        if value not in _ALLOWED_BROWSER_LOCALES and base not in _ALLOWED_BROWSER_LANGUAGE_BASES:
+            return False
+    return True
 
 
 def _build_fingerprint(seed: str | None, proxy: str | None, *, force_random: bool | None = None) -> dict[str, object]:
@@ -342,14 +378,14 @@ def _build_fingerprint(seed: str | None, proxy: str | None, *, force_random: boo
     region = _region_hint_from_proxy(proxy)
     if region == "jp":
         timezone_id = rng.choice(_JP_TIMEZONES)
-        locale = "ja-JP"
+        locale = rng.choice(_ALLOWED_BROWSER_LOCALES)
     elif region == "us":
         timezone_id = rng.choice(_US_TIMEZONES)
         locale = "en-US"
     else:
         timezone_id = rng.choice(_DEFAULT_TIMEZONES)
-        locale = rng.choice(["en-US", "ja-JP", "zh-CN"])
-    language_tail = "ja" if locale == "ja-JP" else ("zh-CN" if locale == "zh-CN" else "en")
+        locale = rng.choice(_ALLOWED_BROWSER_LOCALES)
+    languages = _browser_languages_for_locale(locale)
     webgl_profiles = [
         (
             "Google Inc. (Intel)",
@@ -402,7 +438,7 @@ def _build_fingerprint(seed: str | None, proxy: str | None, *, force_random: boo
         "viewport": viewport,
         "screen": screen,
         "locale": locale,
-        "languages": [locale, language_tail, "en-US", "en"],
+        "languages": languages,
         "timezone_id": timezone_id,
         "device_scale_factor": dpr,
         "hardware_concurrency": hardware_concurrency,
@@ -498,7 +534,11 @@ def _fingerprint_is_current(fingerprint: dict[str, object]) -> bool:
         "media_devices",
         "plugin_count",
     }
-    return fingerprint.get("schema_version") == _FINGERPRINT_SCHEMA_VERSION and required_keys.issubset(fingerprint)
+    return (
+        fingerprint.get("schema_version") == _FINGERPRINT_SCHEMA_VERSION
+        and required_keys.issubset(fingerprint)
+        and _browser_fingerprint_language_allowed(fingerprint)
+    )
 
 
 def get_or_create_account_fingerprint(account_id: str, proxy: str | None, *, log_prefix: str = "") -> dict[str, object]:
@@ -675,7 +715,7 @@ class BrowserSession:
         slow_mo: int,
         timeout_ms: int,
         proxy: str | None = None,
-        isolated: bool = False,
+        isolated: bool = True,
         fingerprint_seed: str | None = None,
         account_id: str | None = None,
         log_prefix: str = "",
@@ -686,15 +726,18 @@ class BrowserSession:
         self.slow_mo = slow_mo
         self.timeout_ms = timeout_ms
         self.proxy = proxy
-        self.isolated = isolated
+        # The parameter is kept for call-site compatibility; runtime is always incognito.
+        self.isolated = True
         self.fingerprint_seed = fingerprint_seed
         self.account_id = account_id
         self.log_prefix = log_prefix
-        self.fingerprint = (
-            get_or_create_account_fingerprint(account_id, proxy, log_prefix=log_prefix)
-            if str(account_id or "").strip()
-            else _build_fingerprint(fingerprint_seed, proxy)
-        )
+        self.fingerprint = None
+        if _browser_fingerprint_enabled():
+            self.fingerprint = (
+                get_or_create_account_fingerprint(account_id, proxy, log_prefix=log_prefix)
+                if str(account_id or "").strip()
+                else _build_fingerprint(fingerprint_seed, proxy)
+            )
         self._playwright = None
         self._browser: Browser | None = None
         self._proxy_bridge: Socks5AuthProxyBridge | None = None
@@ -702,8 +745,6 @@ class BrowserSession:
         self.page: Page | None = None
 
     async def __aenter__(self) -> "BrowserSession":
-        if not self.isolated:
-            self.profile_dir.mkdir(parents=True, exist_ok=True)
         try:
             proxy, self._proxy_bridge = await prepare_proxy_for_playwright(self.proxy)
             self._playwright = await async_playwright().start()
@@ -713,38 +754,36 @@ class BrowserSession:
                 "--no-sandbox",
                 "--disable-gpu",
             ]
-            if self.isolated:
-                self._browser = await self._playwright.chromium.launch(
-                    headless=self.headless,
-                    slow_mo=self.slow_mo,
-                    args=launch_args,
-                    proxy=proxy,
-                )
-                self.context = await self._browser.new_context(**self._context_options())
-            else:
-                self.context = await self._playwright.chromium.launch_persistent_context(
-                    user_data_dir=str(self.profile_dir),
-                    headless=self.headless,
-                    slow_mo=self.slow_mo,
-                    args=launch_args,
-                    proxy=proxy,
-                    **self._context_options(),
-                )
+            if self.fingerprint:
+                launch_args.append(f"--lang={self.fingerprint.get('locale') or 'en-US'}")
+            self._browser = await self._playwright.chromium.launch(
+                headless=self.headless,
+                slow_mo=self.slow_mo,
+                args=launch_args,
+                proxy=proxy,
+            )
+            self.context = await self._browser.new_context(**self._context_options())
         except Exception:
             await self.__aexit__(None, None, None)
             raise
         self.context.set_default_timeout(self.timeout_ms)
-        await _apply_context_fingerprint(self.context, self.fingerprint)
+        if self.fingerprint:
+            await _apply_context_fingerprint(self.context, self.fingerprint)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         return self
 
     def _context_options(self) -> dict[str, object]:
+        if not self.fingerprint:
+            return {}
         return {
             "viewport": self.fingerprint["viewport"],
             "screen": self.fingerprint["screen"],
             "user_agent": self.fingerprint["user_agent"],
             "locale": self.fingerprint["locale"],
             "timezone_id": self.fingerprint["timezone_id"],
+            "extra_http_headers": {
+                "Accept-Language": _accept_language_header(self.fingerprint.get("languages")),
+            },
             "device_scale_factor": self.fingerprint["device_scale_factor"],
             "is_mobile": False,
             "has_touch": False,

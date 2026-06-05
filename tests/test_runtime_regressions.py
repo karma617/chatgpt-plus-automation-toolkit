@@ -34,24 +34,42 @@ def test_chatgpt_register_unknown_page_retry_waits_five_seconds() -> None:
     assert "self.page.wait_for_timeout(UNKNOWN_PAGE_RETRY_WAIT_MS)" in source
 
 
-def test_browser_session_supports_isolated_non_persistent_context() -> None:
+def test_browser_session_forces_incognito_non_persistent_context() -> None:
     source = (ROOT / "modules" / "browser.py").read_text(encoding="utf-8")
 
-    assert "isolated: bool = False" in source
+    assert "isolated: bool = True" in source
+    assert "self.isolated = True" in source
     assert "chromium.launch(" in source
     assert "new_context(**self._context_options())" in source
-    assert "launch_persistent_context(" in source
+    assert "launch_persistent_context(" not in source
     assert "add_init_script(script=script)" in source
+
+
+def test_paypal_auto_filler_uses_incognito_context() -> None:
+    source = (ROOT / "modules" / "paypal_auto_filler.py").read_text(encoding="utf-8")
+
+    assert "args.incognito = True" in source
+    assert "p.chromium.launch(**launch_kwargs)" in source
+    assert "browser.new_context(**ctx_kwargs)" in source
+    assert "launch_persistent_context(" not in source
 
 
 def test_browser_session_uses_random_legal_fingerprint_surface() -> None:
     source = (ROOT / "modules" / "browser.py").read_text(encoding="utf-8")
 
+    assert '_BROWSER_FINGERPRINT_ENABLED_ENV = "BROWSER_FINGERPRINT_ENABLED"' in source
+    assert "_browser_fingerprint_enabled()" in source
+    assert "_is_truthy(os.environ.get(_BROWSER_FINGERPRINT_ENABLED_ENV), False)" in source
+    assert "if self.fingerprint:" in source
     assert "_build_fingerprint" in source
     assert "BROWSER_RANDOM_FINGERPRINT" in source
+    assert "_ALLOWED_BROWSER_LOCALES" in source
+    assert "_accept_language_header" in source
     assert "chrome_full_version" in source
     assert "client_hints" in source
     assert "timezone_id" in source
+    assert "Accept-Language" in source
+    assert "--lang=" in source
     assert "device_scale_factor" in source
     assert "hardwareConcurrency" in source
     assert "navigator.userAgentData.getHighEntropyValues" in source
@@ -61,7 +79,7 @@ def test_browser_session_uses_random_legal_fingerprint_surface() -> None:
     assert "webkitAudioContext" in source
 
 
-def test_business_flows_bind_browser_fingerprint_to_account() -> None:
+def test_business_flows_keep_stable_fingerprint_inputs_for_explicit_enable() -> None:
     paths = [
         ROOT / "main.py",
         ROOT / "modules" / "paypal_register.py",
@@ -124,12 +142,15 @@ def test_chatgpt_register_runtime_wires_flaresolverr_fallback() -> None:
 def test_chatgpt_register_profile_fill_uses_stable_japanese_dom_fields() -> None:
     source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
     fill_profile = source[source.index("async def fill_profile(self)") : source.index("async def handle_phone_required")]
+    detect_state = source[source.index("async def detect_state") : source.index("async def click_entry")]
 
     assert "async def page_looks_like_profile_page" in source
     assert "async def fill_profile_stable_fields" in source
     assert 'input[name="name"], input[autocomplete="name"]' in source
     assert 'input[name="age"], input[inputmode="numeric"], input[type="number"]' in source
     assert 'input[name="birthday"][type="hidden"]' in source
+    assert "fields.length >= 2" in source
+    assert 'if any(key in low for key in ["tell us about yourself"' not in detect_state
     assert fill_profile.index("fill_profile_stable_fields") < fill_profile.index("fill_profile_by_js")
 
 

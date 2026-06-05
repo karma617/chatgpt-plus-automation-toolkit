@@ -6,6 +6,7 @@ from pathlib import Path
 
 KNOWN_ENV_FIELDS = [
     "REGISTER_ONLY_MODE",
+    "REGISTER_ONLY_MAX_ATTEMPTS",
     "MOEMAIL_API_KEY",
     "MOEMAIL_BASE_URL",
     "MOEMAIL_DOMAIN_WHITELIST",
@@ -182,6 +183,7 @@ def _u(text: str) -> str:
 
 ENV_FIELD_LABELS = {
     "REGISTER_ONLY_MODE": _u(r"\u4ec5\u6ce8\u518c\u5e10\u53f7\u6ce8\u518c\u65b9\u5f0f"),
+    "REGISTER_ONLY_MAX_ATTEMPTS": _u(r"\u4ec5\u6ce8\u518c\u672c\u8f6e\u6700\u5927\u5c1d\u8bd5\u6b21\u6570"),
     "MOEMAIL_API_KEY": _u(r"MoeMail \u90ae\u7bb1\u670d\u52a1\u5bc6\u94a5"),
     "MOEMAIL_BASE_URL": _u(r"MoeMail \u90ae\u7bb1\u670d\u52a1\u5730\u5740"),
     "MOEMAIL_DOMAIN_WHITELIST": _u(r"MoeMail \u53ef\u7528\u57df\u540d"),
@@ -328,6 +330,7 @@ _SMS_TOOLTIP_SUFFIXES = {
 
 ENV_FIELD_GROUPS = {
     "REGISTER_ONLY_MODE": _u(r"\u4ec5\u6ce8\u518c"),
+    "REGISTER_ONLY_MAX_ATTEMPTS": _u(r"\u4ec5\u6ce8\u518c"),
     "MOEMAIL_API_KEY": _u(r"\u90ae\u7bb1\u914d\u7f6e"),
     "MOEMAIL_BASE_URL": _u(r"\u90ae\u7bb1\u914d\u7f6e"),
     "MOEMAIL_DOMAIN_WHITELIST": _u(r"\u90ae\u7bb1\u914d\u7f6e"),
@@ -500,6 +503,7 @@ ENV_FIELD_TOOLTIPS = {
 
 ENV_FIELD_TOOLTIPS.update({
     "REGISTER_ONLY_MODE": _u(r"\u4ec5\u6ce8\u518c\u8d26\u53f7\u6309\u94ae\u4f7f\u7528\u7684\u6ce8\u518c\u65b9\u5f0f\u3002email \u8868\u793a\u7528\u90ae\u7bb1\u6ce8\u518c\uff1bphone \u8868\u793a\u7528\u624b\u673a\u53f7\u6ce8\u518c\u5e76\u4f1a\u542f\u7528\u63a5\u7801\u5e73\u53f0\u3002"),
+    "REGISTER_ONLY_MAX_ATTEMPTS": _u(r"\u4ec5\u6ce8\u518c\u5355\u6b21\u6279\u91cf\u6700\u591a\u5c1d\u8bd5\u591a\u5c11\u4e2a\u6d4f\u89c8\u5668\u4f1a\u8bdd\u3002\u7559\u7a7a\u65f6\u9ed8\u8ba4\u4e3a\u76ee\u6807\u6210\u529f\u6570 x 3\uff0c\u7528\u4e8e\u9632\u6b62\u540c\u4e00\u8d26\u53f7\u5931\u8d25\u540e\u65e0\u9650\u91cd\u5f00\u3002"),
     "MOEMAIL_API_KEY": _u(r"MoeMail \u63a5\u53e3\u5bc6\u94a5\u3002\u5f53\u90ae\u7bb1\u6765\u6e90\u9009 moemail\uff0c\u6216\u9700\u8981\u901a\u8fc7 MoeMail API \u81ea\u52a8\u521b\u5efa/\u8865\u5145\u90ae\u7bb1\u65f6\u4f7f\u7528\u3002"),
     "MOEMAIL_BASE_URL": _u(r"MoeMail \u670d\u52a1\u5730\u5740\u3002\u5f53\u90ae\u7bb1\u6765\u6e90\u662f moemail\uff0c\u7a0b\u5e8f\u4f1a\u7528\u8fd9\u4e2a\u5730\u5740\u8bf7\u6c42\u521b\u5efa\u90ae\u7bb1\u548c\u67e5\u8be2\u90ae\u4ef6\u9a8c\u8bc1\u7801\u3002"),
     "MOEMAIL_DOMAIN_WHITELIST": _u(r"MoeMail \u5141\u8bb8\u521b\u5efa\u90ae\u7bb1\u7684\u57df\u540d\u5217\u8868\uff0c\u591a\u4e2a\u53ef\u7528\u9017\u53f7\u5206\u9694\u3002\u81ea\u52a8\u521b\u5efa\u90ae\u7bb1\u65f6\u4f1a\u4ece\u8fd9\u91cc\u9009\u57df\u540d\u3002"),

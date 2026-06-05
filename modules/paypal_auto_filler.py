@@ -3576,7 +3576,7 @@ def main() -> None:
     """完全照搬 无卡plus源码/modules/browser.py:BrowserSession 的浏览器配置。
 
     关键变化（vs 旧版）：
-      - launch_persistent_context 持久化 profile（cookies 跨次保留）
+      - launch + new_context non-persistent incognito browser session
       - 仅 4 个 launch args（与 BrowserSession 完全一致）
       - 固定 viewport 1365×900
       - 不再 random fingerprint / UA / timezone / locale
@@ -3619,6 +3619,9 @@ def main() -> None:
         help="关闭无痕,使用 PROFILE_DIR 持久 profile(保留 cookies/历史)",
     )
     args = parser.parse_args()
+    if not args.incognito:
+        log("--no-incognito is ignored; browser sessions are always incognito.")
+    args.incognito = True
 
     # ---- 应用 --proxy 覆盖 ----
     global PLAYWRIGHT_PROXY, REQUESTS_PROXIES
@@ -3747,7 +3750,6 @@ def main() -> None:
         )
 
         ctx_kwargs = dict(
-            user_data_dir=profile_dir,
             headless=False if (headless and use_headless_new and not browser_channel) else headless,
             slow_mo=int(os.environ.get("SLOW_MO", "80")),
             viewport={"width": 1440, "height": 900},
@@ -3764,11 +3766,18 @@ def main() -> None:
             reduced_motion="no-preference",
             permissions=[],
         )
+        launch_kwargs = {
+            "headless": ctx_kwargs.pop("headless"),
+            "slow_mo": ctx_kwargs.pop("slow_mo"),
+            "args": ctx_kwargs.pop("args"),
+            "proxy": ctx_kwargs.pop("proxy"),
+        }
         if browser_channel:
-            ctx_kwargs["channel"] = browser_channel
-        context: BrowserContext = p.chromium.launch_persistent_context(**ctx_kwargs)
+            launch_kwargs["channel"] = browser_channel
+        browser: Browser = p.chromium.launch(**launch_kwargs)
+        context: BrowserContext = browser.new_context(**ctx_kwargs)
         context.set_default_timeout(int(os.environ.get("TIMEOUT_MS", "60000")))
-        log("Chromium launched (persistent_context)")
+        log("Chromium launched (incognito context)")
 
         # ============ Stealth-style 反检测 (针对 DataDome / PayPal 风控) ============
         # 仅注入开销小、跨页有效的指纹覆盖。无头模式必须;有头模式加上也无害。
@@ -4111,6 +4120,7 @@ def main() -> None:
         finally:
             try:
                 context.close()
+                browser.close()
             except Exception:  # noqa: BLE001
                 pass
 

@@ -14,7 +14,12 @@ from modules.env_settings import settings_panel
 from modules.terminal_theme import install_print_theme
 from modules.terminal_theme import BLUE, CYAN, GREEN, MAGENTA, YELLOW, paint
 from modules.browser import BrowserSession
-from modules.chatgpt_register import ChatGPTRegister, FatalAccountError, ManualInterventionNeeded
+from modules.chatgpt_register import (
+    CLOUDFLARE_CHALLENGE_RETRYABLE,
+    ChatGPTRegister,
+    FatalAccountError,
+    ManualInterventionNeeded,
+)
 from modules.checkout import create_plus_checkout_link, get_chatgpt_session
 from modules.mail_provider import MailProvider
 from modules.moemail_factory import create_moemail_accounts, moemail_api_enabled, split_domains
@@ -47,6 +52,10 @@ LABEL_REGISTER_ONLY_SESSION_PENDING = _zh(
 )
 LABEL_PHONE_BIND_EMAIL_START = _zh(r"\u624b\u673a\u53f7\u6ce8\u518c\u5df2\u767b\u5f55\uff0c\u5f00\u59cb OAuth \u7ed1\u5b9a\u90ae\u7bb1")
 LABEL_PHONE_BIND_EMAIL_DONE = _zh(r"\u624b\u673a\u53f7\u6ce8\u518c\u90ae\u7bb1\u7ed1\u5b9a\u5b8c\u6210")
+LABEL_REGISTER_ONLY_CHALLENGE_BLOCKED = _zh(
+    r"\u4ec5\u6ce8\u518c\u9047\u5230 Cloudflare/\u4eba\u673a\u9a8c\u8bc1\u672a\u901a\u8fc7\uff0c"
+    r"\u672c\u8f6e\u505c\u6b62\u91cd\u8bd5\uff0c\u4e0d\u4f1a\u7ee7\u7eed\u91cd\u5f00\u6d4f\u89c8\u5668"
+)
 
 
 def _display_width(s: str) -> int:
@@ -474,6 +483,8 @@ async def run_account(
             sms_selection=effective_sms_selection,
             log_prefix=prefix,
             proxy=proxy,
+            manual_challenge=not create_payment_link,
+            headless=bool(browser_cfg.get("headless", False)),
         )
         await register.run_until_logged_in(account, since)
         page = await session.current_page()
@@ -575,9 +586,20 @@ async def run_account(
         if session:
             await session.__aexit__(type(exc), exc, exc.__traceback__)
         store.save_failed(account.email, short_error(exc))
+        if not create_payment_link and is_challenge_blocked_error(exc):
+            store.finish_claim(account.email)
+            if hasattr(store, "blocked_emails"):
+                store.blocked_emails.add(account.email.lower())
+            log(f"{prefix} {LABEL_REGISTER_ONLY_CHALLENGE_BLOCKED}: {short_error(exc)}")
+            return None
         store.return_to_pool(account)
         log(f"{prefix} 普通失败，账号已退回号池: {short_error(exc)}")
         return False
+
+
+def is_challenge_blocked_error(exc: Exception) -> bool:
+    text = short_error(exc).lower()
+    return CLOUDFLARE_CHALLENGE_RETRYABLE in text or "cloudflare" in text or "turnstile" in text
 
 
 async def save_failure_artifacts(prefix: str, email: str, session: object | None) -> None:

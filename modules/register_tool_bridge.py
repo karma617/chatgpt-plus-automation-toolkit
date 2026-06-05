@@ -26,6 +26,7 @@ LABEL_SMS_DISABLED = _zh(
 )
 LABEL_REGISTER_SUCCESS_COUNT = _zh(r"\u4ec5\u6ce8\u518c\u6210\u529f\u6570")
 LABEL_REGISTER_DONE = _zh(r"\u4ec5\u6ce8\u518c\u7ed3\u675f\uff0c\u6210\u529f\u6570")
+LABEL_ATTEMPT_LIMIT = _zh(r"\u4ec5\u6ce8\u518c\u5df2\u8fbe\u5230\u672c\u8f6e\u6700\u5927\u5c1d\u8bd5\u6b21\u6570\uff0c\u505c\u6b62\u91cd\u5f00\u6d4f\u89c8\u5668")
 LABEL_NO_REGISTER_ACCOUNTS = _zh(
     r"\u5f53\u524d\u90ae\u7bb1\u6c60\u6ca1\u6709\u53ef\u7528\u8d26\u53f7\uff0c"
     r"\u4e14\u672a\u80fd\u901a\u8fc7\u5f53\u524d\u9879\u76ee\u914d\u7f6e\u81ea\u52a8\u8865\u53f7"
@@ -62,6 +63,16 @@ def register_only_mode(env: dict[str, str] | None = None) -> str:
         _zh(r"\u624b\u673a\u53f7\u6ce8\u518c"): "phone",
     }
     return aliases.get(value, "email")
+
+
+def register_only_max_attempts(env: dict[str, str] | None, target: int, workers: int) -> int:
+    raw = str((env or {}).get("REGISTER_ONLY_MAX_ATTEMPTS") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return max(max(1, int(target or 1)) * 3, max(1, int(workers or 1)))
 
 
 @dataclass(frozen=True)
@@ -133,6 +144,9 @@ async def run_register_only_many(
     worker_count = max(1, int(workers or 1))
     counter = main_app.SuccessCounter(target)
     counter.target = target
+    max_attempts = register_only_max_attempts(env, target, worker_count)
+    attempt_lock = asyncio.Lock()
+    attempts = 0
 
     proxy_status = f"enabled, proxy_count={proxy_pool.count()}" if proxy_pool else "disabled"
     main_app.log(
@@ -140,7 +154,7 @@ async def run_register_only_many(
         f"{LABEL_TARGET_SUCCESS}={target}, "
         f"{LABEL_REGISTER_MODE}={LABEL_REGISTER_MODE_PHONE if mode == 'phone' else LABEL_REGISTER_MODE_EMAIL}, "
         f"{LABEL_MAIL_SOURCE}={register_cfg.get('mail', {}).get('active_source', register_cfg.get('mail', {}).get('source'))}, "
-        f"{LABEL_PROXY}={proxy_status}"
+        f"{LABEL_PROXY}={proxy_status}, max_attempts={max_attempts}"
     )
     if sms_selection:
         country = sms_selection.get("country")
@@ -152,9 +166,16 @@ async def run_register_only_many(
         main_app.log(LABEL_SMS_DISABLED)
 
     async def worker_loop(worker_id: int) -> None:
+        nonlocal attempts
         while True:
             if not await counter.acquire_slot():
                 return
+            async with attempt_lock:
+                if attempts >= max_attempts:
+                    await counter.release_slot(success=False)
+                    return
+                attempts += 1
+                attempt_no = attempts
             proxy = main_app.pick_task_proxy(proxy_pool, main_app.fallback_proxy_from_env(), seed=worker_id)
             result = await main_app.run_account(
                 register_cfg,
@@ -172,6 +193,9 @@ async def run_register_only_many(
             total = await counter.release_slot(success=result is True)
             if result is True:
                 main_app.worker_log(worker_id, f"{LABEL_REGISTER_SUCCESS_COUNT} {total}/{counter.target}")
+            elif attempt_no >= max_attempts:
+                main_app.worker_log(worker_id, f"{LABEL_ATTEMPT_LIMIT}: {attempt_no}/{max_attempts}")
+                return
 
     tasks = [asyncio.create_task(worker_loop(worker_id)) for worker_id in range(1, worker_count + 1)]
     await asyncio.gather(*tasks)
