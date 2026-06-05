@@ -376,7 +376,9 @@ async def run_free_register_once(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=f"{account.email}|free-phone|{proxy or ''}|{time.time_ns()}",
+        fingerprint_seed=f"{account.email}|free-phone",
+        account_id=account.email,
+        log_prefix=prefix,
     )
     success = False
     try:
@@ -657,7 +659,9 @@ async def run_free_register_once_email(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=f"{account.email}|free-email|{proxy or ''}|{time.time_ns()}",
+        fingerprint_seed=f"{account.email}|free-email",
+        account_id=account.email,
+        log_prefix=prefix,
     )
     success = False
     try:

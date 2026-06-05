@@ -563,6 +563,11 @@ def test_run_paypal_pay_moves_bad_generated_link_back_to_registered(monkeypatch,
         link_method="external_api",
     )
     monkeypatch.setattr(paypal_pay, "pay_one", fake_pay_one)
+    monkeypatch.setattr(
+        paypal_pay,
+        "regenerate_flow2_payment_link",
+        lambda *args, **kwargs: asyncio.sleep(0, result=(_ for _ in ()).throw(RuntimeError("generator offline"))),
+    )
 
     result = asyncio.run(paypal_pay.run_paypal_pay({}, count=1, workers=1, card_source_mode="local_random"))
 
@@ -576,3 +581,138 @@ def test_run_paypal_pay_moves_bad_generated_link_back_to_registered(monkeypatch,
     assert state["relink@example.com"]["last_bad_link_method"] == "external_api"
     assert "payment_link" not in state["relink@example.com"]
     assert "link_method" not in state["relink@example.com"]
+
+
+def test_pay_one_short_link_jp_keeps_proxy_and_uses_us_billing(monkeypatch) -> None:
+    jp_proxy = "socks5h://jp-proxy.example.test:1080"
+    captured = {"proxy_checks": [], "sessions": [], "stripe": [], "paypal": []}
+
+    base_card = paypal_pay.CardInfo(
+        number="4111111111111111",
+        exp_month="04",
+        exp_year="2030",
+        cvv="123",
+        holder_name="BASE USER",
+        first_name="BASE",
+        last_name="USER",
+        street="1 Base St",
+        city="Base City",
+        state="BC",
+        zip_code="10000",
+        country="JP",
+    )
+    us_billing_card = paypal_pay.CardInfo(
+        number="5555555555554444",
+        exp_month="05",
+        exp_year="2031",
+        cvv="456",
+        holder_name="JOHN DOE",
+        first_name="JOHN",
+        last_name="DOE",
+        street="350 5th Ave",
+        city="New York",
+        state="NY",
+        zip_code="10001",
+        country="US",
+    )
+
+    class FakeLocator:
+        @property
+        def first(self):
+            return self
+
+        async def wait_for(self, **kwargs):
+            return None
+
+    class FakePage:
+        url = "https://chatgpt.com/success"
+
+        def locator(self, *args, **kwargs):
+            return FakeLocator()
+
+        async def wait_for_timeout(self, *args, **kwargs):
+            return None
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            captured["sessions"].append(kwargs)
+            self.page = FakePage()
+
+        async def __aenter__(self):
+            return self
+
+        async def current_page(self):
+            return self.page
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    class FakePhonePool:
+        def __init__(self):
+            self.released = []
+
+        def acquire(self, worker_id):
+            return paypal_pay.PhoneInfo(number="+15555550123", api_url="https://sms.example.test/get")
+
+        def release(self, phone_number, success):
+            self.released.append((phone_number, success))
+
+        def mark_failed(self, phone_number):
+            raise AssertionError("phone should not be marked failed")
+
+    def fake_ensure_proxy(proxy, *, env, prefix):
+        captured["proxy_checks"].append((proxy, env.get("PAYPAL_PAYMENT_MODE"), prefix))
+
+    def fake_generate_card(worker_id, email, env, region_mode="default"):
+        assert region_mode == "default"
+        return us_billing_card
+
+    async def fake_fill_stripe(page, email, card, *, country_code="US"):
+        captured["stripe"].append((email, card, country_code))
+
+    async def fake_fill_paypal(page, email, card, phone, paypal_password, proxy=None, *, country_code="US"):
+        captured["paypal"].append((email, card, phone, proxy, country_code))
+
+    monkeypatch.setattr(paypal_pay, "load_env", lambda path: {"PAYPAL_PAYMENT_MODE": "short_link"})
+    monkeypatch.setattr(paypal_pay, "_ensure_short_link_jp_proxy", fake_ensure_proxy)
+    monkeypatch.setattr(paypal_pay, "_generate_local_random_card", fake_generate_card)
+    monkeypatch.setattr(paypal_pay, "BrowserSession", FakeSession)
+    monkeypatch.setattr(paypal_pay, "_install_click_watcher", lambda *args, **kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(paypal_pay, "_prepare_checkout_from_chatgpt_offer", lambda *args, **kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(paypal_pay, "inspect_checkout_due_amount", lambda page: asyncio.sleep(0, result={"status": "zero", "amount_text": "US$0.00"}))
+    monkeypatch.setattr(paypal_pay, "fill_stripe", fake_fill_stripe)
+    monkeypatch.setattr(paypal_pay, "fill_paypal", fake_fill_paypal)
+    monkeypatch.setattr(paypal_pay, "_detect_captcha_signal", lambda page: asyncio.sleep(0, result=(False, "")))
+    monkeypatch.setattr(paypal_pay, "check_phone_rejected", lambda page: asyncio.sleep(0, result=False))
+    monkeypatch.setattr(paypal_pay, "fill_sms_code", lambda *args, **kwargs: asyncio.sleep(0, result=True))
+    monkeypatch.setattr(paypal_pay, "_click_paypal_agree_and_continue_if_present", lambda *args, **kwargs: asyncio.sleep(0, result=False))
+    monkeypatch.setattr(paypal_pay, "save_pending_auth", lambda *args, **kwargs: None)
+    monkeypatch.setattr(paypal_pay, "remove_from_link_pool", lambda *args, **kwargs: None)
+
+    ok = asyncio.run(
+        paypal_pay.pay_one(
+            {
+                "email": "short-jp@example.com",
+                "query_code": "query",
+                "payment_link": "",
+                "account_line": "short-jp@example.com----pw----client----rt",
+            },
+            base_card,
+            FakePhonePool(),
+            {"browser": {"headless": True, "slow_mo": 0, "timeout_ms": 1000}, "mail": {}},
+            worker_id=1,
+            proxy=jp_proxy,
+            flow2_region_mode="jp",
+        )
+    )
+
+    assert ok is True
+    assert captured["proxy_checks"] == [(jp_proxy, "short_link", "[paypal-pay-01][short-jp@example.com]")]
+    assert captured["sessions"][0]["proxy"] == jp_proxy
+    assert captured["stripe"][0][2] == "US"
+    assert captured["stripe"][0][1].country == "US"
+    assert captured["stripe"][0][1].city == "New York"
+    assert captured["paypal"][0][3] == jp_proxy
+    assert captured["paypal"][0][4] == "US"
+    assert captured["paypal"][0][1].country == "US"
+    assert captured["paypal"][0][1].state == "NY"

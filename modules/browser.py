@@ -4,16 +4,18 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import platform
 import random
 import secrets
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
-from .utils import resolve_path
+from .utils import log, resolve_path
 
 
 _WINDOWS_VIEWPORTS = [
@@ -33,6 +35,12 @@ _US_TIMEZONES = [
 ]
 _JP_TIMEZONES = ["Asia/Tokyo"]
 _DEFAULT_TIMEZONES = ["Asia/Shanghai", "Asia/Tokyo", "America/Los_Angeles"]
+_FINGERPRINT_STORE_LOCK = threading.Lock()
+_FINGERPRINT_SCHEMA_VERSION = 2
+
+
+def _u(value: str) -> str:
+    return value.encode("ascii").decode("unicode_escape")
 
 
 def _normalize_proxy_raw(raw: str) -> str:
@@ -311,16 +319,25 @@ def _actual_chrome_major() -> int:
     return 126
 
 
-def _build_fingerprint(seed: str | None, proxy: str | None) -> dict[str, object]:
-    randomize = _is_truthy(__import__("os").environ.get("BROWSER_RANDOM_FINGERPRINT"), True)
+def _build_fingerprint(seed: str | None, proxy: str | None, *, force_random: bool | None = None) -> dict[str, object]:
+    randomize = _is_truthy(os.environ.get("BROWSER_RANDOM_FINGERPRINT"), True) if force_random is None else force_random
     base = f"{seed or ''}|{proxy or ''}|{secrets.token_hex(8) if randomize else 'stable'}|{time.time_ns() if randomize else ''}"
     digest = hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
     rng = random.Random(int(digest[:16], 16))
     viewport = dict(rng.choice(_WINDOWS_VIEWPORTS))
+    screen = {
+        "width": viewport["width"],
+        "height": viewport["height"],
+        "availWidth": viewport["width"],
+        "availHeight": max(1, viewport["height"] - rng.choice([40, 48, 72])),
+        "colorDepth": rng.choice([24, 24, 30]),
+        "pixelDepth": rng.choice([24, 24, 30]),
+    }
     major = max(100, _actual_chrome_major() + rng.choice([-1, 0, 0, 1]))
+    full_version = f"{major}.0.{rng.randint(6200, 6999)}.{rng.randint(20, 180)}"
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+        f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_version} Safari/537.36"
     )
     region = _region_hint_from_proxy(proxy)
     if region == "jp":
@@ -332,17 +349,193 @@ def _build_fingerprint(seed: str | None, proxy: str | None) -> dict[str, object]
     else:
         timezone_id = rng.choice(_DEFAULT_TIMEZONES)
         locale = rng.choice(["en-US", "ja-JP", "zh-CN"])
+    language_tail = "ja" if locale == "ja-JP" else ("zh-CN" if locale == "zh-CN" else "en")
+    webgl_profiles = [
+        (
+            "Google Inc. (Intel)",
+            "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+        (
+            "Google Inc. (Intel)",
+            "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+        (
+            "Google Inc. (NVIDIA)",
+            "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+        (
+            "Google Inc. (AMD)",
+            "ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        ),
+    ]
+    webgl_vendor, webgl_renderer = rng.choice(webgl_profiles)
+    hardware_concurrency = rng.choice([4, 6, 8, 12, 16])
+    device_memory = rng.choice([4, 8, 8, 16])
+    dpr = rng.choice([1, 1, 1.25, 1.5])
+    profile_id = hashlib.sha256(f"{digest}|account-browser-fingerprint".encode("utf-8")).hexdigest()[:16]
     return {
+        "schema_version": _FINGERPRINT_SCHEMA_VERSION,
+        "profile_id": profile_id,
+        "created_at": int(time.time()),
+        "source": "account_bound" if force_random else "session_random",
         "user_agent": user_agent,
+        "chrome_major": major,
+        "chrome_full_version": full_version,
+        "client_hints": {
+            "brands": [
+                {"brand": "Chromium", "version": str(major)},
+                {"brand": "Google Chrome", "version": str(major)},
+                {"brand": "Not:A-Brand", "version": "99"},
+            ],
+            "fullVersionList": [
+                {"brand": "Chromium", "version": full_version},
+                {"brand": "Google Chrome", "version": full_version},
+                {"brand": "Not:A-Brand", "version": "99.0.0.0"},
+            ],
+            "platform": "Windows",
+            "platformVersion": rng.choice(["10.0.0", "13.0.0", "15.0.0"]),
+            "architecture": "x86",
+            "bitness": "64",
+            "mobile": False,
+            "model": "",
+        },
         "viewport": viewport,
-        "screen": dict(viewport),
+        "screen": screen,
         "locale": locale,
+        "languages": [locale, language_tail, "en-US", "en"],
         "timezone_id": timezone_id,
-        "device_scale_factor": rng.choice([1, 1, 1.25, 1.5]),
-        "hardware_concurrency": rng.choice([4, 6, 8, 12, 16]),
-        "device_memory": rng.choice([4, 8, 8, 16]),
+        "device_scale_factor": dpr,
+        "hardware_concurrency": hardware_concurrency,
+        "device_memory": device_memory,
         "platform": "Win32" if platform.system().lower() == "windows" else "Linux x86_64",
+        "navigator_vendor": "Google Inc.",
+        "max_touch_points": 0,
+        "do_not_track": rng.choice(["1", None, None]),
+        "webgl_vendor": webgl_vendor,
+        "webgl_renderer": webgl_renderer,
+        "canvas_noise_seed": hashlib.sha256(f"{digest}|canvas".encode("utf-8")).hexdigest()[:16],
+        "webgl_noise_seed": hashlib.sha256(f"{digest}|webgl".encode("utf-8")).hexdigest()[:16],
+        "audio_noise_seed": hashlib.sha256(f"{digest}|audio".encode("utf-8")).hexdigest()[:16],
+        "audio_sample_rate": rng.choice([44100, 48000]),
+        "media_devices": {"audioinput": rng.choice([1, 2]), "videoinput": 1, "audiooutput": rng.choice([1, 2])},
+        "plugin_count": rng.choice([3, 4, 5]),
     }
+
+
+def _fingerprint_store_path() -> Path:
+    return resolve_path("output/browser_fingerprints/account_fingerprints.json")
+
+
+def _account_fingerprint_key(account_id: str) -> str:
+    normalized = str(account_id or "").strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _load_fingerprint_store(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_fingerprint_store(path: Path, data: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _fingerprint_log_payload(fingerprint: dict[str, object]) -> dict[str, object]:
+    keys = (
+        "profile_id",
+        "user_agent",
+        "viewport",
+        "screen",
+        "locale",
+        "languages",
+        "timezone_id",
+        "device_scale_factor",
+        "hardware_concurrency",
+        "device_memory",
+        "platform",
+        "navigator_vendor",
+        "max_touch_points",
+        "webgl_vendor",
+        "webgl_renderer",
+        "canvas_noise_seed",
+        "webgl_noise_seed",
+        "audio_noise_seed",
+        "audio_sample_rate",
+        "media_devices",
+        "plugin_count",
+        "client_hints",
+    )
+    return {key: fingerprint.get(key) for key in keys if key in fingerprint}
+
+
+def _fingerprint_is_current(fingerprint: dict[str, object]) -> bool:
+    required_keys = {
+        "schema_version",
+        "profile_id",
+        "user_agent",
+        "chrome_full_version",
+        "client_hints",
+        "viewport",
+        "screen",
+        "locale",
+        "languages",
+        "timezone_id",
+        "device_scale_factor",
+        "hardware_concurrency",
+        "device_memory",
+        "webgl_vendor",
+        "webgl_renderer",
+        "canvas_noise_seed",
+        "webgl_noise_seed",
+        "audio_noise_seed",
+        "audio_sample_rate",
+        "media_devices",
+        "plugin_count",
+    }
+    return fingerprint.get("schema_version") == _FINGERPRINT_SCHEMA_VERSION and required_keys.issubset(fingerprint)
+
+
+def get_or_create_account_fingerprint(account_id: str, proxy: str | None, *, log_prefix: str = "") -> dict[str, object]:
+    account = str(account_id or "").strip().lower()
+    if not account:
+        return _build_fingerprint(None, proxy)
+    key = _account_fingerprint_key(account)
+    store_path = _fingerprint_store_path()
+    with _FINGERPRINT_STORE_LOCK:
+        store = _load_fingerprint_store(store_path)
+        item = store.get(key)
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("fingerprint"), dict)
+            and _fingerprint_is_current(dict(item["fingerprint"]))
+        ):
+            fingerprint = dict(item["fingerprint"])
+            action = "reuse"
+        else:
+            fingerprint = _build_fingerprint(f"{account}|account-bound", proxy, force_random=True)
+            store[key] = {
+                "account": account,
+                "fingerprint": fingerprint,
+                "created_at": int(time.time()),
+                "updated_at": int(time.time()),
+            }
+            _save_fingerprint_store(store_path, store)
+            action = "refresh" if isinstance(item, dict) else "new"
+    label = (log_prefix.strip() + " ") if log_prefix else ""
+    message_key = r"\u5e10\u53f7\u7ed1\u5b9a\u6d4f\u89c8\u5668\u6307\u7eb9"
+    log(
+        f"{label}[Fingerprint] "
+        + _u(message_key)
+        + f" action={action} account={account} "
+        + json.dumps(_fingerprint_log_payload(fingerprint), ensure_ascii=False, sort_keys=True)
+    )
+    return fingerprint
 
 
 async def _apply_context_fingerprint(context: BrowserContext, fingerprint: dict[str, object]) -> None:
@@ -353,17 +546,122 @@ async def _apply_context_fingerprint(context: BrowserContext, fingerprint: dict[
         const define = (obj, key, value) => {
             try { Object.defineProperty(obj, key, { get: () => value, configurable: true }); } catch {}
         };
+        const languages = Array.isArray(fp.languages) && fp.languages.length ? fp.languages : [fp.locale || 'en-US', 'en'];
         define(navigator, 'webdriver', undefined);
         define(navigator, 'platform', fp.platform || 'Win32');
         define(navigator, 'hardwareConcurrency', fp.hardware_concurrency || 8);
         define(navigator, 'deviceMemory', fp.device_memory || 8);
-        define(navigator, 'languages', [fp.locale || 'en-US', 'en']);
+        define(navigator, 'languages', languages);
+        define(navigator, 'language', languages[0] || fp.locale || 'en-US');
+        define(navigator, 'vendor', fp.navigator_vendor || 'Google Inc.');
+        define(navigator, 'maxTouchPoints', fp.max_touch_points || 0);
+        if (fp.do_not_track) define(navigator, 'doNotTrack', fp.do_not_track);
+        if (navigator.userAgentData && fp.client_hints) {
+            define(navigator.userAgentData, 'brands', fp.client_hints.brands || []);
+            define(navigator.userAgentData, 'mobile', false);
+            define(navigator.userAgentData, 'platform', fp.client_hints.platform || 'Windows');
+            try {
+                navigator.userAgentData.getHighEntropyValues = async (hints) => {
+                    const data = fp.client_hints || {};
+                    const result = {
+                        brands: data.brands || [],
+                        mobile: false,
+                        platform: data.platform || 'Windows',
+                    };
+                    for (const hint of hints || []) {
+                        if (hint === 'fullVersionList') result.fullVersionList = data.fullVersionList || [];
+                        if (hint === 'platformVersion') result.platformVersion = data.platformVersion || '';
+                        if (hint === 'architecture') result.architecture = data.architecture || 'x86';
+                        if (hint === 'bitness') result.bitness = data.bitness || '64';
+                        if (hint === 'model') result.model = data.model || '';
+                        if (hint === 'uaFullVersion') result.uaFullVersion = fp.chrome_full_version || '';
+                    }
+                    return result;
+                };
+            } catch {}
+        }
         const screen = fp.screen || fp.viewport || { width: 1366, height: 768 };
         define(window.screen, 'width', screen.width || 1366);
         define(window.screen, 'height', screen.height || 768);
         define(window.screen, 'availWidth', screen.width || 1366);
         define(window.screen, 'availHeight', Math.max(1, (screen.height || 768) - 40));
+        define(window.screen, 'colorDepth', screen.colorDepth || 24);
+        define(window.screen, 'pixelDepth', screen.pixelDepth || 24);
+        define(window, 'devicePixelRatio', fp.device_scale_factor || 1);
         window.chrome = window.chrome || { runtime: {} };
+        const pluginCount = Number(fp.plugin_count || 3);
+        const fakePlugins = Array.from({ length: pluginCount }, (_, i) => ({
+            name: ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer', 'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'][i] || `Chrome Plugin ${i + 1}`,
+            filename: `internal-pdf-viewer-${i}.dll`,
+            description: 'Portable Document Format',
+            length: 1,
+        }));
+        define(navigator, 'plugins', fakePlugins);
+        define(navigator, 'mimeTypes', fakePlugins.map((plugin) => ({ type: 'application/pdf', enabledPlugin: plugin })));
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+            const media = fp.media_devices || {};
+            navigator.mediaDevices.enumerateDevices = async () => {
+                const out = [];
+                const push = (kind, count) => {
+                    for (let i = 0; i < Number(count || 0); i += 1) {
+                        out.push({ kind, deviceId: `${kind}-${i}-${fp.profile_id || 'fp'}`, groupId: `group-${i}`, label: '' });
+                    }
+                };
+                push('audioinput', media.audioinput || 1);
+                push('videoinput', media.videoinput || 1);
+                push('audiooutput', media.audiooutput || 1);
+                return out;
+            };
+        }
+        const webglVendor = fp.webgl_vendor || 'Google Inc. (Intel)';
+        const webglRenderer = fp.webgl_renderer || 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        const patchWebGL = (proto) => {
+            if (!proto || !proto.getParameter) return;
+            const original = proto.getParameter;
+            proto.getParameter = function(parameter) {
+                if (parameter === 37445) return webglVendor;
+                if (parameter === 37446) return webglRenderer;
+                return original.call(this, parameter);
+            };
+        };
+        patchWebGL(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype);
+        patchWebGL(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype);
+        const noiseByte = (seed) => {
+            const text = String(seed || '0');
+            let n = 0;
+            for (let i = 0; i < text.length; i += 1) n = (n * 31 + text.charCodeAt(i)) & 255;
+            return n || 1;
+        };
+        const canvasNoise = noiseByte(fp.canvas_noise_seed);
+        if (window.HTMLCanvasElement && HTMLCanvasElement.prototype.toDataURL) {
+            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function(...args) {
+                try {
+                    const ctx = this.getContext('2d');
+                    if (ctx && this.width && this.height) {
+                        const x = Math.max(0, this.width - 1);
+                        const y = Math.max(0, this.height - 1);
+                        const data = ctx.getImageData(x, y, 1, 1);
+                        data.data[0] = (data.data[0] + canvasNoise) & 255;
+                        ctx.putImageData(data, x, y);
+                    }
+                } catch {}
+                return originalToDataURL.apply(this, args);
+            };
+        }
+        const audioRate = Number(fp.audio_sample_rate || 48000);
+        const patchAudioContext = (contextName) => {
+            if (!window[contextName]) return;
+            const OriginalAudioContext = window[contextName];
+            window[contextName] = function(...args) {
+                const ctx = new OriginalAudioContext(...args);
+                try { define(ctx, 'sampleRate', audioRate); } catch {}
+                return ctx;
+            };
+            window[contextName].prototype = OriginalAudioContext.prototype;
+        };
+        patchAudioContext('AudioContext');
+        patchAudioContext('webkitAudioContext');
     })();
     """.replace("__FINGERPRINT_JSON__", payload)
     await context.add_init_script(script=script)
@@ -379,6 +677,8 @@ class BrowserSession:
         proxy: str | None = None,
         isolated: bool = False,
         fingerprint_seed: str | None = None,
+        account_id: str | None = None,
+        log_prefix: str = "",
         **kwargs,
     ):
         self.profile_dir = resolve_path(profile_dir)
@@ -388,7 +688,13 @@ class BrowserSession:
         self.proxy = proxy
         self.isolated = isolated
         self.fingerprint_seed = fingerprint_seed
-        self.fingerprint = _build_fingerprint(fingerprint_seed, proxy)
+        self.account_id = account_id
+        self.log_prefix = log_prefix
+        self.fingerprint = (
+            get_or_create_account_fingerprint(account_id, proxy, log_prefix=log_prefix)
+            if str(account_id or "").strip()
+            else _build_fingerprint(fingerprint_seed, proxy)
+        )
         self._playwright = None
         self._browser: Browser | None = None
         self._proxy_bridge: Socks5AuthProxyBridge | None = None

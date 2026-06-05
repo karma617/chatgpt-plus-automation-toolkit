@@ -448,7 +448,9 @@ async def run_account(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=account.email,
+        fingerprint_seed=f"{account.email}|main",
+        account_id=account.email,
+        log_prefix=prefix,
     )
     try:
         await session.__aenter__()

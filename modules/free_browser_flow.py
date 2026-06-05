@@ -14,6 +14,10 @@ from .utils import log, resolve_path, safe_filename
 SMS_CODE_CALLBACK = Callable[[], Awaitable[str]]
 
 
+def _u(text: str) -> str:
+    return text.encode("ascii").decode("unicode_escape")
+
+
 class FreeBrowserFlow:
     """Browser flow helpers for free/email/phone registration and OAuth steps."""
 
@@ -319,10 +323,12 @@ class FreeBrowserFlow:
         raise RuntimeError(f"wait text timeout: {'/'.join(candidates)}")
 
     async def _find_email_input(self):
+        mail_jp = _u(r"\u30e1\u30fc\u30eb")
         selector = (
-            'input[type="email"], input[name*="email" i], input[id*="email" i], '
-            'input[name="username"], input[autocomplete="username"], input[inputmode="email"], '
-            'input[placeholder*="mail" i], input[placeholder*="邮箱" i], '
+            'input#email, input[name="email"], input[type="email"], input[name*="email" i], input[id*="email" i], '
+            'input[name="username"], input[autocomplete="username"], input[autocomplete*="email" i], input[inputmode="email"], '
+            f'input[aria-label*="email" i], input[aria-label*="mail" i], input[aria-label*="{mail_jp}"], '
+            f'input[placeholder*="mail" i], input[placeholder*="邮箱" i], input[placeholder*="{mail_jp}"], '
             '[role="dialog"] input, dialog input, [aria-modal="true"] input'
         )
         try:
@@ -373,7 +379,7 @@ class FreeBrowserFlow:
         probable = bool(
             meta.get("type") == "email"
             or meta.get("inputmode") == "email"
-            or any(k in hint_text for k in ("mail", "email", "user", "账号", "邮箱", "login", "signin", "sign in"))
+            or any(k in hint_text for k in ("mail", "email", "user", "账号", "邮箱", _u(r"\u30e1\u30fc\u30eb"), "login", "signin", "sign in"))
             or meta.get("inDialog")
         )
         return probable, str(meta)
@@ -466,9 +472,26 @@ class FreeBrowserFlow:
                     const s = getComputedStyle(el);
                     return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
                 };
-                const preferred = ['continue', 'next', 'verify', 'submit', 'sign up', '注册', '继续'];
-                const blocked = ['google', 'apple', 'phone', '手机号', '电话', '手机'];
+                const preferred = [
+                    'continue', 'next', 'verify', 'submit', 'sign up', '注册', '继续',
+                    '\\u7d9a\\u884c', '\\u6b21\\u3078', '\\u78ba\\u8a8d', '\\u9001\\u4fe1', '\\u767b\\u9332', '\\u4f5c\\u6210', '\\u5b8c\\u4e86'
+                ];
+                const blocked = ['google', 'apple', 'phone', '手机号', '电话', '手机', '\\u96fb\\u8a71\\u756a\\u53f7', '\\u643a\\u5e2f'];
                 const nodes = Array.from(document.querySelectorAll('button[type="submit"], button, input[type="submit"]'));
+                const structural = nodes.find((el) => {
+                    if (!visible(el) || el.disabled) return false;
+                    const text = String(el.innerText || el.textContent || el.value || '').toLowerCase();
+                    if (blocked.some(b => text.includes(b))) return false;
+                    const form = el.closest('form');
+                    const type = String(el.getAttribute('type') || '').toLowerCase();
+                    return !!form && (type === 'submit' || el.tagName === 'INPUT');
+                });
+                if (structural) {
+                    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+                        structural.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                    });
+                    return true;
+                }
                 for (const el of nodes) {
                     if (!visible(el) || el.disabled) continue;
                     const text = String(el.innerText || el.textContent || el.value || '').toLowerCase();
@@ -527,11 +550,25 @@ class FreeBrowserFlow:
     async def navigate_to_signup(self) -> None:
         await self.goto_chatgpt_entry(timeout_ms=60_000)
         await self.wait_for_cloudflare()
-        await self.wait_for_button_by_text(["Sign up", "Sign up for free", "免费注册", "注册"], 30_000)
-        await self.click_button_by_text(["Sign up", "Sign up for free", "免费注册", "注册"], 12_000)
+        try:
+            if await self.page.locator('input#phoneNumberInput, input[name="phoneNumberInput"], input[autocomplete="tel"], input[type="tel"]').first.is_visible(timeout=2_000):
+                return
+        except Exception:
+            pass
+        signup_labels = [
+            "Sign up", "Sign up for free", "免费注册", "注册",
+            _u(r"\u65b0\u898f\u767b\u9332"), _u(r"\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210"),
+            _u(r"\u30ed\u30b0\u30a4\u30f3\u307e\u305f\u306f\u65b0\u898f\u767b\u9332"),
+        ]
+        phone_labels = [
+            "Continue with phone", "phone number", "手机", "电话",
+            _u(r"\u96fb\u8a71\u756a\u53f7\u3067\u7d9a\u884c"), _u(r"\u96fb\u8a71\u756a\u53f7"), _u(r"\u643a\u5e2f"),
+        ]
+        await self.wait_for_button_by_text(signup_labels, 30_000)
+        await self.click_button_by_text(signup_labels, 12_000)
         await self.sleep(1200)
-        await self.click_button_by_text(["Continue with phone", "phone number", "手机", "电话"], 12_000)
-        await self.page.locator('input[name="phoneNumberInput"], input[type="tel"]').first.wait_for(timeout=15_000)
+        await self.click_button_by_text(phone_labels, 12_000)
+        await self.page.locator('input#phoneNumberInput, input[name="phoneNumberInput"], input[autocomplete="tel"], input[type="tel"]').first.wait_for(timeout=15_000)
 
     async def navigate_to_signup_email(self, email: str) -> None:
         await self.goto_chatgpt_entry(timeout_ms=60_000)
@@ -545,13 +582,21 @@ class FreeBrowserFlow:
         if email_input is not None:
             self.say("[Browser] direct email auth page detected, skipping Sign up button search")
         else:
-            await self.wait_for_button_by_text(["Sign up", "Sign up for free", "免费注册", "注册"], 30_000)
+            signup_labels = [
+                "Sign up", "Sign up for free", "免费注册", "注册",
+                _u(r"\u65b0\u898f\u767b\u9332"), _u(r"\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210"),
+                _u(r"\u30ed\u30b0\u30a4\u30f3\u307e\u305f\u306f\u65b0\u898f\u767b\u9332"),
+            ]
+            await self.wait_for_button_by_text(signup_labels, 30_000)
             for _ in range(3):
-                await self.click_button_by_text(["Sign up", "Sign up for free", "免费注册", "注册"], 12_000)
+                await self.click_button_by_text(signup_labels, 12_000)
                 await self.sleep(1200)
                 try:
                     await self.click_button_by_text(
-                        ["Continue with email", "Use email", "Email", "继续使用邮箱", "邮箱"],
+                        [
+                            "Continue with email", "Use email", "Email", "继续使用邮箱", "邮箱",
+                            _u(r"\u30e1\u30fc\u30eb\u30a2\u30c9\u30ec\u30b9\u3067\u7d9a\u884c"), _u(r"\u30e1\u30fc\u30eb"),
+                        ],
                         timeout_ms=3_000,
                     )
                 except Exception:
@@ -578,7 +623,7 @@ class FreeBrowserFlow:
                 clicked_form_submit = await asyncio.wait_for(
                     email_input.evaluate(
                         """(el) => {
-                            const block = (txt) => ['google', 'apple', 'phone', '手机', '电话', '手机号'].some(k => txt.includes(k));
+                            const block = (txt) => ['google', 'apple', 'phone', '手机', '电话', '手机号', '\\u96fb\\u8a71\\u756a\\u53f7', '\\u643a\\u5e2f'].some(k => txt.includes(k));
                             const form = el.closest('form');
                             if (form) {
                                 const btn = form.querySelector('button[type="submit"], input[type="submit"], button');
@@ -596,7 +641,7 @@ class FreeBrowserFlow:
                                 for (const btn of btns) {
                                     const text = String(btn.innerText || btn.textContent || btn.value || '').toLowerCase();
                                     if (block(text)) continue;
-                                    if (['continue', 'next', 'submit', '继续', '下一步', '提交', '注册'].some(k => text.includes(k))) {
+                                    if (['continue', 'next', 'submit', '继续', '下一步', '提交', '注册', '\\u7d9a\\u884c', '\\u6b21\\u3078', '\\u78ba\\u8a8d', '\\u9001\\u4fe1', '\\u767b\\u9332'].some(k => text.includes(k))) {
                                         btn.click();
                                         return true;
                                     }
@@ -899,6 +944,9 @@ class FreeBrowserFlow:
                 "enter a valid age",
                 "name is required",
                 "age is required",
+                _u(r"\u540d\u524d\u3092\u5165\u529b"),
+                _u(r"\u6c0f\u540d\u3092\u5165\u529b"),
+                _u(r"\u5e74\u9f62\u3092\u5165\u529b"),
             )
         )
 
@@ -912,7 +960,9 @@ class FreeBrowserFlow:
                         );
                         const hasNameOrAge = !!document.querySelector(
                             'input[name*="name" i], input[placeholder*="name" i], input[placeholder*="姓名"], '
-                            + 'input[name*="age" i], input[placeholder*="age" i], input[placeholder*="年龄"]'
+                            + 'input[placeholder*="\\u6c0f\\u540d"], input[placeholder*="\\u540d\\u524d"], '
+                            + 'input[name*="age" i], input[placeholder*="age" i], input[placeholder*="年龄"], '
+                            + 'input[placeholder*="\\u5e74\\u9f62"]'
                         );
                         return hasCode && hasNameOrAge;
                     }"""
@@ -934,6 +984,41 @@ class FreeBrowserFlow:
         y, m, d = "", "", ""
         if isinstance(birth_date, str) and re.match(r"^\d{4}-\d{2}-\d{2}$", birth_date):
             y, m, d = birth_date.split("-")
+        name_keywords = ["全名", "姓名", "Name", "Full name", _u(r"\u6c0f\u540d"), _u(r"\u540d\u524d")]
+        age_keywords = ["年龄", "Age", _u(r"\u5e74\u9f62")]
+        profile_submit_labels = [
+            "Continue", "继续", "下一步", "Submit", "提交",
+            _u(r"\u7d9a\u884c"), _u(r"\u6b21\u3078"), _u(r"\u78ba\u8a8d"), _u(r"\u9001\u4fe1"), _u(r"\u5b8c\u4e86"),
+        ]
+        name_jp_a = _u(r"\u6c0f\u540d")
+        name_jp_b = _u(r"\u540d\u524d")
+        age_jp = _u(r"\u5e74\u9f62")
+        birth_jp = _u(r"\u751f\u5e74\u6708\u65e5")
+        name_selectors = [
+            'input[name*="name" i]',
+            'input[placeholder*="name" i]',
+            'input[id*="name" i]',
+            'input[placeholder*="姓名"]',
+            'input[aria-label*="姓名"]',
+            f'input[placeholder*="{name_jp_a}"]',
+            f'input[aria-label*="{name_jp_a}"]',
+            f'input[placeholder*="{name_jp_b}"]',
+            f'input[aria-label*="{name_jp_b}"]',
+            'input[autocomplete="name"]',
+        ]
+        age_selectors = [
+            'input[name*="age" i]',
+            'input[id*="age" i]',
+            'input[placeholder*="age" i]',
+            'input[aria-label*="age" i]',
+            'input[placeholder*="年龄"]',
+            'input[aria-label*="年龄"]',
+            'input[name*="年龄"]',
+            f'input[placeholder*="{age_jp}"]',
+            f'input[aria-label*="{age_jp}"]',
+            'input[type="number"]',
+            'input[inputmode="numeric"]',
+        ]
 
         for step in range(1, 5):
             try:
@@ -955,6 +1040,10 @@ class FreeBrowserFlow:
                     "你的姓名",
                     "出生",
                     "年龄",
+                    _u(r"\u6c0f\u540d"),
+                    _u(r"\u540d\u524d"),
+                    _u(r"\u751f\u5e74\u6708\u65e5"),
+                    _u(r"\u5e74\u9f62"),
                 )
             ):
                 break
@@ -972,6 +1061,8 @@ class FreeBrowserFlow:
                     'input[inputmode="numeric"]',
                     'input[aria-label*="验证码"]',
                     'input[placeholder*="验证码"]',
+                    'input[aria-label*="code" i]',
+                    'input[placeholder*="code" i]',
                 ],
                 code_text,
             ):
@@ -981,14 +1072,8 @@ class FreeBrowserFlow:
             # Fill name with label-aware matching and strict verification.
             if await self._fill_profile_field(
                 value=full_name,
-                label_keywords=["全名", "姓名", "Name", "Full name"],
-                selectors=[
-                    'input[name*="name" i]',
-                    'input[placeholder*="name" i]',
-                    'input[id*="name" i]',
-                    'input[placeholder*="姓名"]',
-                    'input[aria-label*="姓名"]',
-                ],
+                label_keywords=name_keywords,
+                selectors=name_selectors,
             ):
                 filled_any = True
                 self.say(f"{tag} filled name")
@@ -997,16 +1082,8 @@ class FreeBrowserFlow:
             if age_text:
                 if await self._fill_profile_field(
                     value=age_text,
-                    label_keywords=["年龄", "Age"],
-                    selectors=[
-                        'input[name*="age" i]',
-                        'input[id*="age" i]',
-                        'input[placeholder*="age" i]',
-                        'input[aria-label*="age" i]',
-                        'input[placeholder*="年龄"]',
-                        'input[aria-label*="年龄"]',
-                        'input[name*="年龄"]',
-                    ],
+                    label_keywords=age_keywords,
+                    selectors=age_selectors,
                 ):
                     filled_any = True
                     self.say(f"{tag} filled age")
@@ -1020,6 +1097,8 @@ class FreeBrowserFlow:
                         'input[id*="birth" i]',
                         'input[placeholder*="birthday" i]',
                         'input[placeholder*="出生" i]',
+                        f'input[placeholder*="{birth_jp}"]',
+                        f'input[aria-label*="{birth_jp}"]',
                     ],
                     f"{y}-{m}-{d}",
                 ):
@@ -1041,7 +1120,7 @@ class FreeBrowserFlow:
             await self.sleep(120)
             await self.wait_before_cloudflare_submit(30_000, reason=f"{tag}-profile-submit")
             try:
-                await self.click_button_by_text(["Continue", "继续", "下一步", "Submit", "提交"], timeout_ms=1_500)
+                await self.click_button_by_text(profile_submit_labels, timeout_ms=1_500)
             except Exception:
                 await self.click_submit_button()
             await self.wait_for_url_change(before, timeout_ms=1_500)
@@ -1054,31 +1133,17 @@ class FreeBrowserFlow:
                 self.say(f"{tag} detected profile validation error, retry refill")
                 await self._fill_profile_field(
                     value=full_name,
-                    label_keywords=["全名", "姓名", "Name", "Full name"],
-                    selectors=[
-                        'input[name*="name" i]',
-                        'input[placeholder*="name" i]',
-                        'input[id*="name" i]',
-                        'input[placeholder*="姓名"]',
-                        'input[aria-label*="姓名"]',
-                    ],
+                    label_keywords=name_keywords,
+                    selectors=name_selectors,
                 )
                 if age_text:
                     await self._fill_profile_field(
                         value=age_text,
-                        label_keywords=["年龄", "Age"],
-                        selectors=[
-                            'input[name*="age" i]',
-                            'input[id*="age" i]',
-                            'input[placeholder*="age" i]',
-                            'input[aria-label*="age" i]',
-                            'input[placeholder*="年龄"]',
-                            'input[aria-label*="年龄"]',
-                            'input[name*="年龄"]',
-                        ],
+                        label_keywords=age_keywords,
+                        selectors=age_selectors,
                     )
                 try:
-                    await self.click_button_by_text(["Continue", "继续", "下一步", "Submit", "提交"], timeout_ms=1_500)
+                    await self.click_button_by_text(profile_submit_labels, timeout_ms=1_500)
                 except Exception:
                     await self.click_submit_button()
 
@@ -1089,7 +1154,7 @@ class FreeBrowserFlow:
         if not targets:
             return
         try:
-            await self.click_button_by_text(["country", "国家", "地区", "region"], 5000)
+            await self.click_button_by_text(["country", "国家", "地区", "region", _u(r"\u56fd"), _u(r"\u5730\u57df")], 5000)
         except Exception:
             pass
         for t in targets:
@@ -1107,7 +1172,7 @@ class FreeBrowserFlow:
         return number
 
     async def enter_phone(self, local_number: str) -> None:
-        inp = self.page.locator('input[name="phoneNumberInput"], input[type="tel"]').first
+        inp = self.page.locator('input#phoneNumberInput, input[name="phoneNumberInput"], input[autocomplete="tel"], input[type="tel"]').first
         await inp.wait_for(timeout=20_000)
         await inp.click(click_count=3)
         await inp.fill("")

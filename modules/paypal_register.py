@@ -517,7 +517,9 @@ async def register_one(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=f"{email}|paypal-register|{proxy or ''}|{time.time_ns()}",
+        fingerprint_seed=f"{email}|paypal-register",
+        account_id=email,
+        log_prefix=prefix,
     )
     session = BrowserSession(**session_kwargs)
 
@@ -729,7 +731,9 @@ async def login_existing_account_for_checkout(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=f"{email}|paypal-login|{proxy or ''}|{time.time_ns()}",
+        fingerprint_seed=f"{email}|paypal-login",
+        account_id=email,
+        log_prefix=prefix,
     )
     page = None
     try:

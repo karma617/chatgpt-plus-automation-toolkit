@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -48,10 +49,32 @@ def test_browser_session_uses_random_legal_fingerprint_surface() -> None:
 
     assert "_build_fingerprint" in source
     assert "BROWSER_RANDOM_FINGERPRINT" in source
-    assert "Chrome/{major}.0.0.0" in source
+    assert "chrome_full_version" in source
+    assert "client_hints" in source
     assert "timezone_id" in source
     assert "device_scale_factor" in source
     assert "hardwareConcurrency" in source
+    assert "navigator.userAgentData.getHighEntropyValues" in source
+    assert "webgl_renderer" in source
+    assert "canvas_noise_seed" in source
+    assert "audio_noise_seed" in source
+    assert "webkitAudioContext" in source
+
+
+def test_business_flows_bind_browser_fingerprint_to_account() -> None:
+    paths = [
+        ROOT / "main.py",
+        ROOT / "modules" / "paypal_register.py",
+        ROOT / "modules" / "paypal_pay.py",
+        ROOT / "modules" / "free_register.py",
+    ]
+    source = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+
+    assert "account_id=account.email" in source
+    assert "account_id=email" in source
+    assert "log_prefix=prefix" in source
+    for line in re.findall(r"fingerprint_seed=.*", source):
+        assert "time.time_ns()" not in line
 
 
 def test_chatgpt_register_turnstile_backoff_is_low_frequency() -> None:
@@ -114,12 +137,16 @@ def test_phone_register_mode_never_falls_back_to_email_fill() -> None:
     source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
     email_branch = source[source.index('if state == "email":') : source.index('if state == "password":')]
     phone_gate = email_branch[email_branch.index("if self.is_phone_signup_mode()") : email_branch.index("self.log(f")]
+    phone_switch = source[source.index("async def click_phone_switch") : source.index("async def fill_email")]
 
     assert "await self.force_phone_login_entry()" in phone_gate
     assert "continue" in phone_gate
     assert "await self.fill_email(account.email)" not in phone_gate
     assert "PHONE_ENTRY_ACTIONS" in source
     assert "async def force_phone_login_entry" in source
+    assert r"\u96fb\u8a71\u756a\u53f7\u3067\u7d9a\u884c" in phone_switch
+    assert r"\u643a\u5e2f\u96fb\u8a71\u3067\u7d9a\u884c" in phone_switch
+    assert r"\u96fb\u8a71\u756a\u53f7|\u643a\u5e2f\u96fb\u8a71|\u643a\u5e2f" in phone_switch
 
 
 def test_phone_login_detection_requires_dom_evidence_not_url_only() -> None:

@@ -195,6 +195,7 @@ def test_paypal_flow1_jp_delegates_to_register_with_jp_region(monkeypatch, capsy
         return 1
 
     monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_PAYMENT_MODE": "long_link"})
     monkeypatch.setattr(panel_runner, "run_paypal_register", fake_run_paypal_register)
 
     exit_code = panel_runner.run_action(args)
@@ -205,6 +206,26 @@ def test_paypal_flow1_jp_delegates_to_register_with_jp_region(monkeypatch, capsy
     event = json.loads(capsys.readouterr().out)
     assert event["flow"] == "paypal-flow1-jp"
     assert event["status"] == "success"
+
+
+def test_paypal_flow1_jp_short_link_mode_returns_hint_without_register(monkeypatch, capsys) -> None:
+    args = panel_runner.parse_args(["paypal-flow1-jp", "--count", "1", "--workers", "1"])
+
+    async def fail_run_paypal_register(*args, **kwargs):
+        raise AssertionError("flow1 should be skipped when PAYPAL_PAYMENT_MODE=short_link")
+
+    monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_PAYMENT_MODE": "short_link"})
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fail_run_paypal_register)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 0
+    event = json.loads(capsys.readouterr().out)
+    assert event["flow"] == "paypal-flow1-jp"
+    assert event["status"] == "success"
+    assert panel_runner._u(r"\u77ed\u94fe\u652f\u4ed8") in event["message"]
+    assert panel_runner._u(r"\u6d41\u7a0b2 \u65e5\u672c\u4ee3\u7406(\u65e0\u5361)") in event["message"]
 
 
 def test_paypal_auto_reuses_existing_link_when_flow1_reports_reused_link(monkeypatch, capsys) -> None:
@@ -255,6 +276,7 @@ def test_paypal_auto_stops_when_flow1_fails_even_if_old_pending_exists(monkeypat
         raise AssertionError("flow3 should not run after flow1 failure")
 
     monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_PAYMENT_MODE": "long_link"})
     monkeypatch.setattr(panel_runner, "run_register_tool_only", lambda *args, **kwargs: SimpleNamespace(ok=True, returncode=0, success_count=1, target_count=1, summary_file="registered.txt"))
     monkeypatch.setattr(panel_runner, "run_paypal_register", fake_flow1)
     monkeypatch.setattr(panel_runner, "run_paypal_pay", fail_flow2)
@@ -289,6 +311,7 @@ def test_paypal_auto_stops_when_flow2_fails_even_if_old_pending_exists(monkeypat
         raise AssertionError("flow3 should not run after flow2 failure")
 
     monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_PAYMENT_MODE": "long_link"})
     monkeypatch.setattr(panel_runner, "run_register_tool_only", lambda *args, **kwargs: SimpleNamespace(ok=True, returncode=0, success_count=1, target_count=1, summary_file="registered.txt"))
     monkeypatch.setattr(panel_runner, "run_paypal_register", fake_flow1)
     monkeypatch.setattr(panel_runner, "run_paypal_pay", fake_flow2)
@@ -357,6 +380,7 @@ def test_paypal_auto_jp_nocard_runs_full_jp_chain(monkeypatch, tmp_path, capsys)
         return 0
 
     monkeypatch.setattr(panel_runner, "_load_panel_config", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_PAYMENT_MODE": "long_link"})
     monkeypatch.setattr(panel_runner, "run_register_tool_only", fake_register_only)
     monkeypatch.setattr(panel_runner, "run_paypal_register", fake_flow1)
     monkeypatch.setattr(panel_runner, "run_paypal_pay", fake_flow2)
@@ -426,6 +450,7 @@ def test_paypal_auto_jp_nocard_reuses_ready_registered_account_without_registeri
             "mail_sources": {"hotmail": {"source": "hotmail", "accounts_file": "hotmail.txt"}},
         },
     )
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_PAYMENT_MODE": "long_link"})
     monkeypatch.setattr(panel_runner, "run_register_tool_only", fail_register_only)
     monkeypatch.setattr(panel_runner, "_count_flow1_ready_registered", lambda selected_email="": 1)
     monkeypatch.setattr(panel_runner, "run_paypal_register", fake_flow1)
@@ -459,7 +484,64 @@ def test_paypal_auto_jp_nocard_without_long_link_skips_flow1(monkeypatch, capsys
     pending_calls = {"count": 0}
 
     async def fail_flow1(*args, **kwargs):
-        raise AssertionError("flow1 should be skipped when PAYPAL_USE_LONG_LINK=false")
+        raise AssertionError("flow1 should be skipped when PAYPAL_PAYMENT_MODE=short_link")
+
+    async def fake_flow2(*args, **kwargs):
+        calls.append(("flow2", kwargs))
+        return 1
+
+    def fake_pending_count(*args, **kwargs):
+        pending_calls["count"] += 1
+        return 1 if pending_calls["count"] >= 2 else 0
+
+    def fake_authorize(**kwargs):
+        calls.append(("flow3", kwargs))
+        return 0
+
+    monkeypatch.setattr(
+        panel_runner,
+        "_load_panel_config",
+        lambda *args, **kwargs: {
+            "mail": {"source": "hotmail"},
+            "mail_sources": {"hotmail": {"source": "hotmail", "accounts_file": "hotmail.txt"}},
+        },
+    )
+    monkeypatch.setattr(panel_runner, "load_env", lambda path: {"PAYPAL_PAYMENT_MODE": "short_link"})
+    monkeypatch.setattr(panel_runner, "_count_flow1_ready_registered", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_direct_pay_ready", lambda selected_email="": 1)
+    monkeypatch.setattr(panel_runner, "_count_payment_links", lambda selected_email="": 0)
+    monkeypatch.setattr(panel_runner, "_count_pending_auth", fake_pending_count)
+    monkeypatch.setattr(panel_runner, "run_paypal_register", fail_flow1)
+    monkeypatch.setattr(panel_runner, "run_paypal_pay", fake_flow2)
+    monkeypatch.setattr(panel_runner, "_run_paypal_authorize", fake_authorize)
+
+    exit_code = panel_runner.run_action(args)
+
+    assert exit_code == 0
+    assert [name for name, _kwargs in calls] == ["flow2", "flow3"]
+    assert calls[0][1]["card_source_mode"] == "local_random"
+    assert calls[0][1]["flow2_region_mode"] == "jp"
+    event = json.loads(capsys.readouterr().out)
+    assert event["status"] == "success"
+
+
+def test_paypal_auto_jp_nocard_legacy_long_link_false_still_skips_flow1(monkeypatch, capsys) -> None:
+    args = panel_runner.parse_args(
+        [
+            "paypal-auto-jp-nocard",
+            "--count",
+            "1",
+            "--workers",
+            "1",
+            "--mail-source",
+            "hotmail",
+        ]
+    )
+    calls = []
+    pending_calls = {"count": 0}
+
+    async def fail_flow1(*args, **kwargs):
+        raise AssertionError("flow1 should be skipped when legacy PAYPAL_USE_LONG_LINK=false")
 
     async def fake_flow2(*args, **kwargs):
         calls.append(("flow2", kwargs))
@@ -494,8 +576,6 @@ def test_paypal_auto_jp_nocard_without_long_link_skips_flow1(monkeypatch, capsys
 
     assert exit_code == 0
     assert [name for name, _kwargs in calls] == ["flow2", "flow3"]
-    assert calls[0][1]["card_source_mode"] == "local_random"
-    assert calls[0][1]["flow2_region_mode"] == "jp"
     event = json.loads(capsys.readouterr().out)
     assert event["status"] == "success"
 

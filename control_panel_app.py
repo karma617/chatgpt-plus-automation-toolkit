@@ -69,6 +69,42 @@ def _env_bool_value(values: dict[str, str], key: str, default: bool = False) -> 
     return default
 
 
+def _paypal_use_long_link_value(values: dict[str, str]) -> bool:
+    raw = str(values.get("PAYPAL_PAYMENT_MODE") or "").strip()
+    if not raw:
+        return _env_bool_value(values, "PAYPAL_USE_LONG_LINK", True)
+    normalized = raw.lower().replace("-", "_")
+    compact = re.sub(r"[\s_]+", "", normalized)
+    if compact in {
+        "short",
+        "shortlink",
+        "shorturl",
+        "direct",
+        "browser",
+        "offer",
+        "shortpay",
+        "\u77ed\u94fe",
+        "\u77ed\u94fe\u63a5",
+        "\u77ed\u94fe\u652f\u4ed8",
+        "\u77ed\u94fe\u63a5\u652f\u4ed8",
+        "\u76f4\u63a5\u652f\u4ed8",
+    }:
+        return False
+    if compact in {
+        "long",
+        "link",
+        "longlink",
+        "longurl",
+        "longpay",
+        "\u957f\u94fe",
+        "\u957f\u94fe\u63a5",
+        "\u957f\u94fe\u652f\u4ed8",
+        "\u957f\u94fe\u63a5\u652f\u4ed8",
+    }:
+        return True
+    return _env_bool_value(values, "PAYPAL_USE_LONG_LINK", True)
+
+
 def app_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -783,11 +819,11 @@ class RunPage(ttk.Frame):
             return
         if action == "paypal-flow1-jp":
             env = read_env(self.root_path / ".env")
-            if not _env_bool_value(env, "PAYPAL_USE_LONG_LINK", True):
+            if not _paypal_use_long_link_value(env):
                 messagebox.showinfo(
                     _u(r"\u957f\u94fe\u751f\u6210\u5df2\u5173\u95ed"),
                     _u(
-                        r"\u5f53\u524d PAYPAL_USE_LONG_LINK=false\uff0c\u5df2\u5173\u95ed\u65e5\u533a\u65e0\u5361\u957f\u94fe\u751f\u6210\u3002\n"
+                        r"\u5f53\u524d PayPal \u652f\u4ed8\u6a21\u5f0f\u4e3a\u77ed\u94fe\u652f\u4ed8\uff0c\u5df2\u5173\u95ed\u65e5\u533a\u65e0\u5361\u957f\u94fe\u751f\u6210\u3002\n"
                         r"\u8bf7\u76f4\u63a5\u70b9\u51fb\u201c\u6d41\u7a0b2 \u65e5\u672c\u4ee3\u7406(\u65e0\u5361)\u201d\uff0c\u7a0b\u5e8f\u4f1a\u767b\u5f55\u5df2\u6ce8\u518c\u8d26\u53f7\u5e76\u4ece ChatGPT \u9886\u53d6\u4f18\u60e0/\u5347\u7ea7\u5165\u53e3\u63a5\u7ba1\u652f\u4ed8\u6d41\u7a0b\u3002"
                     ),
                 )

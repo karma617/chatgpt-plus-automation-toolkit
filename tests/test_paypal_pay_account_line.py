@@ -147,6 +147,7 @@ def test_regenerate_flow2_payment_link_uses_forced_method_order(monkeypatch, tmp
         "email": "user@hotmail.com",
         "account_line": "user@hotmail.com----pw----client----rt",
         "payment_link": "https://pay.example/old",
+        "link_method": checkout.CHECKOUT_METHOD_EXTERNAL_API,
     }
 
     link, method = asyncio.run(
@@ -163,10 +164,67 @@ def test_regenerate_flow2_payment_link_uses_forced_method_order(monkeypatch, tmp
     assert method == checkout.CHECKOUT_METHOD_LOCAL_SERVICE
     assert captured["mail_source"] == "hotmail"
     assert captured["checkout_region"] == "jp"
-    assert captured["checkout_skip_methods"] == set()
-    assert captured["checkout_preferred_methods"] == paypal_pay.PAYPAL_FLOW2_RECREATE_METHOD_ORDER
+    assert captured["checkout_skip_methods"] == {checkout.CHECKOUT_METHOD_EXTERNAL_API}
+    assert checkout.CHECKOUT_METHOD_EXTERNAL_API not in captured["checkout_preferred_methods"]
+    assert captured["checkout_preferred_methods"] == tuple(
+        method for method in paypal_pay.PAYPAL_FLOW2_RECREATE_METHOD_ORDER if method != checkout.CHECKOUT_METHOD_EXTERNAL_API
+    )
     assert item["payment_link"] == "https://pay.example/recreated"
     assert "https://pay.example/recreated" in link_file.read_text(encoding="utf-8")
+
+
+def test_paypal_payment_mode_prefers_new_env_and_keeps_legacy_fallback() -> None:
+    assert paypal_pay.paypal_payment_mode({}) == paypal_pay.PAYPAL_PAYMENT_MODE_LONG_LINK
+    assert paypal_pay.paypal_payment_mode({"PAYPAL_USE_LONG_LINK": "false"}) == paypal_pay.PAYPAL_PAYMENT_MODE_SHORT_LINK
+    assert (
+        paypal_pay.paypal_payment_mode({"PAYPAL_PAYMENT_MODE": "\u77ed\u94fe\u652f\u4ed8", "PAYPAL_USE_LONG_LINK": "true"})
+        == paypal_pay.PAYPAL_PAYMENT_MODE_SHORT_LINK
+    )
+    assert paypal_pay.paypal_payment_mode({"PAYPAL_PAYMENT_MODE": "long_link"}) == paypal_pay.PAYPAL_PAYMENT_MODE_LONG_LINK
+    assert paypal_pay.paypal_use_long_link({"PAYPAL_PAYMENT_MODE": "\u957f\u94fe\u652f\u4ed8"}) is True
+    assert paypal_pay.paypal_use_long_link({"PAYPAL_PAYMENT_MODE": "short_link"}) is False
+
+
+def test_short_link_jp_keeps_jp_proxy_but_uses_us_billing_country(monkeypatch) -> None:
+    assert paypal_pay._payment_form_country_code("jp", use_long_link=False) == "US"
+    assert paypal_pay._paypal_form_country_code("jp", use_long_link=False) == "US"
+    assert paypal_pay._payment_form_country_code("jp", use_long_link=True) == "JP"
+    assert paypal_pay._paypal_form_country_code("jp", use_long_link=True) == "JP"
+
+    probes = []
+
+    def fake_probe(proxy, required_country_code, timeout_sec=12):
+        probes.append((proxy, required_country_code, timeout_sec))
+        return True, "country=JP ip=203.0.113.10"
+
+    monkeypatch.setattr(paypal_pay, "_probe_flow2_proxy_country", fake_probe)
+
+    paypal_pay._ensure_short_link_jp_proxy(
+        "socks5h://jp-proxy.example.test:1080",
+        env={"PAYPAL_SHORT_LINK_JP_PROXY_CHECK_TIMEOUT": "9"},
+        prefix="[test]",
+    )
+
+    assert probes == [("socks5h://jp-proxy.example.test:1080", "JP", 9)]
+
+
+def test_short_link_jp_proxy_country_mismatch_raises(monkeypatch) -> None:
+    monkeypatch.setattr(
+        paypal_pay,
+        "_probe_flow2_proxy_country",
+        lambda proxy, required_country_code, timeout_sec=12: (False, "country mismatch: got=US required=JP"),
+    )
+
+    try:
+        paypal_pay._ensure_short_link_jp_proxy(
+            "socks5h://us-proxy.example.test:1080",
+            env={},
+            prefix="[test]",
+        )
+    except RuntimeError as exc:
+        assert str(exc).startswith(paypal_pay.PAYPAL_FLOW2_JP_PROXY_COUNTRY_MISMATCH)
+    else:
+        raise AssertionError("expected proxy country mismatch to raise")
 
 
 def test_classify_checkout_due_amount_detects_zero_and_nonzero() -> None:
@@ -240,7 +298,7 @@ def test_filler_flow2_keeps_full_mail_account_line(monkeypatch, tmp_path) -> Non
 def test_paypal_pay_fast_otp_submit_and_captcha_cleanup_regression() -> None:
     source = paypal_pay.Path(paypal_pay.__file__).read_text(encoding="utf-8")
 
-    assert paypal_pay.PAYPAL_FLOW2_CODE_VERSION == "PAYPAL_BROWSER_FINGERPRINT_TURNSTILE_BACKOFF_2026-06-04_01"
+    assert paypal_pay.PAYPAL_FLOW2_CODE_VERSION == "PAYPAL_SHORT_LINK_US_PAY_JP_PROXY_2026-06-05_01"
     assert "_cleanup_hosted_captcha_artifacts(page, timeout_ms=2500)" in source
     assert "await _wait_captcha_cleared(page, timeout_seconds=10)" in source
     assert "if await _is_paypal_verification_stage(page):\n                break" in source
@@ -253,4 +311,10 @@ def test_paypal_pay_fast_otp_submit_and_captcha_cleanup_regression() -> None:
     assert "PAYPAL_FLOW2_RECREATE_LINK" in source
     assert "submit entered processing but did not redirect PayPal in 60s" in source
     assert "regenerate_flow2_payment_link" in source
+    assert "_detect_link_payment_invalid_long_link" in source
+    assert "opened long link shows Link payment" in source
+    assert "PAYPAL_PAYMENT_MODE" in source
+    assert "_ensure_short_link_jp_proxy(proxy, env=flow_env, prefix=prefix)" in source
+    assert "country_code=stripe_country" in source
+    assert "country_code=paypal_country" in source
     assert "checkout agreement checkbox not detected; keep as diagnostic only" in source

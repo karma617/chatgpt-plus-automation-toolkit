@@ -236,14 +236,31 @@ class ChatGPTRegister:
     async def click_entry(self) -> None:
         entry_action = self.entry_action.lower()
         if entry_action in {"login", "signin", "log_in"}:
-            labels = ["登录", "Log in", "Login", "Sign in"]
-            patterns = [re.compile(r"log in|login|sign in", re.I), re.compile(r"登录")]
+            labels = ["登录", "Log in", "Login", "Sign in", _zh(r"\u30ed\u30b0\u30a4\u30f3")]
+            patterns = [re.compile(r"log in|login|sign in", re.I), re.compile(r"登录"), re.compile(_zh(r"\u30ed\u30b0\u30a4\u30f3"))]
         elif entry_action in {"signup_phone", "phone_signup", "phone"}:
-            labels = ["登录", "Log in", "Login", "Sign in", "免费注册", "创建账号", "注册", "Sign up", "Create account"]
-            patterns = [re.compile(r"log in|login|sign in|sign up|create account|register", re.I), re.compile(r"登录|免费注册|创建账号|注册")]
+            labels = [
+                "登录", "Log in", "Login", "Sign in", "免费注册", "创建账号", "注册", "Sign up", "Create account",
+                _zh(r"\u30ed\u30b0\u30a4\u30f3"), _zh(r"\u65b0\u898f\u767b\u9332"),
+                _zh(r"\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210"),
+                _zh(r"\u30ed\u30b0\u30a4\u30f3\u307e\u305f\u306f\u65b0\u898f\u767b\u9332"),
+            ]
+            patterns = [
+                re.compile(r"log in|login|sign in|sign up|create account|register", re.I),
+                re.compile(r"登录|免费注册|创建账号|注册"),
+                re.compile(_zh(r"\u30ed\u30b0\u30a4\u30f3|\u65b0\u898f\u767b\u9332|\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210")),
+            ]
         else:
-            labels = ["免费注册", "创建账号", "创建帐户", "注册", "Sign up for free", "Sign up", "Create account", "Register"]
-            patterns = [re.compile(r"sign up|create account|create|register|free", re.I), re.compile(r"免费注册|创建账号|创建帐户|注册|创建")]
+            labels = [
+                "免费注册", "创建账号", "创建帐户", "注册", "Sign up for free", "Sign up", "Create account", "Register",
+                _zh(r"\u65b0\u898f\u767b\u9332"), _zh(r"\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210"),
+                _zh(r"\u30ed\u30b0\u30a4\u30f3\u307e\u305f\u306f\u65b0\u898f\u767b\u9332"),
+            ]
+            patterns = [
+                re.compile(r"sign up|create account|create|register|free", re.I),
+                re.compile(r"免费注册|创建账号|创建帐户|注册|创建"),
+                re.compile(_zh(r"\u65b0\u898f\u767b\u9332|\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210")),
+            ]
         for pattern in patterns:
             buttons = self.page.get_by_role("button", name=pattern)
             for index in range(await buttons.count()):
@@ -299,8 +316,10 @@ class ChatGPTRegister:
                         return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
                     };
                     const nodes = [...document.querySelectorAll('a[href], button, [role="button"]')].filter(visible);
-                    const target = nodes.find((el) => /login|log in|登录|sign up|注册|创建/i.test(el.innerText || el.textContent || el.getAttribute('aria-label') || ''))
-                        || nodes.find((el) => String(el.getAttribute('href') || '').includes('/auth/login'));
+                    const target = nodes.find((el) => {
+                        const href = String(el.getAttribute('href') || '');
+                        return href.includes('/auth/login') || href.includes('/log-in-or-create-account') || href.includes('/create-account');
+                    }) || nodes.find((el) => /login|log in|登录|sign up|注册|创建|\u30ed\u30b0\u30a4\u30f3|\u65b0\u898f\u767b\u9332|\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210/i.test(el.innerText || el.textContent || el.getAttribute('aria-label') || ''));
                     if (!target) return false;
                     target.click();
                     return true;
@@ -456,6 +475,9 @@ class ChatGPTRegister:
         if await click_by_visible_text(self.page, "Continue with email"):
             await settle(self.page)
             return
+        if await click_by_visible_text(self.page, _zh(r"\u30e1\u30fc\u30eb\u30a2\u30c9\u30ec\u30b9\u3067\u7d9a\u884c")):
+            await settle(self.page)
+            return
         clicked = await self.page.evaluate(
             """() => {
                 const visible = (el) => {
@@ -464,7 +486,7 @@ class ChatGPTRegister:
                     return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
                 };
                 const nodes = [...document.querySelectorAll('button, a, [role="button"], div')];
-                const target = nodes.find((el) => visible(el) && /电子邮件|email/i.test(el.innerText || el.textContent || ''));
+                const target = nodes.find((el) => visible(el) && /电子邮件|邮箱|email|\u30e1\u30fc\u30eb/i.test(el.innerText || el.textContent || el.getAttribute('aria-label') || ''));
                 if (!target) return false;
                 target.click();
                 return true;
@@ -503,7 +525,21 @@ class ChatGPTRegister:
         await settle(self.page)
 
     async def click_phone_switch(self) -> bool:
-        labels = ["使用电话号码继续", "使用手机号继续", "手机登录", "手机号登录", "继续使用手机登录", "Continue with phone", "Continue with phone number", "Phone number", "Phone"]
+        labels = [
+            _zh(r"\u4f7f\u7528\u7535\u8bdd\u53f7\u7801\u7ee7\u7eed"),
+            _zh(r"\u4f7f\u7528\u624b\u673a\u53f7\u7ee7\u7eed"),
+            _zh(r"\u624b\u673a\u767b\u5f55"),
+            _zh(r"\u624b\u673a\u53f7\u767b\u5f55"),
+            _zh(r"\u7ee7\u7eed\u4f7f\u7528\u624b\u673a\u767b\u5f55"),
+            _zh(r"\u96fb\u8a71\u756a\u53f7\u3067\u7d9a\u884c"),
+            _zh(r"\u96fb\u8a71\u756a\u53f7\u3067\u30ed\u30b0\u30a4\u30f3"),
+            _zh(r"\u96fb\u8a71\u756a\u53f7"),
+            _zh(r"\u643a\u5e2f\u96fb\u8a71\u3067\u7d9a\u884c"),
+            "Continue with phone",
+            "Continue with phone number",
+            "Phone number",
+            "Phone",
+        ]
         for label in labels:
             if await click_by_visible_text(self.page, label):
                 await settle(self.page)
@@ -516,7 +552,14 @@ class ChatGPTRegister:
                     return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
                 };
                 const nodes = [...document.querySelectorAll('button, a, [role="button"], div')];
-                const target = nodes.find((el) => visible(el) && /手机|手机号|电话号码|phone/i.test(el.innerText || el.textContent || ''));
+                const textOf = (el) => [
+                    el.innerText || '',
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.outerHTML || ''
+                ].join(' ');
+                const target = nodes.find((el) => visible(el) && /\u624b\u673a|\u624b\u673a\u53f7|\u7535\u8bdd\u53f7\u7801|\u96fb\u8a71\u756a\u53f7|\u643a\u5e2f\u96fb\u8a71|\u643a\u5e2f|phone|mobile|tel/i.test(textOf(el)));
                 if (!target) return false;
                 target.click();
                 return true;
@@ -546,7 +589,10 @@ class ChatGPTRegister:
         if not locator:
             raise RuntimeError("未找到密码输入框")
         await human_fill(locator, account.password, force_mouse=True)
-        await click_submit_by_js(self.page, ["下一步", "继续", "登录", "Continue", "Next", "Log in"])
+        await click_submit_by_js(
+            self.page,
+            ["下一步", "继续", "登录", "Continue", "Next", "Log in", _zh(r"\u7d9a\u884c"), _zh(r"\u6b21\u3078"), _zh(r"\u30ed\u30b0\u30a4\u30f3")],
+        )
 
     async def fill_code(self, code: str) -> bool:
         inputs = await visible_locators(self.page.locator("input:not([type='file'])"))
@@ -671,13 +717,19 @@ class ChatGPTRegister:
 
 async def find_phone_input(page: Page) -> Locator | None:
     selectors = (
+        'input#phoneNumberInput',
         'input[name="phoneNumberInput"]',
-        'input[type="tel"]',
         'input[autocomplete="tel"]',
+        'input[type="tel"]',
+        'input[inputmode="tel"]',
         'input[name*="phone" i]',
+        'input[id*="phone" i]',
+        'input[aria-label*="phone" i]',
+        'input[aria-label*="\u96fb\u8a71\u756a\u53f7"]',
         'input[placeholder*="phone" i]',
         'input[placeholder*="手机号"]',
         'input[placeholder*="电话号码"]',
+        'input[placeholder*="\u96fb\u8a71\u756a\u53f7"]',
     )
     for selector in selectors:
         found = await maybe_visible_selector(page, selector, timeout=900)
@@ -700,8 +752,16 @@ async def page_looks_like_profile_page(page: Page) -> bool:
                         const style = getComputedStyle(el);
                         return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
                     };
-                    const nameInput = document.querySelector('input[name="name"], input[autocomplete="name"]');
-                    const ageInput = document.querySelector('input[name="age"], input[inputmode="numeric"], input[type="number"]');
+                    const nameInput = document.querySelector(
+                        'input[name="name"], input[autocomplete="name"], input[id*="name" i], ' +
+                        'input[aria-label*="name" i], input[placeholder*="name" i], input[aria-label*="\\u6c0f\\u540d"], ' +
+                        'input[placeholder*="\\u6c0f\\u540d"], input[aria-label*="\\u540d\\u524d"], input[placeholder*="\\u540d\\u524d"]'
+                    );
+                    const ageInput = document.querySelector(
+                        'input[name="age"], input[inputmode="numeric"], input[type="number"], input[id*="age" i], ' +
+                        'input[aria-label*="age" i], input[placeholder*="age" i], input[aria-label*="\\u5e74\\u9f62"], ' +
+                        'input[placeholder*="\\u5e74\\u9f62"]'
+                    );
                     if (visible(nameInput) && visible(ageInput)) return true;
                     const text = String(document.body?.innerText || '').toLowerCase();
                     return (
@@ -867,7 +927,10 @@ async def country_selector_matches(page: Page, country: PhoneCountry) -> bool:
 
 
 async def click_phone_submit(page: Page, field: Locator | None = None) -> bool:
-    clicked = await click_submit_by_js(page, ["继续", "Continue", "Next", "Verify", "Submit", "验证", "下一步"])
+    clicked = await click_submit_by_js(
+        page,
+        ["继续", "Continue", "Next", "Verify", "Submit", "验证", "下一步", _zh(r"\u7d9a\u884c"), _zh(r"\u6b21\u3078"), _zh(r"\u78ba\u8a8d"), _zh(r"\u9001\u4fe1")],
+    )
     if clicked:
         return True
     if field is not None:
@@ -1329,6 +1392,31 @@ def is_chatgpt_success_landing(url: str, low: str, text: str) -> bool:
 async def is_phone_login_page(page: Page, low: str, text: str) -> bool:
     url = (page.url or "").lower()
     phone_url = "usernamekind=phone_number" in url or "screen_hint=phone" in url
+    try:
+        structural_phone = bool(
+            await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el || !el.getBoundingClientRect) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const phone = document.querySelector(
+                        'input#phoneNumberInput, input[name="phoneNumberInput"], input[autocomplete="tel"], input[type="tel"], input[inputmode="tel"]'
+                    );
+                    if (visible(phone)) return true;
+                    const country = document.querySelector(
+                        'button[role="combobox"][aria-label*="\u96fb\u8a71\u756a\u53f7"], button[role="combobox"], select option[value="JP"][selected]'
+                    );
+                    return visible(country) && !!document.querySelector('input[name*="phone" i], input[id*="phone" i]');
+                }"""
+            )
+        )
+        if structural_phone:
+            return True
+    except Exception:
+        pass
     switch_to_email = any(
         marker in low or marker in text
         for marker in (
@@ -1505,12 +1593,24 @@ async def fill_profile_stable_fields(page: Page, full_name: str, age: str, logge
                 'input[name="name"]',
                 'input[autocomplete="name"]',
                 'input[id$="-name"]',
+                'input[id*="name" i]',
+                'input[aria-label*="name" i]',
+                'input[placeholder*="name" i]',
+                'input[aria-label*="\\u6c0f\\u540d"]',
+                'input[placeholder*="\\u6c0f\\u540d"]',
+                'input[aria-label*="\\u540d\\u524d"]',
+                'input[placeholder*="\\u540d\\u524d"]',
             ]);
             const ageEl = firstVisible([
                 'input[name="age"]',
                 'input[id$="-age"]',
+                'input[id*="age" i]',
                 'input[type="number"][min][max]',
                 'input[inputmode="numeric"][min][max]',
+                'input[aria-label*="age" i]',
+                'input[placeholder*="age" i]',
+                'input[aria-label*="\\u5e74\\u9f62"]',
+                'input[placeholder*="\\u5e74\\u9f62"]',
             ]);
             if (nameEl) setValue(nameEl, fullName);
             if (ageEl) setValue(ageEl, age);
@@ -1583,12 +1683,12 @@ async def fill_profile_by_js(page: Page, full_name: str, age: str, logger: Calla
             let ageEl = null;
             for (const el of fields) {
                 const meta = labelFor(el);
-                if (!ageEl && (/\\bage\\b|年龄|birthday|birth|year/i.test(meta) || /number|numeric|tel/i.test([el.type, el.inputMode].join(' ')))) ageEl = el;
+                if (!ageEl && (/\\bage\\b|年龄|\\u5e74\\u9f62|\\u751f\\u5e74\\u6708\\u65e5|birthday|birth|year/i.test(meta) || /number|numeric|tel/i.test([el.type, el.inputMode].join(' ')))) ageEl = el;
             }
             for (const el of fields) {
                 if (el === ageEl) continue;
                 const meta = labelFor(el);
-                if (!nameEl && /全名|姓名|名字|full\\s*name|name/i.test(meta)) nameEl = el;
+                if (!nameEl && /全名|姓名|名字|\\u6c0f\\u540d|\\u540d\\u524d|full\\s*name|name/i.test(meta)) nameEl = el;
             }
             if (!nameEl) nameEl = fields[0] || null;
             if (!ageEl) {
@@ -1617,12 +1717,33 @@ async def fill_profile_by_js(page: Page, full_name: str, age: str, logger: Calla
 
 
 async def click_profile_submit_by_js(page: Page) -> None:
-    clicked = await click_submit_by_js(page, ["完成帐户创建", "完成账户创建", "完成帐户建立", "完成账户建立", "完成", "创建", "Continue", "Done", "Create"])
+    clicked = await click_submit_by_js(
+        page,
+        [
+            "完成帐户创建", "完成账户创建", "完成帐户建立", "完成账户建立", "完成", "创建", "Continue", "Done", "Create",
+            _zh(r"\u7d9a\u884c"), _zh(r"\u5b8c\u4e86"), _zh(r"\u4f5c\u6210"), _zh(r"\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210"),
+        ],
+    )
     if not clicked:
         await click_continue(page, profile=True)
 
 
 async def click_submit_by_js(page: Page, labels: list[str]) -> bool:
+    labels = list(
+        dict.fromkeys(
+            [
+                *labels,
+                _zh(r"\u7d9a\u884c"),
+                _zh(r"\u6b21\u3078"),
+                _zh(r"\u78ba\u8a8d"),
+                _zh(r"\u9001\u4fe1"),
+                _zh(r"\u30ed\u30b0\u30a4\u30f3"),
+                _zh(r"\u767b\u9332"),
+                _zh(r"\u4f5c\u6210"),
+                _zh(r"\u5b8c\u4e86"),
+            ]
+        )
+    )
     clicked = await page.evaluate(
         """(labels) => {
             const visible = (el) => {
@@ -1645,11 +1766,11 @@ async def click_submit_by_js(page: Page, labels: list[str]) -> bool:
                 .filter((el) => visible(el) && !el.disabled)
                 .filter((el) => {
                     const value = text(el) || el.value || '';
-                    const hay = meta(el);
-                    if (/google|apple|microsoft|github|sso|oauth|social|provider/i.test(hay)) return false;
-                    if (isSwitchEmail(value)) return false;
-                    return true;
-                });
+                const hay = meta(el);
+                if (/google|apple|microsoft|github|sso|oauth|social|provider/i.test(hay)) return false;
+                if (isSwitchEmail(value)) return false;
+                return true;
+            });
             const labeled = buttons.filter((el) => (text(el) || el.value || '').trim());
             const wanted = labels.map((s) => String(s).toLowerCase());
             const exact = labeled.find((el) => {
@@ -1669,6 +1790,19 @@ async def click_submit_by_js(page: Page, labels: list[str]) -> bool:
             };
             if (exact) {
                 activate(exact);
+                return true;
+            }
+            const structuralSubmit = buttons.find((el) => {
+                const type = String(el.getAttribute?.('type') || '').toLowerCase();
+                const tag = String(el.tagName || '').toLowerCase();
+                const form = el.closest?.('form');
+                if (!form) return false;
+                if (tag === 'input' && type === 'submit') return true;
+                if (tag === 'button' && (type === 'submit' || type === '')) return true;
+                return false;
+            });
+            if (structuralSubmit) {
+                activate(structuralSubmit);
                 return true;
             }
             const primary = labeled.find((el) => {
@@ -1708,8 +1842,8 @@ async def click_email_submit(page: Page, email_input: Locator) -> bool:
                 el?.outerHTML || ''
             ].join(' ').toLowerCase();
             const isSocial = (el) => /google|apple|microsoft|github|sso|oauth|social|provider/.test(meta(el));
-            const isWanted = (el) => /^(continue|next|submit|log in|sign in|sign up|create|继续|下一步|登录|注册)$/i.test(label(el))
-                || /continue|next|继续|下一步/.test(label(el).toLowerCase());
+            const isWanted = (el) => /^(continue|next|submit|log in|sign in|sign up|create|继续|下一步|登录|注册|\u7d9a\u884c|\u6b21\u3078|\u78ba\u8a8d|\u9001\u4fe1|\u30ed\u30b0\u30a4\u30f3|\u767b\u9332)$/i.test(label(el))
+                || /continue|next|继续|下一步|\u7d9a\u884c|\u6b21\u3078/.test(label(el).toLowerCase());
             const activate = (target) => {
                 target.scrollIntoView({ block: 'center', inline: 'nearest' });
                 target.focus?.();
@@ -1789,13 +1923,14 @@ async def click_email_submit_safe(page: Page, email_input: Locator) -> bool:
             const hasEmailValue = () => String(input.value || '').includes('@');
             const isSocial = (el) => /google|apple|microsoft|github|sso|oauth|social|provider/.test(meta(el));
             const isPhoneSwitch = (el) => /phone|mobile|sms|tel|\u7535\u8bdd\u53f7\u7801|\u624b\u673a\u53f7|\u624b\u673a|\u96fb\u8a71\u756a\u53f7|\u643a\u5e2f/.test(meta(el));
-            const isEmailSwitch = (el) => /continue with email|email address|\u7535\u5b50\u90ae\u4ef6|\u90ae\u7bb1/.test(meta(el));
+            const isEmailSwitch = (el) => /continue with email|email address|\u7535\u5b50\u90ae\u4ef6|\u90ae\u7bb1|\u30e1\u30fc\u30eb/.test(meta(el));
             const isWanted = (el) => {
                 if (isSocial(el) || isPhoneSwitch(el) || isEmailSwitch(el)) return false;
                 const value = label(el).toLowerCase();
                 if (/^(continue|next|submit|log in|sign in|sign up|create)$/.test(value)) return true;
                 if (/^(\u7ee7\u7eed|\u4e0b\u4e00\u6b65|\u767b\u5f55|\u6ce8\u518c)$/.test(value)) return true;
-                return /\b(continue|next)\b/.test(value) || /\u7ee7\u7eed|\u4e0b\u4e00\u6b65/.test(value);
+                if (/^(\u7d9a\u884c|\u6b21\u3078|\u78ba\u8a8d|\u9001\u4fe1|\u30ed\u30b0\u30a4\u30f3|\u767b\u9332)$/.test(value)) return true;
+                return /\b(continue|next)\b/.test(value) || /\u7ee7\u7eed|\u4e0b\u4e00\u6b65|\u7d9a\u884c|\u6b21\u3078/.test(value);
             };
             const activate = (target) => {
                 target.scrollIntoView({ block: 'center', inline: 'nearest' });
@@ -1850,10 +1985,12 @@ async def click_continue(page: Page, profile: bool = False, anchor: Locator | No
     patterns = [
         re.compile(r"^(continue|next|submit|verify|log in|sign up|create|finish|done)$", re.I),
         re.compile(r"^(继续|下一步|验证|登录|注册|完成|创建)$"),
+        re.compile(_zh(r"^(\u7d9a\u884c|\u6b21\u3078|\u78ba\u8a8d|\u9001\u4fe1|\u30ed\u30b0\u30a4\u30f3|\u767b\u9332|\u4f5c\u6210|\u5b8c\u4e86)$")),
     ]
     if profile:
         patterns.insert(0, re.compile(r"continue|finish|done|create", re.I))
         patterns.insert(1, re.compile(r"完成|创建|继续"))
+        patterns.insert(2, re.compile(_zh(r"\u7d9a\u884c|\u4f5c\u6210|\u5b8c\u4e86|\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210")))
     if anchor:
         form_button = await find_submit_near_anchor(anchor)
         if form_button:

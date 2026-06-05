@@ -1,8 +1,14 @@
 import asyncio
+import json
 import struct
 
 import modules.browser as browser_module
-from modules.browser import Socks5AuthProxyBridge, parse_proxy, prepare_proxy_for_playwright
+from modules.browser import (
+    Socks5AuthProxyBridge,
+    get_or_create_account_fingerprint,
+    parse_proxy,
+    prepare_proxy_for_playwright,
+)
 
 
 def test_parse_proxy_normalizes_socks5h_for_playwright() -> None:
@@ -33,6 +39,63 @@ def test_parse_proxy_supports_user_pass_at_host_port_without_scheme() -> None:
         "username": "user",
         "password": "pass",
     }
+
+
+def test_account_fingerprint_is_persisted_and_reused(tmp_path, monkeypatch) -> None:
+    store_path = tmp_path / "account_fingerprints.json"
+    monkeypatch.setattr(browser_module, "_fingerprint_store_path", lambda: store_path)
+
+    first = get_or_create_account_fingerprint(
+        "User@Example.com",
+        "socks5h://japan.example:1080",
+        log_prefix="[test]",
+    )
+    second = get_or_create_account_fingerprint(
+        "user@example.com",
+        "socks5h://different.example:1080",
+        log_prefix="[test]",
+    )
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+
+    assert first["profile_id"] == second["profile_id"]
+    assert first["user_agent"] == second["user_agent"]
+    assert first["webgl_renderer"] == second["webgl_renderer"]
+    assert first["canvas_noise_seed"] == second["canvas_noise_seed"]
+    assert first["audio_noise_seed"] == second["audio_noise_seed"]
+    assert first["client_hints"] == second["client_hints"]
+    assert len(store) == 1
+    record = next(iter(store.values()))
+    assert record["account"] == "user@example.com"
+    assert record["fingerprint"]["profile_id"] == first["profile_id"]
+
+
+def test_account_fingerprint_refreshes_legacy_records(tmp_path, monkeypatch) -> None:
+    store_path = tmp_path / "account_fingerprints.json"
+    key = browser_module._account_fingerprint_key("legacy@example.com")
+    store_path.write_text(
+        json.dumps(
+            {
+                key: {
+                    "account": "legacy@example.com",
+                    "fingerprint": {
+                        "schema_version": 1,
+                        "profile_id": "legacy",
+                        "user_agent": "legacy",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(browser_module, "_fingerprint_store_path", lambda: store_path)
+
+    fingerprint = get_or_create_account_fingerprint("legacy@example.com", "socks5h://japan.example:1080")
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+
+    assert fingerprint["profile_id"] != "legacy"
+    assert fingerprint["schema_version"] == browser_module._FINGERPRINT_SCHEMA_VERSION
+    assert "webgl_renderer" in fingerprint
+    assert store[key]["fingerprint"]["profile_id"] == fingerprint["profile_id"]
 
 
 def test_prepare_proxy_bridges_authenticated_socks5() -> None:

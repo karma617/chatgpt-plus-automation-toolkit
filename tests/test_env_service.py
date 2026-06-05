@@ -105,6 +105,7 @@ def test_known_env_fields_include_api_keys() -> None:
     assert "YESCAPTCHA_API_KEY" in fields
     assert "HERO_SMS_API_KEY" in fields
     assert "PAYPAL_CARD_REDEEM_API_KEY" in fields
+    assert "PAYPAL_PAYMENT_MODE" in fields
     assert "PAYPAL_USE_PROXY" in fields
     assert "PAYPAL_REGISTER_USE_PROXY" in fields
     assert "PAYPAL_REGISTER_LOCAL_PROXY_URL" in fields
@@ -193,6 +194,7 @@ def test_known_env_fields_include_dropdown_choices_for_enum_values() -> None:
     assert _field_by_key("PAYPAL_CAPTCHA_MODE").choices == ("manual", "api")
     assert _field_by_key("CAPTCHA_API_PROVIDER").choices == ("capsolver", "twocaptcha", "yescaptcha")
     assert _field_by_key("PAYPAL_USE_PROXY").choices == ("true", "false")
+    assert _field_by_key("PAYPAL_PAYMENT_MODE").choices == (_u(r"\u957f\u94fe\u652f\u4ed8"), _u(r"\u77ed\u94fe\u652f\u4ed8"))
     assert _field_by_key("FLARESOLVERR_ENABLED").choices == ("true", "false")
     assert _field_by_key("FLARESOLVERR_AUTO_START").choices == ("true", "false")
     assert _field_by_key("FLARESOLVERR_DOCKER_ENABLED").choices == ("true", "false")

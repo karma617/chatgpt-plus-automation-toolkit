@@ -12,7 +12,7 @@ def test_run_page_blocks_jp_flow1_when_long_link_disabled(monkeypatch, tmp_path)
     page = control_panel_app.RunPage.__new__(control_panel_app.RunPage)
     page.process = None
     page.root_path = tmp_path
-    (tmp_path / ".env").write_text("PAYPAL_USE_LONG_LINK=false\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("PAYPAL_PAYMENT_MODE=short_link\n", encoding="utf-8")
     shown = {}
     monkeypatch.setattr(control_panel_app.messagebox, "showinfo", lambda title, message: shown.update(title=title, message=message))
     monkeypatch.setattr(page, "_runner_command", lambda action: (_ for _ in ()).throw(AssertionError("runner must not start")))
@@ -20,4 +20,5 @@ def test_run_page_blocks_jp_flow1_when_long_link_disabled(monkeypatch, tmp_path)
     page.start("paypal-flow1-jp")
 
     assert "title" in shown
-    assert "PAYPAL_USE_LONG_LINK=false" in shown["message"]
+    assert control_panel_app._u(r"\u77ed\u94fe\u652f\u4ed8") in shown["message"]
+    assert control_panel_app._u(r"\u6d41\u7a0b2 \u65e5\u672c\u4ee3\u7406(\u65e0\u5361)") in shown["message"]

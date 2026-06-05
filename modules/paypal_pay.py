@@ -41,11 +41,14 @@ LINK_POOL_FILE = PAYPAL_OUTPUT_ROOT / "长链接账号" / "account.txt"
 PENDING_AUTH_DIR = PAYPAL_OUTPUT_ROOT / "待授权账号"
 PENDING_AUTH_FILE = PENDING_AUTH_DIR / "account.txt"
 REGISTER_ONLY_SUMMARY_FILE = resolve_path("output/register_only/registered_sessions.txt")
-PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_BROWSER_FINGERPRINT_TURNSTILE_BACKOFF_2026-06-04_01"
+PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_SHORT_LINK_US_PAY_JP_PROXY_2026-06-05_01"
 PAYPAL_FLOW2_NONZERO_AMOUNT = "nonzero_checkout_amount"
 PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT = "stripe_paypal_redirect_timeout"
 PAYPAL_FLOW2_RECREATE_LINK = "generated_payment_link_invalid_recreate"
 PAYPAL_FLOW2_RECREATE_LINK_MAX = 3
+PAYPAL_FLOW2_JP_PROXY_COUNTRY_MISMATCH = "jp_short_link_proxy_country_mismatch"
+PAYPAL_PAYMENT_MODE_LONG_LINK = "long_link"
+PAYPAL_PAYMENT_MODE_SHORT_LINK = "short_link"
 PAYPAL_FLOW2_RECREATE_METHOD_ORDER = (
     CHECKOUT_METHOD_EXTERNAL_API,
     CHECKOUT_METHOD_LOCAL_SERVICE,
@@ -237,6 +240,45 @@ def _normalize_flow2_region_mode(mode: str | None) -> str:
 
 def _billing_country_code(region_mode: str) -> str:
     return "JP" if _normalize_flow2_region_mode(region_mode) == "jp" else "US"
+
+
+def _payment_form_country_code(region_mode: str, *, use_long_link: bool) -> str:
+    # Short-link JP mode enters the official offer under a JP IP, then switches
+    # the Stripe hosted checkout billing country to US before entering PayPal.
+    if _normalize_flow2_region_mode(region_mode) == "jp" and not use_long_link:
+        return "US"
+    return _billing_country_code(region_mode)
+
+
+def _paypal_form_country_code(region_mode: str, *, use_long_link: bool) -> str:
+    # The browser/proxy remains JP in short-link JP mode, but hosted checkout
+    # and PayPal billing fields are filled as US.
+    return _payment_form_country_code(region_mode, use_long_link=use_long_link)
+
+
+def _probe_flow2_proxy_country(proxy: str | None, required_country_code: str, timeout_sec: int = 12) -> tuple[bool, str]:
+    from .paypal_register import _probe_proxy_country
+
+    if not str(proxy or "").strip():
+        return False, "missing proxy"
+    return _probe_proxy_country(proxy, required_country_code, timeout_sec=timeout_sec)  # type: ignore[arg-type]
+
+
+def _ensure_short_link_jp_proxy(proxy: str | None, *, env: dict[str, str], prefix: str) -> None:
+    timeout_raw = str(env.get("PAYPAL_SHORT_LINK_JP_PROXY_CHECK_TIMEOUT") or "").strip()
+    try:
+        timeout_sec = max(3, int(timeout_raw or "12"))
+    except ValueError:
+        timeout_sec = 12
+    ok, reason = _probe_flow2_proxy_country(proxy, "JP", timeout_sec=timeout_sec)
+    if ok:
+        log(
+            f"{prefix} "
+            + _zh(r"\u77ed\u94fe\u65e5\u533a\u5b98\u65b9\u8ba2\u9605\u5165\u53e3\u4ee3\u7406\u5df2\u786e\u8ba4\u4e3a\u65e5\u672c\u51fa\u53e3: ")
+            + str(reason)
+        )
+        return
+    raise RuntimeError(f"{PAYPAL_FLOW2_JP_PROXY_COUNTRY_MISMATCH}: {reason}")
 
 
 def _with_billing_profile(base_card: CardInfo, billing_card: CardInfo) -> CardInfo:
@@ -538,8 +580,50 @@ def _env_bool(env: dict[str, str], key: str, default: bool = False) -> bool:
     return default
 
 
+def paypal_payment_mode(env: dict[str, str]) -> str:
+    raw = str(env.get("PAYPAL_PAYMENT_MODE") or "").strip()
+    if not raw:
+        return PAYPAL_PAYMENT_MODE_LONG_LINK if _env_bool(env, "PAYPAL_USE_LONG_LINK", True) else PAYPAL_PAYMENT_MODE_SHORT_LINK
+    normalized = raw.lower().replace("-", "_")
+    compact = re.sub(r"[\s_]+", "", normalized)
+    if compact in {
+        "long",
+        "link",
+        "longlink",
+        "longurl",
+        "longpay",
+        "\u957f\u94fe",
+        "\u957f\u94fe\u63a5",
+        "\u957f\u94fe\u652f\u4ed8",
+        "\u957f\u94fe\u63a5\u652f\u4ed8",
+        "\u9577\u93c8",
+        "\u9577\u93c8\u652f\u4ed8",
+    }:
+        return PAYPAL_PAYMENT_MODE_LONG_LINK
+    if compact in {
+        "short",
+        "shortlink",
+        "shorturl",
+        "direct",
+        "browser",
+        "offer",
+        "shortpay",
+        "\u77ed\u94fe",
+        "\u77ed\u94fe\u63a5",
+        "\u77ed\u94fe\u652f\u4ed8",
+        "\u77ed\u94fe\u63a5\u652f\u4ed8",
+        "\u76f4\u63a5\u652f\u4ed8",
+    }:
+        return PAYPAL_PAYMENT_MODE_SHORT_LINK
+    if normalized in {PAYPAL_PAYMENT_MODE_LONG_LINK, "long_link_payment"}:
+        return PAYPAL_PAYMENT_MODE_LONG_LINK
+    if normalized in {PAYPAL_PAYMENT_MODE_SHORT_LINK, "short_link_payment"}:
+        return PAYPAL_PAYMENT_MODE_SHORT_LINK
+    return PAYPAL_PAYMENT_MODE_LONG_LINK if _env_bool(env, "PAYPAL_USE_LONG_LINK", True) else PAYPAL_PAYMENT_MODE_SHORT_LINK
+
+
 def paypal_use_long_link(env: dict[str, str]) -> bool:
-    return _env_bool(env, "PAYPAL_USE_LONG_LINK", True)
+    return paypal_payment_mode(env) == PAYPAL_PAYMENT_MODE_LONG_LINK
 
 
 def paypal_click_watcher_enabled(env: dict[str, str]) -> bool:
@@ -798,6 +882,49 @@ async def _checkout_surface_ready(page) -> bool:
     return False
 
 
+async def _detect_link_payment_invalid_long_link(page) -> dict[str, Any]:
+    try:
+        result = await page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.getAttribute?.('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                const patterns = [
+                    /pay\\s*with\\s*link/i,
+                    /pay\\s*by\\s*link/i,
+                    /\\u7528\\s*link\\s*\\u652f\\u4ed8/i,
+                    /link\\s*\\u652f\\u4ed8/i,
+                    /link\\s*\\u652f\\u6255/i,
+                    /link\\s*\\u3067\\s*\\u652f\\u6255/i
+                ];
+                const actionNodes = Array.from(document.querySelectorAll('button, a, label, [role="button"], [role="radio"], [data-testid], [aria-label]'))
+                    .filter(visible);
+                for (const node of actionNodes) {
+                    const text = textOf(node);
+                    if (!text || text.length > 180) continue;
+                    if (patterns.some((pattern) => pattern.test(text))) {
+                        return { invalid: true, source: 'action', text: text.slice(0, 180) };
+                    }
+                }
+                const body = textOf(document.body).slice(0, 6000);
+                const hasDirectLinkPay = patterns.some((pattern) => pattern.test(body));
+                const hasCheckoutContext = /payment|pay\\s|paypal|stripe|card|\\u652f\\u4ed8|\\u652f\\u6255|\\u30ab\\u30fc\\u30c9/i.test(body);
+                if (hasDirectLinkPay && hasCheckoutContext) {
+                    const hit = body.match(/.{0,80}(?:pay\\s*with\\s*link|pay\\s*by\\s*link|\\u7528\\s*link\\s*\\u652f\\u4ed8|link\\s*\\u652f\\u4ed8|link\\s*\\u652f\\u6255|link\\s*\\u3067\\s*\\u652f\\u6255).{0,80}/i);
+                    return { invalid: true, source: 'body', text: (hit ? hit[0] : body).slice(0, 180) };
+                }
+                return { invalid: false, source: '', text: '' };
+            }"""
+        )
+        return result if isinstance(result, dict) else {"invalid": False, "source": "", "text": ""}
+    except Exception as exc:
+        return {"invalid": False, "source": "probe_error", "text": str(exc)[:160]}
+
+
 async def _dismiss_chatgpt_interstitials(page, prefix: str) -> None:
     skip_cn = _zh(r"\u8df3\u8fc7")
     later_cn_1 = _zh(r"\u4ee5\u540e\u518d\u8bf4")
@@ -828,18 +955,113 @@ async def _dismiss_chatgpt_interstitials(page, prefix: str) -> None:
             return
 
 
+async def _click_zero_trial_plus_option(page, prefix: str) -> bool:
+    free_trial_cn = _zh(r"\u514d\u8d39\u8bd5\u7528")
+    free_trial_tw = _zh(r"\u514d\u8cbb\u8a66\u7528")
+    free_trial_jp = _zh(r"\u7121\u6599\u30c8\u30e9\u30a4\u30a2\u30eb")
+    trial_jp = _zh(r"\u304a\u8a66\u3057")
+    zero_yen = _zh(r"0\u5186")
+    zero_cn = _zh(r"0\u5143")
+    selectors = (
+        f'button:has-text("Plus"):has-text("{free_trial_cn}")',
+        f'a:has-text("Plus"):has-text("{free_trial_cn}")',
+        f'[role="button"]:has-text("Plus"):has-text("{free_trial_cn}")',
+        f'button:has-text("Plus"):has-text("{free_trial_tw}")',
+        f'a:has-text("Plus"):has-text("{free_trial_tw}")',
+        f'button:has-text("Plus"):has-text("{free_trial_jp}")',
+        f'a:has-text("Plus"):has-text("{free_trial_jp}")',
+        f'button:has-text("Plus"):has-text("{trial_jp}")',
+        f'a:has-text("Plus"):has-text("{trial_jp}")',
+        f'button:has-text("Plus"):has-text("{zero_yen}")',
+        f'a:has-text("Plus"):has-text("{zero_yen}")',
+        f'button:has-text("Plus"):has-text("{zero_cn}")',
+        f'a:has-text("Plus"):has-text("{zero_cn}")',
+        'button:has-text("Plus"):has-text("Free trial")',
+        'a:has-text("Plus"):has-text("Free trial")',
+        '[role="button"]:has-text("Plus"):has-text("Free trial")',
+        'button:has-text("Try Plus")',
+        'a:has-text("Try Plus")',
+        'button:has-text("Get Plus")',
+        'a:has-text("Get Plus")',
+    )
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.is_visible(timeout=600) and await locator.is_enabled(timeout=600):
+                await locator.scroll_into_view_if_needed(timeout=1000)
+                await locator.click(timeout=2500)
+                log(f"{prefix} clicked zero/free Plus trial option: {selector}")
+                await page.wait_for_timeout(1800)
+                return True
+        except Exception:
+            continue
+    try:
+        clicked = await page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], [data-testid]')).filter(visible);
+                const bad = /team|business|enterprise|workspace|education|\\u56e2\\u961f|\\u5718\\u968a|\\u4f01\\u4e1a|\\u4f01\\u696d|\\u30c1\\u30fc\\u30e0|\\u30d3\\u30b8\\u30cd\\u30b9|\\u30a8\\u30f3\\u30bf\\u30fc\\u30d7\\u30e9\\u30a4\\u30ba/i;
+                const plus = /plus/i;
+                const freeOrZero = /free\\s*trial|trial|try\\s*plus|get\\s*plus|\\$\\s*0|us\\$\\s*0|\\u00a5\\s*0|\\uffe5\\s*0|0\\s*\\u5143|0\\s*\\u5186|\\u514d\\u8d39|\\u514d\\u8cbb|\\u7121\\u6599|\\u304a\\u8a66\\u3057|\\u30c8\\u30e9\\u30a4\\u30a2\\u30eb/i;
+                let target = nodes.find((node) => {
+                    const text = textOf(node);
+                    return text && !bad.test(text) && plus.test(text) && freeOrZero.test(text);
+                });
+                if (!target) {
+                    target = nodes.find((node) => {
+                        const text = textOf(node);
+                        return text && !bad.test(text) && /try\\s*plus|get\\s*plus/i.test(text);
+                    });
+                }
+                if (!target) return "";
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+                target.click();
+                return textOf(target).slice(0, 160);
+            }"""
+        )
+        if clicked:
+            log(f"{prefix} clicked zero/free Plus trial option by JS: {clicked}")
+            await page.wait_for_timeout(1800)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def _click_visible_offer_entry(page, prefix: str) -> bool:
     claim_offer = _zh(r"\u9886\u53d6\u4f18\u60e0")
     free_trial = _zh(r"\u514d\u8d39\u8bd5\u7528")
+    claim_offer_jp = _zh(r"\u30aa\u30d5\u30a1\u30fc\u3092\u53d7\u3051\u53d6\u308b")
+    free_trial_jp = _zh(r"\u7121\u6599\u30c8\u30e9\u30a4\u30a2\u30eb")
+    try_plus_jp = _zh(r"Plus\u3092\u8a66\u3059")
+    get_plus_jp = _zh(r"Plus\u3092\u5165\u624b")
     upgrade_cn = _zh(r"\u5347\u7ea7")
+    upgrade_jp = _zh(r"\u30a2\u30c3\u30d7\u30b0\u30ec\u30fc\u30c9")
     selectors = (
         f'button:has-text("{claim_offer}")',
         f'a:has-text("{claim_offer}")',
         f'[role="button"]:has-text("{claim_offer}")',
+        f'button:has-text("{claim_offer_jp}")',
+        f'a:has-text("{claim_offer_jp}")',
+        f'[role="button"]:has-text("{claim_offer_jp}")',
         f'button:has-text("{free_trial}")',
         f'a:has-text("{free_trial}")',
+        f'button:has-text("{free_trial_jp}")',
+        f'a:has-text("{free_trial_jp}")',
         f'button:has-text("{upgrade_cn}")',
         f'a:has-text("{upgrade_cn}")',
+        f'button:has-text("{upgrade_jp}")',
+        f'a:has-text("{upgrade_jp}")',
+        f'button:has-text("{try_plus_jp}")',
+        f'a:has-text("{try_plus_jp}")',
+        f'button:has-text("{get_plus_jp}")',
+        f'a:has-text("{get_plus_jp}")',
         'button:has-text("Upgrade")',
         'a:has-text("Upgrade")',
         'button:has-text("Try Plus")',
@@ -878,6 +1100,11 @@ async def _click_visible_offer_entry(page, prefix: str) -> bool:
                     /\u9886\u53d6\u4f18\u60e0/,
                     /\u514d\u8d39\u8bd5\u7528/,
                     /\u5347\u7ea7/,
+                    /\u30aa\u30d5\u30a1\u30fc\u3092\u53d7\u3051\u53d6\u308b/,
+                    /\u7121\u6599\u30c8\u30e9\u30a4\u30a2\u30eb/,
+                    /\u30a2\u30c3\u30d7\u30b0\u30ec\u30fc\u30c9/,
+                    /plus\u3092\u8a66\u3059/i,
+                    /plus\u3092\u5165\u624b/i,
                     /upgrade/i,
                     /try\\s*plus/i,
                     /get\\s*plus/i,
@@ -951,10 +1178,17 @@ async def _prepare_checkout_from_chatgpt_offer(
         if await _checkout_surface_ready(page):
             return
         await _dismiss_chatgpt_interstitials(page, prefix)
+        clicked_trial = await _click_zero_trial_plus_option(page, prefix)
+        if await _checkout_surface_ready(page):
+            return
         clicked = await _click_visible_offer_entry(page, prefix)
         if await _checkout_surface_ready(page):
             return
-        if not clicked and attempt in {8, 16, 24}:
+        if clicked:
+            await _click_zero_trial_plus_option(page, prefix)
+            if await _checkout_surface_ready(page):
+                return
+        if not clicked and not clicked_trial and attempt in {8, 16, 24}:
             try:
                 await page.goto("https://chatgpt.com/#pricing", wait_until="domcontentloaded", timeout=30_000)
                 await page.wait_for_timeout(1800)
@@ -1035,10 +1269,15 @@ async def regenerate_flow2_payment_link(
     resolved_mail_source = mail_source or _mail_source_for_account(account, "hotmail")
     region = "jp" if _normalize_flow2_region_mode(flow2_region_mode) == "jp" else "us"
     method_sink: dict[str, str] = {}
+    failed_method = str(item.get("link_method") or "").strip()
+    preferred_methods = tuple(method for method in PAYPAL_FLOW2_RECREATE_METHOD_ORDER if method != failed_method)
+    if not preferred_methods:
+        preferred_methods = PAYPAL_FLOW2_RECREATE_METHOD_ORDER
     log(
         f"[paypal-pay-{worker_id:02d}][{account.email}] "
         + _zh(r"\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe: ")
-        + " -> ".join(PAYPAL_FLOW2_RECREATE_METHOD_ORDER)
+        + " -> ".join(preferred_methods)
+        + (f" (skip={failed_method})" if failed_method else "")
     )
     link = await login_existing_account_for_checkout(
         account,
@@ -1049,8 +1288,8 @@ async def regenerate_flow2_payment_link(
         create_payment_link=True,
         session_source="paypal_flow2_recreate_link",
         checkout_region=region,
-        checkout_skip_methods=set(),
-        checkout_preferred_methods=PAYPAL_FLOW2_RECREATE_METHOD_ORDER,
+        checkout_skip_methods={failed_method} if failed_method else set(),
+        checkout_preferred_methods=preferred_methods,
         checkout_method_sink=method_sink,
     )
     if not link:
@@ -1627,6 +1866,11 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
 
     desired_country = "JP" if str(country_code or "").upper() == "JP" else "US"
     desired_labels = ["Japan", "日本"] if desired_country == "JP" else ["United States", "美国"]
+    manual_address_jp = _zh(r"\u4f4f\u6240\u3092\u624b\u52d5\u3067\u5165\u529b")
+    subscribe_jp = _zh(r"\u8cfc\u8aad")
+    subscribe_jp_alt = _zh(r"\u30b5\u30d6\u30b9\u30af\u30e9\u30a4\u30d6")
+    apply_jp = _zh(r"\u7533\u3057\u8fbc\u3080")
+    continue_jp = _zh(r"\u7d9a\u884c")
 
     # 国家选择 - 先等待下拉框可交互
     country_select = page.locator('#billingCountry, select[name*="country" i], select[autocomplete="country"]').first
@@ -1661,7 +1905,11 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
 
     # 手动输入地址
     try:
-        manual = page.locator('text=手动输入地址, text=Enter address manually, a:has-text("手动"), a:has-text("manually")').first
+        manual = page.locator(
+            f'text=手动输入地址, text=Enter address manually, text="{manual_address_jp}", '
+            f'a:has-text("手动"), a:has-text("manually"), a:has-text("{manual_address_jp}"), '
+            f'button:has-text("{manual_address_jp}")'
+        ).first
         if await manual.is_visible(timeout=1200):
             await manual.click(timeout=1500)
             await page.wait_for_timeout(600)
@@ -2389,12 +2637,17 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
     subscribe_clicked = False
     subscribe_attempted = False
     subscribe_selectors = [
-        'button:has-text("Subscribe")',
-        'button:has-text("订阅")',
         'button.SubmitButton',
         'button.SubmitButton--complete',
         '[data-testid="hosted-payment-submit-button"]',
         'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Subscribe")',
+        'button:has-text("订阅")',
+        f'button:has-text("{subscribe_jp}")',
+        f'button:has-text("{subscribe_jp_alt}")',
+        f'button:has-text("{apply_jp}")',
+        f'button:has-text("{continue_jp}")',
     ]
 
     async def _wait_stripe_subscribe_processing(timeout_ms: int = 4500) -> tuple[bool, str]:
@@ -2406,7 +2659,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
             try:
                 state = await page.evaluate(
                     r"""() => {
-                        const processingText = /processing|loading|please\s*wait|\u6b63\u5728\u5904\u7406|\u5904\u7406\u4e2d|\u8bf7\u7a0d\u5019/i;
+                        const processingText = /processing|loading|please\s*wait|\u6b63\u5728\u5904\u7406|\u5904\u7406\u4e2d|\u51e6\u7406\u4e2d|\u8bf7\u7a0d\u5019|\u304a\u5f85\u3061\u304f\u3060\u3055\u3044|\u8aad\u307f\u8fbc\u307f\u4e2d/i;
                         const isVisible = (el) => {
                             if (!el) return false;
                             const rect = el.getBoundingClientRect();
@@ -2429,7 +2682,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
                             if (busy) {
                                 return { ok: true, reason: 'aria_busy' };
                             }
-                            if (disabled && /subscribe|\u8ba2\u9605|submit/i.test(text + ' ' + (el.type || ''))) {
+                            if (disabled && /subscribe|\u8ba2\u9605|\u8cfc\u8aad|\u30b5\u30d6\u30b9\u30af\u30e9\u30a4\u30d6|\u7533\u3057\u8fbc\u3080|submit/i.test(text + ' ' + (el.type || ''))) {
                                 return { ok: true, reason: 'disabled_after_click' };
                             }
                         }
@@ -2464,7 +2717,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
                 for (const btn of buttons.reverse()) {
                     const text = (btn.textContent || '').trim();
                     const rect = btn.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0 && /Subscribe|\u8ba2\u9605|submit/i.test(text + btn.type)) {
+                    if (rect.width > 0 && rect.height > 0 && /Subscribe|\u8ba2\u9605|\u8cfc\u8aad|\u30b5\u30d6\u30b9\u30af\u30e9\u30a4\u30d6|\u7533\u3057\u8fbc\u3080|\u7d9a\u884c|submit/i.test(text + btn.type)) {
                         btn.click();
                         return true;
                     }
@@ -2522,7 +2775,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
             for (const btn of buttons.reverse()) {
                 const text = (btn.textContent || '').trim();
                 const rect = btn.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0 && /Subscribe|\u8ba2\u9605|submit/i.test(text + btn.type)) {
+                if (rect.width > 0 && rect.height > 0 && /Subscribe|\u8ba2\u9605|\u8cfc\u8aad|\u30b5\u30d6\u30b9\u30af\u30e9\u30a4\u30d6|\u7533\u3057\u8fbc\u3080|\u7d9a\u884c|submit/i.test(text + btn.type)) {
                     btn.click();
                     return true;
                 }
@@ -2579,12 +2832,29 @@ async def fill_paypal(
 ) -> None:
     """PayPal 页面：注册 + 绑卡。"""
     await page.wait_for_timeout(5000)
+    mail_jp = _zh(r"\u30e1\u30fc\u30eb")
+    continue_jp = _zh(r"\u7d9a\u884c")
+    next_jp = _zh(r"\u6b21\u3078")
+    confirm_jp = _zh(r"\u78ba\u8a8d")
+    pay_continue_jp = _zh(r"\u652f\u6255\u3044\u3092\u7d9a\u884c")
+    agree_create_jp = _zh(r"\u540c\u610f\u3057\u3066\u4f5c\u6210")
+    create_account_jp = _zh(r"\u30a2\u30ab\u30a6\u30f3\u30c8\u3092\u4f5c\u6210")
+    agree_continue_jp = _zh(r"\u540c\u610f\u3057\u3066\u7d9a\u884c")
+    phone_jp = _zh(r"\u96fb\u8a71")
+    address_jp = _zh(r"\u4f4f\u6240")
+    city_jp = _zh(r"\u5e02\u533a\u753a\u6751")
+    postal_jp = _zh(r"\u90f5\u4fbf\u756a\u53f7")
 
     # 第一步：填邮箱（确保所有可见的 email 字段都被填写）
     log("[PayPal] 填写邮箱...")
     email_filled = False
     # PayPal 中文页面的 placeholder 是 "电子邮箱地址或手机号码"
-    email_selectors = 'input[name="email"], input[type="email"], input[placeholder*="邮箱" i], input[placeholder*="email" i], input[placeholder*="手机号" i]'
+    email_selectors = (
+        'input[name="email"], input[type="email"], input[autocomplete="email"], input[autocomplete="username"], '
+        'input[name*="login" i], input[id*="email" i], input[id*="login" i], '
+        'input[placeholder*="邮箱" i], input[placeholder*="email" i], input[placeholder*="手机号" i], '
+        f'input[placeholder*="{mail_jp}"], input[aria-label*="email" i], input[aria-label*="邮箱" i], input[aria-label*="{mail_jp}"]'
+    )
     email_fields = page.locator(email_selectors)
     count = await email_fields.count()
     for i in range(count):
@@ -2600,21 +2870,26 @@ async def fill_paypal(
     if not email_filled:
         log("[PayPal] ⚠️ 未找到可见的邮箱输入框，尝试备用选择器")
         try:
-            await page.locator('input[aria-label*="email" i], input[aria-label*="邮箱" i]').first.fill(email, timeout=5000)
+            await page.locator(f'input[aria-label*="email" i], input[aria-label*="邮箱" i], input[aria-label*="{mail_jp}"]').first.fill(email, timeout=5000)
         except Exception:
             pass
 
     # 点击"继续付款"优先（PayPal 注册页面的实际按钮文字），然后是其他变体
     clicked_next = False
     next_selectors = [
+        'button[id="btnNext"]',
+        'button[type="submit"]',
+        'input[type="submit"]',
+        '[data-atomic-wait-task]',
         'button:has-text("继续付款")',
         'button:has-text("Continue")',
         'button:has-text("继续")',
         'button:has-text("Next")',
         'button:has-text("下一页")',
-        'button:has-text("次へ")',
-        'button[id="btnNext"]',
-        'button[type="submit"]',
+        f'button:has-text("{next_jp}")',
+        f'button:has-text("{continue_jp}")',
+        f'button:has-text("{pay_continue_jp}")',
+        f'button:has-text("{confirm_jp}")',
     ]
     for sel in next_selectors:
         try:
@@ -2639,7 +2914,10 @@ async def fill_paypal(
             has_form = await page.evaluate("""() => {
                 const selects = document.querySelectorAll('select');
                 const hasCountrySelect = Array.from(selects).some(s => s.options.length > 50 || /country/i.test(s.name + s.id));
-                const hasPhoneInput = !!document.querySelector('input[name*="phone" i], input[id*="phone" i], input[placeholder*="Phone" i], input[placeholder*="手机" i]');
+                const hasPhoneInput = !!document.querySelector(
+                    'input[name*="phone" i], input[name*="telephone" i], input[id*="phone" i], input[id*="tel" i], ' +
+                    'input[type="tel"], input[autocomplete="tel"], input[placeholder*="Phone" i], input[placeholder*="手机" i], input[placeholder*="\\u96fb\\u8a71"]'
+                );
                 const hasCardInput = !!document.querySelector('input[name*="card" i], input[id*="card" i], input[placeholder*="Card" i], input[placeholder*="卡号" i]');
                 return hasCountrySelect || hasPhoneInput || hasCardInput;
             }""")
@@ -2725,7 +3003,10 @@ async def fill_paypal(
 
     # 等待表单字段重新出现（国家切换后地址字段会重新渲染）
     try:
-        await page.locator('input[name*="phone" i], input[id*="phone" i], input[placeholder*="Phone" i]').first.wait_for(state="visible", timeout=10000)
+        await page.locator(
+            'input[name*="phone" i], input[name*="telephone" i], input[id*="phone" i], input[id*="tel" i], '
+            f'input[type="tel"], input[autocomplete="tel"], input[placeholder*="Phone" i], input[placeholder*="{phone_jp}"]'
+        ).first.wait_for(state="visible", timeout=10000)
     except Exception:
         await page.wait_for_timeout(3000)
 
@@ -2758,7 +3039,7 @@ async def fill_paypal(
 
     # 再次确认邮箱（国家切换后页面可能重置了邮箱字段）
     try:
-        email_fields_after = page.locator('input[name="email"], input[type="email"]')
+        email_fields_after = page.locator(email_selectors)
         count_after = await email_fields_after.count()
         for i in range(count_after):
             field = email_fields_after.nth(i)
@@ -2774,7 +3055,10 @@ async def fill_paypal(
     # 手机号
     phone_local = phone.number.lstrip("+1") if phone.number.startswith("+1") else phone.number.lstrip("+")
     try:
-        phone_input = page.locator('input[name*="phone" i], input[id*="phone" i], input[placeholder*="Phone" i]').first
+        phone_input = page.locator(
+            'input[name*="phone" i], input[name*="telephone" i], input[id*="phone" i], input[id*="tel" i], '
+            f'input[type="tel"], input[autocomplete="tel"], input[placeholder*="Phone" i], input[placeholder*="{phone_jp}"]'
+        ).first
         await phone_input.fill("", timeout=2000)
         await phone_input.fill(phone_local, timeout=5000)
     except Exception:
@@ -2847,8 +3131,10 @@ async def fill_paypal(
         'input[placeholder*="Street" i]',
         'input[placeholder*="地址" i]',
         'input[placeholder*="Address" i]',
+        f'input[placeholder*="{address_jp}" i]',
         'input[aria-label*="Street" i]',
         'input[aria-label*="address" i]:not([aria-label*="email" i])',
+        f'input[aria-label*="{address_jp}" i]',
         'input[id*="street" i]',
         'input[id*="address" i]:not([id*="email" i])',
     ]
@@ -2876,7 +3162,7 @@ async def fill_paypal(
             pass
         if not street_filled:
             try:
-                loc = page.get_by_label("地址", exact=False).first
+                loc = page.get_by_label(re.compile(r"地址|\u4f4f\u6240|address|street", re.I)).first
                 if await loc.is_visible(timeout=2000):
                     await loc.fill(card.street, timeout=5000)
                     street_filled = True
@@ -2913,7 +3199,11 @@ async def fill_paypal(
 
     # City
     try:
-        loc = page.locator('input[name="city"], input[name*="city" i], input[autocomplete="address-level2"], input[placeholder*="City" i], input[placeholder*="城市" i]').first
+        loc = page.locator(
+            'input[name="city"], input[name*="city" i], input[name*="locality" i], input[autocomplete="address-level2"], '
+            f'input[placeholder*="City" i], input[placeholder*="城市" i], input[placeholder*="{city_jp}" i], '
+            f'input[aria-label*="City" i], input[aria-label*="{city_jp}" i]'
+        ).first
         if await loc.is_visible(timeout=3000):
             await loc.fill("", timeout=2000)
             await loc.fill(card.city, timeout=5000)
@@ -2929,7 +3219,11 @@ async def fill_paypal(
 
     # ZIP code
     try:
-        loc = page.locator('input[name*="zip" i], input[name*="postal" i], input[autocomplete="postal-code"], input[placeholder*="ZIP" i], input[placeholder*="邮编" i], input[placeholder*="Postal" i]').first
+        loc = page.locator(
+            'input[name*="zip" i], input[name*="postal" i], input[autocomplete="postal-code"], '
+            'input[placeholder*="ZIP" i], input[placeholder*="邮编" i], input[placeholder*="Postal" i], '
+            f'input[placeholder*="{postal_jp}" i], input[aria-label*="{postal_jp}" i]'
+        ).first
         if await loc.is_visible(timeout=2000):
             await loc.fill("", timeout=2000)
             await loc.fill(card.zip_code, timeout=5000)
@@ -3289,7 +3583,11 @@ async def fill_paypal(
         max_regen = 1
     working_card = card
     for regen_idx in range(max_regen + 1):
-        create_btn = page.locator('button:has-text("Agree"), button:has-text("Create Account"), button[type="submit"]').first
+        create_btn = page.locator(
+            'button[type="submit"], input[type="submit"], button:has-text("Agree"), button:has-text("Create Account"), '
+            f'button:has-text("Continue"), button:has-text("{agree_create_jp}"), button:has-text("{create_account_jp}"), '
+            f'button:has-text("{agree_continue_jp}"), button:has-text("{continue_jp}")'
+        ).first
         try:
             await create_btn.click(timeout=10000)
         except Exception as exc:
@@ -4156,7 +4454,15 @@ async def fill_sms_code(
         await _wait_captcha_cleared(page, timeout_seconds=30)
 
     try:
-        btn = page.locator('button:has-text("Confirm"), button:has-text("Submit"), button:has-text("Verify"), button[type="submit"]').first
+        confirm_jp = _zh(r"\u78ba\u8a8d")
+        submit_jp = _zh(r"\u9001\u4fe1")
+        continue_jp = _zh(r"\u7d9a\u884c")
+        next_jp = _zh(r"\u6b21\u3078")
+        btn = page.locator(
+            'button[type="submit"], input[type="submit"], '
+            'button:has-text("Confirm"), button:has-text("Submit"), button:has-text("Verify"), button:has-text("Continue"), '
+            f'button:has-text("{confirm_jp}"), button:has-text("{submit_jp}"), button:has-text("{continue_jp}"), button:has-text("{next_jp}")'
+        ).first
         if await btn.is_visible(timeout=800):
             try:
                 await btn.click(timeout=2500, no_wait_after=True)
@@ -4197,8 +4503,8 @@ async def fill_sms_code(
 
 
 async def _click_paypal_otp_submit_by_dom(page) -> bool:
-    script = """() => {
-        const labels = /confirm|submit|verify|continue|确认|提交|验证|继续/i;
+    script = r"""() => {
+        const labels = /confirm|submit|verify|continue|确认|提交|验证|继续|\u78ba\u8a8d|\u9001\u4fe1|\u7d9a\u884c|\u6b21\u3078/i;
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
@@ -4276,10 +4582,13 @@ async def _click_paypal_agree_and_continue_if_present(
     visible_timeout_ms: int = 1200,
 ) -> bool:
     """若出现 PayPal review 页的 Agree and Continue，则自动点击。"""
+    agree_continue_jp = _zh(r"\u540c\u610f\u3057\u3066\u7d9a\u884c")
+    agree_continue_jp_alt = _zh(r"\u540c\u610f\u3057\u3066\u7d9a\u3051\u308b")
+    continue_jp = _zh(r"\u7d9a\u884c")
     selectors = [
-        'button:has-text("同意して続行")',
-        'button:has-text("同意して続ける")',
-        'button:has-text("続行")',
+        f'button:has-text("{agree_continue_jp}")',
+        f'button:has-text("{agree_continue_jp_alt}")',
+        f'button:has-text("{continue_jp}")',
         'button:has-text("Agree and Continue")',
         'button:has-text("Agree & Continue")',
         'button:has-text("同意并继续")',
@@ -4313,7 +4622,7 @@ async def _click_paypal_agree_and_continue_if_present(
     # JS 文本兜底：处理包裹在 span/div 的日语大蓝按钮
     try:
         js_clicked = await page.evaluate(
-            """() => {
+            r"""() => {
                 const isVisible = (el) => {
                     if (!el) return false;
                     const r = el.getBoundingClientRect();
@@ -4325,7 +4634,7 @@ async def _click_paypal_agree_and_continue_if_present(
                 const textOf = (el) => String(el?.innerText || el?.textContent || '').trim();
                 const targets = Array.from(document.querySelectorAll('button, a, div[role="button"], span'))
                     .filter(isVisible);
-                const hit = targets.find(el => /同意して続行|同意して続ける|Agree\\s*&?\\s*Continue/i.test(textOf(el)));
+                const hit = targets.find(el => /\u540c\u610f\u3057\u3066\u7d9a\u884c|\u540c\u610f\u3057\u3066\u7d9a\u3051\u308b|Agree\s*&?\s*Continue/i.test(textOf(el)));
                 if (!hit) return false;
                 const btn = hit.closest('button, a, div[role="button"]') || hit;
                 btn.scrollIntoView({block: 'center'});
@@ -4362,7 +4671,6 @@ async def pay_one(
     prefix = f"[paypal-pay-{worker_id:02d}][{email}]"
     paypal_password = generate_paypal_password(email)
     region_mode = _normalize_flow2_region_mode(flow2_region_mode)
-    billing_country = _billing_country_code(region_mode)
 
     browser_cfg = cfg.get("browser", {})
     profile_dir = resolve_path("profiles") / f"paypal_pay_{safe_filename(email)}"
@@ -4377,7 +4685,9 @@ async def pay_one(
         timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
         proxy=proxy,
         isolated=True,
-        fingerprint_seed=f"{email}|flow2|{proxy or ''}|{proxy_attempt}|{time.time_ns()}",
+        fingerprint_seed=f"{email}|flow2",
+        account_id=email,
+        log_prefix=prefix,
     )
 
     phone: PhoneInfo | None = None
@@ -4385,14 +4695,30 @@ async def pay_one(
         flow_env = load_env(".env")
         use_long_link = paypal_use_long_link(flow_env)
         watcher_enabled = paypal_click_watcher_enabled(flow_env)
+        stripe_country = _payment_form_country_code(region_mode, use_long_link=use_long_link)
+        paypal_country = _paypal_form_country_code(region_mode, use_long_link=use_long_link)
         working_card = card
         if region_mode == "jp":
-            jp_billing = _generate_local_random_card(worker_id, email, flow_env, region_mode="jp")
-            working_card = _with_billing_profile(card, jp_billing)
-            log(
-                f"{prefix} 日本代理模式: 使用日本账单地址 "
-                f"{working_card.city}, {working_card.state}, {working_card.zip_code}"
-            )
+            if use_long_link:
+                jp_billing = _generate_local_random_card(worker_id, email, flow_env, region_mode="jp")
+                working_card = _with_billing_profile(card, jp_billing)
+                log(
+                    f"{prefix} "
+                    + _zh(r"\u65e5\u672c\u4ee3\u7406\u957f\u94fe\u6a21\u5f0f: \u4f7f\u7528\u65e5\u672c\u8d26\u5355\u5730\u5740 ")
+                    + f"{working_card.city}, {working_card.state}, {working_card.zip_code}"
+                )
+            else:
+                _ensure_short_link_jp_proxy(proxy, env=flow_env, prefix=prefix)
+                us_billing = _generate_local_random_card(worker_id, email, flow_env, region_mode="default")
+                working_card = _with_billing_profile(card, us_billing)
+                log(
+                    f"{prefix} "
+                    + _zh(
+                        r"\u77ed\u94fe\u5b98\u65b9\u8ba2\u9605\u6a21\u5f0f: \u4f7f\u7528\u65e5\u672c IP \u83b7\u53d6 0 \u5143\u8bd5\u7528\uff0c"
+                        r"\u5168\u7a0b\u4fdd\u6301\u540c\u4e00\u65e5\u672c\u4ee3\u7406\uff0c\u652f\u4ed8\u9875/PayPal \u8d26\u5355\u6539\u7528\u7f8e\u56fd "
+                    )
+                    + f"{working_card.city}, {working_card.state}, {working_card.zip_code}"
+                )
 
         await session.__aenter__()
         page = await session.current_page()
@@ -4402,6 +4728,17 @@ async def pay_one(
         if use_long_link:
             log(f"{prefix} 打开支付链接...")
             await page.goto(payment_link, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
+            link_payment = await _detect_link_payment_invalid_long_link(page)
+            if link_payment.get("invalid"):
+                log(
+                    f"{prefix} "
+                    + _zh(r"\u957f\u94fe\u6253\u5f00\u540e\u51fa\u73b0 Link \u652f\u4ed8\u5165\u53e3\uff0c\u5224\u5b9a\u957f\u94fe\u751f\u6210\u9519\u8bef\uff0c\u9700\u6362\u65b9\u6cd5\u91cd\u65b0\u751f\u6210: ")
+                    + str(link_payment.get("text") or link_payment.get("source") or "")
+                )
+                raise RuntimeError(
+                    f"{PAYPAL_FLOW2_RECREATE_LINK}: opened long link shows Link payment; generated link is invalid"
+                )
         else:
             await _prepare_checkout_from_chatgpt_offer(
                 page,
@@ -4454,7 +4791,7 @@ async def pay_one(
 
         # Stripe
         log(f"{prefix} Stripe 填充...")
-        await fill_stripe(page, email, working_card, country_code=billing_country)
+        await fill_stripe(page, email, working_card, country_code=stripe_country)
 
         # PayPal - 可能需要换手机号重试
         for attempt in range(1, max_phone_retries + 1):
@@ -4470,7 +4807,7 @@ async def pay_one(
                 phone,
                 paypal_password,
                 proxy=proxy,
-                country_code=billing_country,
+                country_code=paypal_country,
             )
 
             # 检查手机号是否被拒
@@ -4570,7 +4907,7 @@ async def run_paypal_pay(
         if use_long_link:
             log(f"PayPal 流程2：长链接池为空，请先运行流程1{detail}")
         else:
-            log(f"PayPal 流程2：长链已关闭，但没有可直接登录的注册账号{detail}")
+            log(f"PayPal 流程2：短链支付模式下没有可直接登录的注册账号{detail}")
         return 0
 
     cards_file = env.get("PAYPAL_CARDS_FILE") or "data/paypal/cards.txt"
@@ -4628,7 +4965,7 @@ async def run_paypal_pay(
     capacity = min(len(pool), phone_pool.count()) if local_random_mode else min(len(pool), card_pool.count())
     target = min(count, capacity)
     card_desc = "本地随机" if local_random_mode else str(card_pool.count())
-    source_desc = "长链接" if use_long_link else "直接登录账号"
+    source_desc = "长链接" if use_long_link else "短链支付账号"
     log(f"PayPal 流程2：{source_desc} {len(pool)} 个，卡 {card_desc} 张，手机号 {phone_pool.count()} 个，本次目标 {target}，并发 {workers}")
 
     success = 0
@@ -4675,6 +5012,7 @@ async def run_paypal_pay(
                 ok = False
                 flow2_discarded = False
                 flow2_recreate_link = False
+                stripe_timeout_stop = False
                 for proxy_attempt, proxy in enumerate(proxies, start=1):
                     link_attempt = 1
                     while True:
@@ -4720,7 +5058,7 @@ async def run_paypal_pay(
                             link_attempt += 1
                             log(
                                 f"[paypal-pay-{index:02d}][{item['email']}] "
-                                + _zh(r"\u63d0\u4ea4\u540e 60s \u672a\u8df3\u8f6c PayPal\uff0c\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe\u540e\u91cd\u8bd5 ")
+                                + _zh(r"\u957f\u94fe\u6821\u9a8c/\u63d0\u4ea4\u540e\u672a\u8fdb\u5165 PayPal\uff0c\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe\u540e\u91cd\u8bd5 ")
                                 + f"({link_attempt}/{PAYPAL_FLOW2_RECREATE_LINK_MAX})"
                             )
                             try:
@@ -4738,27 +5076,19 @@ async def run_paypal_pay(
                                     + _zh(r"\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe\u5931\u8d25: ")
                                     + str(recreate_exc)
                                 )
-                                if link_attempt >= PAYPAL_FLOW2_RECREATE_LINK_MAX:
-                                    flow2_recreate_link = True
-                                    mark_link_for_regeneration(
-                                        item["email"],
-                                        account_line=item.get("account_line", ""),
-                                        reason=reason,
-                                        failed_link_method=item.get("link_method", ""),
-                                    )
-                                    break
-                                if not proxy_pool or proxy_attempt >= len(proxies):
-                                    break
-                                retry_label = f"{proxy_attempt}/{len(proxies)}"
-                                log(
-                                    f"[paypal-pay-{index:02d}][{item['email']}] "
-                                    f"长链重建失败，随机切换代理 ({retry_label}): {_display_proxy(proxy)}"
+                                flow2_recreate_link = True
+                                mark_link_for_regeneration(
+                                    item["email"],
+                                    account_line=item.get("account_line", ""),
+                                    reason=reason,
+                                    failed_link_method=item.get("link_method", ""),
                                 )
                                 break
                             continue
                         if not proxy_pool or proxy_attempt >= len(proxies):
                             break
                         if reason == PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT and proxy_attempt >= 4:
+                            stripe_timeout_stop = True
                             log(
                                 f"[paypal-pay-{index:02d}][{item['email']}] "
                                 f"Stripe 60s no PayPal redirect, switched proxy {proxy_attempt - 1}/3 times; stop current link"
@@ -4770,7 +5100,7 @@ async def run_paypal_pay(
                             f"流程失败，随机切换代理 ({retry_label}): {_display_proxy(proxy)}"
                         )
                         break
-                    if ok or flow2_discarded or flow2_recreate_link:
+                    if ok or flow2_discarded or flow2_recreate_link or stripe_timeout_stop:
                         break
                 if ok and not local_random_mode:
                     card_pool.remove(card)

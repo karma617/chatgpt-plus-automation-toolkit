@@ -59,6 +59,10 @@ from modules.storage import parse_mail_line
 from modules.utils import load_config, load_env
 
 
+def _u(text: str) -> str:
+    return text.encode("ascii").decode("unicode_escape")
+
+
 VALID_ACTIONS = (
     "register-only",
     "paypal-flow1",
@@ -380,6 +384,19 @@ def run_action(args: argparse.Namespace) -> int:
             "paypal-flow2-jp",
             "paypal-flow2-jp-nocard",
         }:
+            if flow == "paypal-flow1-jp" and not paypal_use_long_link(env_values):
+                print(
+                    result_event(
+                        flow,
+                        "success",
+                        _u(
+                            r"\u65e5\u533a\u65e0\u5361\u5df2\u8bbe\u4e3a\u77ed\u94fe\u652f\u4ed8\uff0c\u5df2\u5173\u95ed\u957f\u94fe\u751f\u6210\uff1b"
+                            r"\u8bf7\u76f4\u63a5\u70b9\u51fb\u201c\u6d41\u7a0b2 \u65e5\u672c\u4ee3\u7406(\u65e0\u5361)\u201d\u8d70\u652f\u4ed8\u6d41\u7a0b"
+                        ),
+                    ),
+                    flush=True,
+                )
+                return 0
             if flow in {"paypal-flow1", "paypal-flow1-jp"}:
                 reset_last_run_detail()
             success = asyncio.run(run_with_playwright_noise_filter(_run_async_action(args, cfg)))
@@ -463,7 +480,14 @@ def run_action(args: argparse.Namespace) -> int:
                     return 1
             elif direct_count <= 0:
                 detail = f" for selected email {args.email}" if args.email else ""
-                print(result_event(flow, "failure", f"PAYPAL_USE_LONG_LINK=false but no direct registered accounts{detail}"), flush=True)
+                print(
+                    result_event(
+                        flow,
+                        "failure",
+                        f"PAYPAL_PAYMENT_MODE=short_link but no direct registered accounts{detail}",
+                    ),
+                    flush=True,
+                )
                 return 1
             pay_success = 0
             if link_count > 0 or direct_jp_nocard:
