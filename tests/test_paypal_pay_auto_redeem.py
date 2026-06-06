@@ -531,7 +531,7 @@ def test_run_paypal_pay_replaces_nonzero_discard_with_next_link(monkeypatch, tmp
     assert "bad@example.com" in (tmp_path / "paypal_flow_discarded_emails.txt").read_text(encoding="utf-8")
 
 
-def test_run_paypal_pay_moves_bad_generated_link_back_to_registered(monkeypatch, tmp_path: Path) -> None:
+def test_run_paypal_pay_discards_recreate_reason_without_long_link_fallback(monkeypatch, tmp_path: Path) -> None:
     phones_file = tmp_path / "phones.txt"
     links_file = tmp_path / "links.txt"
     phones_file.write_text("15555550123|https://sms.example.test/get\n", encoding="utf-8")
@@ -563,24 +563,22 @@ def test_run_paypal_pay_moves_bad_generated_link_back_to_registered(monkeypatch,
         link_method="external_api",
     )
     monkeypatch.setattr(paypal_pay, "pay_one", fake_pay_one)
-    monkeypatch.setattr(
-        paypal_pay,
-        "regenerate_flow2_payment_link",
-        lambda *args, **kwargs: asyncio.sleep(0, result=(_ for _ in ()).throw(RuntimeError("generator offline"))),
-    )
+    async def fail_if_regenerated(*args, **kwargs):
+        raise AssertionError("should not recreate long link")
+
+    monkeypatch.setattr(paypal_pay, "regenerate_flow2_payment_link", fail_if_regenerated)
 
     result = asyncio.run(paypal_pay.run_paypal_pay({}, count=1, workers=1, card_source_mode="local_random"))
 
     assert result == 0
     assert links_file.read_text(encoding="utf-8") == ""
-    assert not (tmp_path / "paypal_flow_discarded_emails.txt").exists()
+    discarded = tmp_path / "paypal_flow_discarded_emails.txt"
+    assert discarded.exists()
+    assert "relink@example.com" in discarded.read_text(encoding="utf-8")
     state = paypal_flow_state.load_state(tmp_path / "paypal_flow_state.json")
-    assert state["relink@example.com"]["status"] == paypal_flow_state.STATUS_REGISTERED
+    assert state["relink@example.com"]["status"] == paypal_flow_state.STATUS_DISCARDED
     assert state["relink@example.com"]["account_line"] == "relink@example.com----pw----client----rt"
-    assert state["relink@example.com"]["bad_link_methods"] == ["external_api"]
-    assert state["relink@example.com"]["last_bad_link_method"] == "external_api"
     assert "payment_link" not in state["relink@example.com"]
-    assert "link_method" not in state["relink@example.com"]
 
 
 def test_pay_one_short_link_jp_keeps_proxy_and_uses_us_billing(monkeypatch) -> None:
@@ -667,8 +665,8 @@ def test_pay_one_short_link_jp_keeps_proxy_and_uses_us_billing(monkeypatch) -> N
         assert region_mode == "default"
         return us_billing_card
 
-    async def fake_fill_stripe(page, email, card, *, country_code="US"):
-        captured["stripe"].append((email, card, country_code))
+    async def fake_fill_stripe(page, email, card, *, country_code="US", recreate_on_missing_paypal=True):
+        captured["stripe"].append((email, card, country_code, recreate_on_missing_paypal))
 
     async def fake_fill_paypal(page, email, card, phone, paypal_password, proxy=None, *, country_code="US"):
         captured["paypal"].append((email, card, phone, proxy, country_code))
@@ -710,6 +708,7 @@ def test_pay_one_short_link_jp_keeps_proxy_and_uses_us_billing(monkeypatch) -> N
     assert captured["proxy_checks"] == [(jp_proxy, "short_link", "[paypal-pay-01][short-jp@example.com]")]
     assert captured["sessions"][0]["proxy"] == jp_proxy
     assert captured["stripe"][0][2] == "US"
+    assert captured["stripe"][0][3] is False
     assert captured["stripe"][0][1].country == "US"
     assert captured["stripe"][0][1].city == "New York"
     assert captured["paypal"][0][3] == jp_proxy

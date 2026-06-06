@@ -191,6 +191,51 @@ def test_login_state_machine_handles_account_picker_and_signin_problem_pages() -
     assert "SIGNIN_PROBLEM_RETRY_CURRENT_FLOW" in source
 
 
+def test_login_state_machine_treats_offer_modal_as_logged_in() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    detect_state = source[source.index("async def detect_state") : source.index("async def click_entry")]
+    wait_after_code = source[source.index("async def wait_after_code_submit") : source.index("async def fill_password")]
+    fill_code = source[source.index("async def fill_code") : source.index("async def fill_profile")]
+    markers = source[source.index("async def chatgpt_offer_or_payment_markers") : source.index("async def is_phone_login_page")]
+
+    assert "async def chatgpt_offer_or_payment_markers" in source
+    assert "async def wait_after_code_submit" in source
+    assert "await self.wait_after_code_submit()" in source
+    assert "code_submit_attempts" in source
+    assert "提交多次仍未跳转" in source
+    assert "#modal-account-payment" in markers
+    assert "Free offer" in markers
+    assert "Claim offer" in markers
+    assert "await chatgpt_offer_or_payment_markers(page)" in markers
+    assert "or await chatgpt_logged_in_markers(self.page, low, text)" in detect_state
+    assert "visible_code_inputs(self.page) > 0" not in wait_after_code
+    assert "await chatgpt_logged_in_markers(self.page, text.lower(), text)" in fill_code
+    assert "未找到验证码输入框" in fill_code
+
+
+def test_click_continue_fallback_never_uses_random_first_button() -> None:
+    source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
+    helper = source[source.index("async def click_continue") : source.index("async def click_by_visible_text")]
+
+    assert "safe_candidates = []" in helper
+    assert "!!el.closest('form')" in helper
+    assert "candidates = safe_candidates" in helper
+    assert "await candidates[0].click()" in helper
+
+
+def test_paypal_offer_entry_supports_current_chatgpt_offer_labels() -> None:
+    source = (ROOT / "modules" / "paypal_pay.py").read_text(encoding="utf-8")
+    offer = source[source.index("async def _click_visible_offer_entry") : source.index("async def _prepare_checkout_from_chatgpt_offer")]
+    dismiss = source[source.index("async def _dismiss_chatgpt_interstitials") : source.index("async def _click_zero_trial_plus_option")]
+
+    assert 'button:has-text("Free offer")' in offer
+    assert 'button:has-text("Claim offer")' in offer
+    assert '/free\\\\s*offer/i' in offer
+    assert '/claim\\\\s*offer/i' in offer
+    assert "const bad =" in offer
+    assert "#modal-account-payment" in dismiss
+
+
 def test_account_picker_and_signin_problem_click_helpers_are_wired() -> None:
     source = (ROOT / "modules" / "chatgpt_register.py").read_text(encoding="utf-8")
     account_picker = source[source.index("async def handle_account_picker") : source.index("async def handle_signin_problem")]

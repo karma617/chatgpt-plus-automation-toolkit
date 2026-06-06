@@ -1,3 +1,7 @@
+powershell -ExecutionPolicy Bypass -File .\build_panel.ps1
+
+
+
 # ChatGPT 全流程助手
 
 自动化完成 ChatGPT Plus 账号注册、支付、授权、Session 导出的全链路工具。

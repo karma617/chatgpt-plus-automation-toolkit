@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -31,6 +33,16 @@ AUTH_ERROR_PATHS = ("/api/auth/error", "/auth/error")
 
 def _zh(text: str) -> str:
     return text.encode("ascii").decode("unicode_escape")
+
+
+def _safe_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.@-]+", "_", str(value or "").strip())[:120] or "unknown"
+
+
+def _runtime_output_base() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "output"
+    return Path(__file__).resolve().parents[1] / "output"
 
 
 def is_signin_problem_retry_reason(reason: str | None) -> bool:
@@ -87,8 +99,10 @@ class ChatGPTRegister:
         self.generated_name: str | None = None
         self.generated_age: str | None = None
         self.bad_codes: set[str] = set()
+        self.code_submit_attempts: dict[str, int] = {}
         self.unknown_count = 0
         self.entry_count = 0
+        self.email_submit_attempts = 0
         self.phone_switch_attempts = 0
         self.signin_problem_attempts = 0
 
@@ -141,7 +155,14 @@ class ChatGPTRegister:
                     self.log("手机号页: 已启用接码，开始自动获取手机号")
                     await self.handle_phone_required()
                     continue
+                if state != "email":
+                    self.email_submit_attempts = 0
+                if state != "code":
+                    self.code_submit_attempts.clear()
                 if state == "email":
+                    self.email_submit_attempts += 1
+                    if self.email_submit_attempts > 6:
+                        raise RuntimeError("邮箱页连续提交后仍未推进，疑似触发普通 GET 表单或页面脚本未接管")
                     if self.is_phone_signup_mode():
                         if not self.sms_selection:
                             raise FatalAccountError(
@@ -151,7 +172,7 @@ class ChatGPTRegister:
                             )
                         await self.force_phone_login_entry()
                         continue
-                    self.log(f"邮箱页: 填入邮箱 {account.email}")
+                    self.log(f"邮箱页: 等待页面完全加载后填入邮箱 {account.email}")
                     await self.fill_email(account.email)
                     continue
                 if state == "password":
@@ -161,6 +182,12 @@ class ChatGPTRegister:
                 if state == "code":
                     self.log("验证码页: 开始拉取邮箱验证码")
                     code = await self.mail_provider.wait_code(account, since, self.bad_codes)
+                    submitted_count = self.code_submit_attempts.get(code, 0)
+                    if submitted_count >= 2:
+                        self.bad_codes.add(code)
+                        await self.dump_code_submit_debug(account.email, code, "same code repeated without redirect")
+                        raise RuntimeError(f"验证码 {code} 提交多次仍未跳转，停止重复提交")
+                    self.code_submit_attempts[code] = submitted_count + 1
                     self.log(f"验证码页: 已拿到验证码 {code}，准备填入")
                     accepted = await self.fill_code(code)
                     if not accepted:
@@ -168,6 +195,7 @@ class ChatGPTRegister:
                         self.log(f"验证码被页面判定无效，已排除旧码: {code}")
                     else:
                         self.log("验证码页: 已提交验证码")
+                        await self.wait_after_code_submit()
                     continue
                 if state == "profile":
                     self.log("资料页: 准备填写姓名和年龄")
@@ -631,6 +659,12 @@ class ChatGPTRegister:
         return False
 
     async def fill_email(self, email: str) -> None:
+        await self.wait_email_page_ready()
+        if "auth/login?email=" in (self.page.url or "").lower():
+            self.log("邮箱页: 检测到普通 GET 回退，重置登录页后重填")
+            await self.page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded")
+            await settle(self.page)
+            await self.wait_email_page_ready()
         locator = await first_visible(
             self.page.locator("input[type='email'], input[name*='email' i], input[autocomplete='username']")
         )
@@ -638,9 +672,141 @@ class ChatGPTRegister:
             locator = await first_textbox(self.page)
         if not locator:
             raise RuntimeError("未找到邮箱输入框")
+        self.log(f"邮箱页: 页面已加载，填入邮箱 {email}")
         await human_fill(locator, email, force_mouse=True)
-        if not await click_email_submit_safe(self.page, locator):
+        submit_result = None
+        # 新版登录页可能在邮箱输入后才渲染继续按钮，需短轮询，仍只点邮箱表单附近的安全按钮。
+        for _ in range(20):
+            submit_result = await click_email_submit_safe(self.page, locator)
+            if submit_result:
+                break
+            await self.page.wait_for_timeout(500)
+        if not submit_result:
             raise RuntimeError("邮箱页未找到安全的继续按钮")
+        self.log(f"邮箱页: 已触发提交 mode={submit_result.get('mode', '')} label={submit_result.get('label', '')}")
+        await self.wait_email_submit_progress()
+
+    async def wait_email_page_ready(self, timeout_ms: int = 30_000) -> None:
+        """等待邮箱登录页完全加载，避免页面脚本尚未接管时提前输入邮箱。"""
+        try:
+            await self.page.wait_for_load_state("load", timeout=min(timeout_ms, 15_000))
+        except Exception:
+            pass
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass
+        deadline = asyncio.get_running_loop().time() + max(3_000, timeout_ms) / 1000
+        last_state = ""
+        email_ready_since: float | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                now = asyncio.get_running_loop().time()
+                state = await self.page.evaluate(
+                    r"""() => {
+                        const docReady = document.readyState === 'complete';
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                        };
+                        const email = document.querySelector('input[type="email"], input[name*="email" i], input[autocomplete="username"]');
+                        const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]')).filter(visible);
+                        const hasSubmit = buttons.some((el) => /continue|next|log in|sign in|sign up|create|\u7ee7\u7eed|\u4e0b\u4e00\u6b65|\u767b\u5f55|\u6ce8\u518c|\u7d9a\u884c|\u6b21\u3078/i.test(
+                            String(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '')
+                        ));
+                        return {
+                            ready: docReady && visible(email) && hasSubmit,
+                            inputReady: docReady && visible(email),
+                            docReady,
+                            hasEmail: visible(email),
+                            hasSubmit
+                        };
+                    }"""
+                )
+                if isinstance(state, dict):
+                    last_state = (
+                        f"docReady={state.get('docReady')} "
+                        f"hasEmail={state.get('hasEmail')} "
+                        f"hasSubmit={state.get('hasSubmit')}"
+                    )
+                    if state.get("ready"):
+                        await self.page.wait_for_timeout(800)
+                        return
+                    if state.get("inputReady"):
+                        if email_ready_since is None:
+                            email_ready_since = now
+                        if now - email_ready_since >= 2.5:
+                            self.log("邮箱页: 输入框已完成加载，继续按钮待输入后出现")
+                            await self.page.wait_for_timeout(800)
+                            return
+                    else:
+                        email_ready_since = None
+                elif state:
+                    await self.page.wait_for_timeout(800)
+                    return
+            except Exception:
+                pass
+            await self.page.wait_for_timeout(300)
+        raise RuntimeError(f"邮箱页等待加载超时，禁止提前输入邮箱: {last_state or 'unknown'}")
+
+    async def wait_email_submit_progress(self, timeout_ms: int = 45_000) -> None:
+        """邮箱提交后给 Auth0/Cloudflare 预留推进时间，避免慢代理下重复填邮箱。"""
+        deadline = asyncio.get_running_loop().time() + max(2_000, timeout_ms) / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            await self.page.wait_for_timeout(600)
+            await self.refresh_page()
+            text = await body_text(self.page)
+            state = await self.detect_state()
+            if state != "email" or await chatgpt_logged_in_markers(self.page, text.lower(), text):
+                return
+        self.log("邮箱页: 提交后仍停留，等待下一轮状态机重试")
+
+    async def wait_after_code_submit(self, timeout_ms: int = 75_000) -> None:
+        """验证码提交后等待 Auth 回跳 ChatGPT，避免慢代理下重复提交同一码。"""
+        deadline = asyncio.get_running_loop().time() + max(2_000, timeout_ms) / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            await self.page.wait_for_timeout(600)
+            await self.refresh_page()
+            text = await body_text(self.page)
+            low = text.lower()
+            if await chatgpt_logged_in_markers(self.page, low, text):
+                return
+            if await is_invalid_code_page(self.page):
+                return
+            if "email-verification" not in (self.page.url or "").lower() and not likely_code_page(low):
+                return
+        self.log("验证码页: 提交后仍未完成跳转，交由状态机继续判断")
+
+    async def dump_code_submit_debug(self, email: str, code: str, reason: str) -> None:
+        """保存验证码提交失败现场，便于将页面变化转为稳定自动操作。"""
+        try:
+            out_dir = (
+                _runtime_output_base()
+                / "paypal注册"
+                / "debug"
+                / "auth_code_failure"
+                / f"{_safe_filename(email)}_{int(time.time())}"
+            )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            text = await body_text(self.page)
+            (out_dir / "body.txt").write_text(
+                f"reason={reason}\nurl={self.page.url}\ncode={code}\n\n{text[:8000]}",
+                encoding="utf-8",
+            )
+            (out_dir / "page.html").write_text(await self.page.content(), encoding="utf-8")
+            try:
+                await self.page.context.storage_state(path=str(out_dir / "state.json"))
+            except Exception:
+                pass
+            try:
+                await self.page.screenshot(path=str(out_dir / "screenshot.png"), full_page=True)
+            except Exception:
+                pass
+            self.log(f"验证码页: 已保存失败现场 {out_dir}")
+        except Exception as exc:
+            self.log(f"验证码页: 保存失败现场失败: {exc}")
 
     async def fill_password(self, account: MailAccount) -> None:
         if not account.password:
@@ -655,6 +821,11 @@ class ChatGPTRegister:
         )
 
     async def fill_code(self, code: str) -> bool:
+        text = await body_text(self.page)
+        if await chatgpt_logged_in_markers(self.page, text.lower(), text):
+            return True
+        if await chatgpt_offer_or_payment_markers(self.page):
+            return True
         inputs = await visible_locators(self.page.locator("input:not([type='file'])"))
         code_inputs = []
         for item in inputs:
@@ -663,17 +834,63 @@ class ChatGPTRegister:
                 continue
             if any(k in " ".join(attrs.values()).lower() for k in ["code", "otp", "verification", "one-time"]):
                 code_inputs.append(item)
+        submit_anchor: Locator | None = None
         if len(code_inputs) >= 6:
-            for index, char in enumerate(code[:6]):
-                await code_inputs[index].fill(char)
+            submit_anchor = code_inputs[0]
+            for item in code_inputs[:6]:
+                try:
+                    await item.fill("")
+                except Exception:
+                    pass
+            await code_inputs[0].click()
+            await self.page.keyboard.type(code[:6], delay=70)
+            await self.page.wait_for_timeout(500)
+            typed_values = []
+            for item in code_inputs[:6]:
+                try:
+                    typed_values.append(await item.input_value(timeout=500))
+                except Exception:
+                    typed_values.append("")
+            if "".join(typed_values)[:6] != code[:6]:
+                for index, char in enumerate(code[:6]):
+                    await code_inputs[index].fill(char)
         elif code_inputs:
+            submit_anchor = code_inputs[0]
             await human_fill(code_inputs[0], code, force_mouse=True)
         else:
             target = await first_textbox(self.page)
             if not target:
+                if await chatgpt_offer_or_payment_markers(self.page):
+                    return True
+                await self.wait_after_code_submit(timeout_ms=8_000)
+                text = await body_text(self.page)
+                if await chatgpt_logged_in_markers(self.page, text.lower(), text):
+                    return True
+                if "email-verification" in (self.page.url or "").lower() or likely_code_page(text.lower()):
+                    return True
                 raise RuntimeError("未找到验证码输入框")
+            attrs = await input_attrs(target)
+            if "composer" in " ".join(attrs.values()).lower():
+                text = await body_text(self.page)
+                if await chatgpt_logged_in_markers(self.page, text.lower(), text):
+                    return True
+                if await chatgpt_offer_or_payment_markers(self.page):
+                    return True
+            submit_anchor = target
             await human_fill(target, code, force_mouse=True)
-        await click_continue(self.page)
+        await self.page.wait_for_timeout(500)
+        submit_result = await click_code_submit(self.page, submit_anchor)
+        self.log(
+            "验证码页: 已触发提交 "
+            f"mode={submit_result.get('mode', '') if submit_result else 'fallback'} "
+            f"label={submit_result.get('label', '') if submit_result else ''}"
+        )
+        await self.page.wait_for_timeout(1500)
+        text = await body_text(self.page)
+        if await chatgpt_logged_in_markers(self.page, text.lower(), text):
+            return True
+        if await chatgpt_offer_or_payment_markers(self.page):
+            return True
         return not await is_invalid_code_page(self.page)
 
     async def fill_profile(self) -> None:
@@ -1400,10 +1617,34 @@ def is_entry_page(low: str, text: str) -> bool:
     )
 
 
+async def chatgpt_offer_or_payment_markers(page: Page) -> bool:
+    selectors = (
+        "#modal-account-payment",
+        '[data-testid="modal-account-payment"]',
+        'button:has-text("Free offer")',
+        'a:has-text("Free offer")',
+        '[role="button"]:has-text("Free offer")',
+        'button:has-text("Claim offer")',
+        'a:has-text("Claim offer")',
+        '[role="button"]:has-text("Claim offer")',
+        'button[aria-label*="Free offer" i]',
+        'a[aria-label*="Free offer" i]',
+        'button[aria-label*="Claim offer" i]',
+        'a[aria-label*="Claim offer" i]',
+    )
+    for selector in selectors:
+        try:
+            if await page.locator(selector).first.is_visible(timeout=250):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def chatgpt_logged_in_markers(page: Page, low: str, text: str) -> bool:
+    if await chatgpt_offer_or_payment_markers(page):
+        return True
     if "auth/login" in (page.url or "").lower() or "auth/signup" in (page.url or "").lower():
-        return False
-    if "log in" in low or "sign up" in low or "登录" in text or "注册" in text:
         return False
     selectors = (
         "textarea[placeholder]",
@@ -1419,6 +1660,8 @@ async def chatgpt_logged_in_markers(page: Page, low: str, text: str) -> bool:
                 return True
         except Exception:
             continue
+    if "log in" in low or "sign up" in low or "登录" in text or "注册" in text:
+        return False
     return any(
         hint in low or hint in text
         for hint in [
@@ -1966,11 +2209,37 @@ async def click_email_submit(page: Page, email_input: Locator) -> bool:
     return False
 
 
-async def click_email_submit_safe(page: Page, email_input: Locator) -> bool:
+async def click_email_submit_safe(page: Page, email_input: Locator) -> dict[str, Any] | None:
     """Submit the email form without clicking phone/SMS switch buttons."""
+    for pattern in (
+        re.compile(r"^(continue|next|log in|sign in|sign up|create)$", re.I),
+        re.compile(r"^(继续|下一步|登录|注册)$"),
+        re.compile(_zh(r"^(\u7d9a\u884c|\u6b21\u3078|\u30ed\u30b0\u30a4\u30f3|\u767b\u9332)$")),
+    ):
+        buttons = page.get_by_role("button", name=pattern)
+        for index in range(await buttons.count()):
+            button = buttons.nth(index)
+            try:
+                if not await button.is_visible(timeout=300) or not await button.is_enabled(timeout=300):
+                    continue
+                if await is_social_oauth(button):
+                    continue
+                await button.scroll_into_view_if_needed(timeout=1000)
+                box = await button.bounding_box()
+                if box:
+                    await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    await page.mouse.down()
+                    await page.wait_for_timeout(80)
+                    await page.mouse.up()
+                else:
+                    await button.click(timeout=2000)
+                await page.wait_for_timeout(1500)
+                return {"ok": True, "mode": "role-click", "label": pattern.pattern}
+            except Exception:
+                continue
     handle = await email_input.element_handle()
     if not handle:
-        return False
+        return None
     result = await page.evaluate(
         r"""(input) => {
             const visible = (el) => {
@@ -1980,6 +2249,8 @@ async def click_email_submit_safe(page: Page, email_input: Locator) -> bool:
                 return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
             };
             const label = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+            const form = input.closest('form');
+            const inputRect = input.getBoundingClientRect();
             const meta = (el) => [
                 label(el),
                 el?.getAttribute?.('aria-label') || '',
@@ -1994,61 +2265,176 @@ async def click_email_submit_safe(page: Page, email_input: Locator) -> bool:
             const isSocial = (el) => /google|apple|microsoft|github|sso|oauth|social|provider/.test(meta(el));
             const isPhoneSwitch = (el) => /phone|mobile|sms|tel|\u7535\u8bdd\u53f7\u7801|\u624b\u673a\u53f7|\u624b\u673a|\u96fb\u8a71\u756a\u53f7|\u643a\u5e2f/.test(meta(el));
             const isEmailSwitch = (el) => /continue with email|email address|\u7535\u5b50\u90ae\u4ef6|\u90ae\u7bb1|\u30e1\u30fc\u30eb/.test(meta(el));
+            const isCurrentFormButton = (el) => !!form && el.closest?.('form') === form;
+            const isSwitchButton = (el) => isPhoneSwitch(el) || (isEmailSwitch(el) && !isCurrentFormButton(el));
             const isWanted = (el) => {
-                if (isSocial(el) || isPhoneSwitch(el) || isEmailSwitch(el)) return false;
+                if (isSocial(el) || isSwitchButton(el)) return false;
                 const value = label(el).toLowerCase();
+                const info = meta(el);
+                if (/^continue with email( address)?$/.test(value)) return true;
+                if (/continue with email( address)?|email-submit|submit-button|continue-button|next-button/.test(info)) return true;
                 if (/^(continue|next|submit|log in|sign in|sign up|create)$/.test(value)) return true;
                 if (/^(\u7ee7\u7eed|\u4e0b\u4e00\u6b65|\u767b\u5f55|\u6ce8\u518c)$/.test(value)) return true;
                 if (/^(\u7d9a\u884c|\u6b21\u3078|\u78ba\u8a8d|\u9001\u4fe1|\u30ed\u30b0\u30a4\u30f3|\u767b\u9332)$/.test(value)) return true;
                 return /\b(continue|next)\b/.test(value) || /\u7ee7\u7eed|\u4e0b\u4e00\u6b65|\u7d9a\u884c|\u6b21\u3078/.test(value);
+            };
+            const score = (el) => {
+                const rect = el.getBoundingClientRect();
+                const formScore = isCurrentFormButton(el) ? 0 : 2000;
+                const vertical = Math.abs((rect.top + rect.bottom) / 2 - (inputRect.top + inputRect.bottom) / 2);
+                const belowPenalty = rect.top >= inputRect.top ? 0 : 500;
+                return formScore + belowPenalty + vertical;
             };
             const activate = (target) => {
                 target.scrollIntoView({ block: 'center', inline: 'nearest' });
                 target.focus?.();
                 target.click();
             };
-            const form = input.closest('form');
             const scopes = [
                 form,
                 input.closest('[data-testid]'),
                 input.closest('section'),
                 input.closest('main'),
-                input.closest('[role="main"]')
+                input.closest('[role="main"]'),
+                document.querySelector('main'),
+                document.body
             ].filter(Boolean);
             for (const scope of scopes) {
                 const buttons = [...scope.querySelectorAll('button, input[type=submit]')]
                     .filter((el) => visible(el) && !el.disabled);
-                const wanted = buttons.find(isWanted);
+                const wanted = buttons.filter(isWanted).sort((a, b) => score(a) - score(b))[0];
                 if (wanted) {
                     activate(wanted);
-                    return { ok: true, mode: 'button', label: label(wanted) };
+                    return { ok: true, mode: 'button', label: label(wanted) || meta(wanted).slice(0, 120) };
                 }
                 const safeSubmit = buttons.filter((el) => {
                     const type = String(el.getAttribute?.('type') || '').toLowerCase();
-                    return !isSocial(el) && !isPhoneSwitch(el) && !isEmailSwitch(el) && (type === 'submit' || el.tagName === 'BUTTON');
-                });
+                    return !isSocial(el) && !isPhoneSwitch(el) && !isSwitchButton(el) && (type === 'submit' || el.tagName === 'BUTTON');
+                }).sort((a, b) => score(a) - score(b));
                 if (form && scope === form && safeSubmit.length === 1) {
                     activate(safeSubmit[0]);
-                    return { ok: true, mode: 'single-form-button', label: label(safeSubmit[0]) };
+                    return { ok: true, mode: 'single-form-button', label: label(safeSubmit[0]) || meta(safeSubmit[0]).slice(0, 120) };
                 }
             }
-            input.focus();
-            input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Enter', code: 'Enter' }));
-            input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter', code: 'Enter' }));
-            if (form && typeof form.requestSubmit === 'function' && hasEmailValue()) {
-                try {
-                    form.requestSubmit();
-                    return { ok: true, mode: 'form-request-submit' };
-                } catch (e) {}
-            }
-            return { ok: false, mode: 'not-found' };
+            return { ok: false, mode: 'not-found', label: '' };
         }""",
         handle,
     )
     if isinstance(result, dict) and result.get("ok"):
         await settle(page)
-        return True
-    return False
+        return result
+    return None
+
+
+async def click_code_submit(page: Page, anchor: Locator | None) -> dict[str, Any] | None:
+    """验证码页专用提交：只点 Continue/Verify/Submit，明确排除 Resend。"""
+    if not anchor:
+        await page.keyboard.press("Enter")
+        await settle(page)
+        return {"ok": True, "mode": "keyboard-enter", "label": ""}
+    handle = await anchor.element_handle()
+    if not handle:
+        await page.keyboard.press("Enter")
+        await settle(page)
+        return {"ok": True, "mode": "keyboard-enter", "label": ""}
+    deadline = asyncio.get_running_loop().time() + 8
+    last_result: dict[str, Any] | None = None
+    while asyncio.get_running_loop().time() < deadline:
+        result = await page.evaluate(
+            r"""(input) => {
+                const visible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const label = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const meta = (el) => [
+                    label(el),
+                    el?.getAttribute?.('aria-label') || '',
+                    el?.getAttribute?.('title') || '',
+                    el?.getAttribute?.('data-testid') || '',
+                    el?.getAttribute?.('name') || '',
+                    el?.getAttribute?.('type') || '',
+                    el?.outerHTML || ''
+                ].join(' ').toLowerCase();
+                const inputRect = input.getBoundingClientRect();
+                const bad = (el) => /resend|send again|send new|new code|another code|back|cancel|close|edit|change email|different email|try another|use phone|phone|mobile|sms|google|apple|microsoft|github|oauth|social|provider|sidebar|country|currency|plan|offer|paypal|\u91cd\u53d1|\u518d\u53d1|\u53d1\u9001\u65b0|\u8fd4\u56de|\u53d6\u6d88|\u66f4\u6539\u90ae\u7bb1|\u30b3\u30fc\u30c9\u3092\u518d\u9001|\u518d\u9001/.test(meta(el));
+                const wanted = (el) => {
+                    if (!visible(el) || bad(el) || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                    const text = label(el).toLowerCase();
+                    const info = meta(el);
+                    if (/^(continue|next|submit|verify|confirm|log in|sign in|sign up|create|finish|done)$/.test(text)) return true;
+                    if (/^(\u7ee7\u7eed|\u4e0b\u4e00\u6b65|\u63d0\u4ea4|\u9a8c\u8bc1|\u786e\u8ba4|\u767b\u5f55|\u6ce8\u518c|\u5b8c\u6210|\u521b\u5efa)$/.test(text)) return true;
+                    if (/^(\u7d9a\u884c|\u6b21\u3078|\u78ba\u8a8d|\u9001\u4fe1|\u30ed\u30b0\u30a4\u30f3|\u767b\u9332|\u4f5c\u6210|\u5b8c\u4e86)$/.test(text)) return true;
+                    if (/\b(continue|next|submit|verify|confirm)\b|continue-button|submit-button|verify-button|otp-submit|code-submit/.test(info)) return true;
+                    return false;
+                };
+                const score = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const inputCenterY = (inputRect.top + inputRect.bottom) / 2;
+                    const inputCenterX = (inputRect.left + inputRect.right) / 2;
+                    const y = (rect.top + rect.bottom) / 2;
+                    const x = (rect.left + rect.right) / 2;
+                    const type = String(el.getAttribute('type') || '').toLowerCase();
+                    const text = label(el).toLowerCase();
+                    let value = Math.abs(y - inputCenterY) + Math.abs(x - inputCenterX) * 0.2;
+                    if (rect.top >= inputRect.top) value -= 120;
+                    if (type === 'submit') value -= 120;
+                    if (/continue|verify|submit|next|confirm|\u7ee7\u7eed|\u9a8c\u8bc1|\u63d0\u4ea4|\u7d9a\u884c|\u78ba\u8a8d|\u9001\u4fe1/.test(text)) value -= 180;
+                    return value;
+                };
+                const scopes = [];
+                const pushScope = (el) => {
+                    if (el && !scopes.includes(el)) scopes.push(el);
+                };
+                pushScope(input.closest('form'));
+                let node = input.parentElement;
+                for (let depth = 0; node && depth < 9; depth++, node = node.parentElement) pushScope(node);
+                pushScope(document.querySelector('main'));
+                pushScope(document.body);
+                for (const scope of scopes.filter(Boolean)) {
+                    const buttons = Array.from(scope.querySelectorAll('button, input[type=submit], [role="button"]'))
+                        .filter(wanted)
+                        .filter((el) => {
+                            const rect = el.getBoundingClientRect();
+                            return Math.abs(((rect.top + rect.bottom) / 2) - ((inputRect.top + inputRect.bottom) / 2)) < 700;
+                        })
+                        .sort((a, b) => score(a) - score(b));
+                    const target = buttons[0];
+                    if (!target) continue;
+                    target.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    target.focus?.();
+                    target.click();
+                    return { ok: true, mode: 'code-submit-click', label: label(target) || meta(target).slice(0, 120) };
+                }
+                const form = input.closest('form');
+                if (form && typeof form.requestSubmit === 'function') {
+                    const blocked = Array.from(form.querySelectorAll('button, input[type=submit], [role="button"]')).filter((el) => visible(el) && bad(el));
+                    const safeSubmitCount = Array.from(form.querySelectorAll('button, input[type=submit]')).filter((el) => visible(el) && !bad(el)).length;
+                    if (blocked.length === 0 || safeSubmitCount > 0) {
+                        form.requestSubmit();
+                        return { ok: true, mode: 'form-request-submit', label: '' };
+                    }
+                }
+                return { ok: false, mode: 'code-submit-not-found', label: '' };
+            }""",
+            handle,
+        )
+        if isinstance(result, dict):
+            last_result = result
+            if result.get("ok"):
+                await settle(page)
+                return result
+        await page.wait_for_timeout(300)
+    try:
+        await anchor.press("Enter")
+        await settle(page)
+        return {"ok": True, "mode": "anchor-enter", "label": str((last_result or {}).get("mode") or "")}
+    except Exception:
+        await page.keyboard.press("Enter")
+        await settle(page)
+        return {"ok": True, "mode": "keyboard-enter", "label": str((last_result or {}).get("mode") or "")}
 
 
 async def click_continue(page: Page, profile: bool = False, anchor: Locator | None = None) -> None:
@@ -2067,6 +2453,82 @@ async def click_continue(page: Page, profile: bool = False, anchor: Locator | No
             await form_button.click()
             await settle(page)
             return
+        handle = await anchor.element_handle()
+        if handle:
+            result = await page.evaluate(
+                r"""(input) => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const label = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const meta = (el) => [
+                        label(el),
+                        el?.getAttribute?.('aria-label') || '',
+                        el?.getAttribute?.('title') || '',
+                        el?.getAttribute?.('data-testid') || '',
+                        el?.getAttribute?.('name') || '',
+                        el?.getAttribute?.('type') || '',
+                        el?.outerHTML || ''
+                    ].join(' ').toLowerCase();
+                    const inputRect = input.getBoundingClientRect();
+                    const bad = (el) => /google|apple|microsoft|github|oauth|social|provider|sidebar|new chat|search chats|close|country|currency|plan|offer|paypal/.test(meta(el));
+                    const wanted = (el) => {
+                        if (bad(el) || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                        const text = label(el).toLowerCase();
+                        const info = meta(el);
+                        if (/^(continue|next|submit|verify|log in|sign in|sign up|create|finish|done)$/.test(text)) return true;
+                        if (/^(\u7ee7\u7eed|\u4e0b\u4e00\u6b65|\u9a8c\u8bc1|\u767b\u5f55|\u6ce8\u518c|\u5b8c\u6210|\u521b\u5efa)$/.test(text)) return true;
+                        if (/^(\u7d9a\u884c|\u6b21\u3078|\u78ba\u8a8d|\u9001\u4fe1|\u30ed\u30b0\u30a4\u30f3|\u767b\u9332|\u4f5c\u6210|\u5b8c\u4e86)$/.test(text)) return true;
+                        return /\b(continue|next|submit|verify)\b|continue-button|submit-button|verify-button|otp|code/.test(info);
+                    };
+                    const score = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        const vertical = Math.abs((rect.top + rect.bottom) / 2 - (inputRect.top + inputRect.bottom) / 2);
+                        const horizontal = Math.abs((rect.left + rect.right) / 2 - (inputRect.left + inputRect.right) / 2);
+                        const belowPenalty = rect.top >= inputRect.top ? 0 : 400;
+                        return belowPenalty + vertical + horizontal * 0.25;
+                    };
+                    const scopes = [];
+                    const pushScope = (el) => {
+                        if (el && visible(el) && !scopes.includes(el)) scopes.push(el);
+                    };
+                    pushScope(input.closest('form'));
+                    let node = input.parentElement;
+                    for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+                        pushScope(node);
+                    }
+                    pushScope(document.querySelector('main'));
+                    for (const scope of scopes) {
+                        const buttons = Array.from(scope.querySelectorAll('button, input[type=submit], [role="button"]'))
+                            .filter((el) => visible(el) && wanted(el))
+                            .filter((el) => {
+                                const rect = el.getBoundingClientRect();
+                                return Math.abs((rect.top + rect.bottom) / 2 - (inputRect.top + inputRect.bottom) / 2) < 520;
+                            })
+                            .sort((a, b) => score(a) - score(b));
+                        const target = buttons[0];
+                        if (!target) continue;
+                        target.scrollIntoView({ block: 'center', inline: 'nearest' });
+                        target.focus?.();
+                        target.click();
+                        return { ok: true, mode: 'near-anchor-js', label: label(target) || meta(target).slice(0, 120) };
+                    }
+                    return { ok: false, mode: 'near-anchor-not-found', label: '' };
+                }""",
+                handle,
+            )
+            if isinstance(result, dict) and result.get("ok"):
+                await settle(page)
+                return
+        try:
+            await anchor.press("Enter")
+            await settle(page)
+            return
+        except Exception:
+            pass
     for pattern in patterns:
         buttons = page.get_by_role("button", name=pattern)
         for index in range(await buttons.count()):
@@ -2080,6 +2542,17 @@ async def click_continue(page: Page, profile: bool = False, anchor: Locator | No
                 continue
     candidates = await visible_locators(page.locator("button, input[type='submit']"))
     candidates = [item for item in candidates if not await is_social_oauth(item)]
+    safe_candidates = []
+    for item in candidates:
+        try:
+            attrs = await input_attrs(item)
+            hay = " ".join(attrs.values()).lower()
+            in_form = bool(await item.evaluate("el => !!el.closest('form')"))
+            if in_form or any(key in hay for key in ["submit", "continue", "next", "verify", "login", "signup"]):
+                safe_candidates.append(item)
+        except Exception:
+            continue
+    candidates = safe_candidates
     if candidates:
         await candidates[0].click()
         await settle(page)

@@ -203,7 +203,22 @@ def mark_completed_many(emails: Iterable[str]) -> None:
 
 def mark_discarded_many(emails: Iterable[str], *, reason: str = "") -> None:
     for email in emails:
-        update_account(email, STATUS_DISCARDED, reason=reason)
+        normalized = normalize_email(email)
+        if not normalized:
+            continue
+        state = load_state()
+        record = dict(state.get(normalized) or {})
+        record.setdefault("created_at", _now_iso())
+        record["email"] = normalized
+        record["status"] = STATUS_DISCARDED
+        record["updated_at"] = _now_iso()
+        # 作废账号不保留旧长链，避免流程2后续误复用已失效地址。
+        record.pop("payment_link", None)
+        record.pop("link_method", None)
+        if reason:
+            record["reason"] = reason.strip()
+        state[normalized] = record
+        save_state(state)
 
 
 def mark_stage_failure(email: str, *, stage: str, reason: str = "") -> None:

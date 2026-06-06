@@ -1,4 +1,7 @@
 browser:
+  engine: "camoufox"
+  camoufox_executable_path: ""
+  camoufox_geoip: false
   headless: false
   slow_mo: 80
   timeout_ms: 60000

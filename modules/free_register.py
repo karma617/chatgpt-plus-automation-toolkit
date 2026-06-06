@@ -379,6 +379,10 @@ async def run_free_register_once(
         fingerprint_seed=f"{account.email}|free-phone",
         account_id=account.email,
         log_prefix=prefix,
+        browser_engine=browser_cfg.get("engine"),
+        browser_locale=browser_cfg.get("locale"),
+        camoufox_executable_path=browser_cfg.get("camoufox_executable_path"),
+        camoufox_geoip=browser_cfg.get("camoufox_geoip"),
     )
     success = False
     try:
@@ -662,6 +666,10 @@ async def run_free_register_once_email(
         fingerprint_seed=f"{account.email}|free-email",
         account_id=account.email,
         log_prefix=prefix,
+        browser_engine=browser_cfg.get("engine"),
+        browser_locale=browser_cfg.get("locale"),
+        camoufox_executable_path=browser_cfg.get("camoufox_executable_path"),
+        camoufox_geoip=browser_cfg.get("camoufox_geoip"),
     )
     success = False
     try:

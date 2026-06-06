@@ -110,12 +110,15 @@ def test_fingerprint_languages_are_limited_to_chinese_or_english(monkeypatch) ->
         fingerprint = browser_module._build_fingerprint("language-test", proxy)
         languages = fingerprint["languages"]
 
-        assert fingerprint["locale"] in {"en-US", "zh-CN"}
+        assert fingerprint["locale"] in {"en-US", "zh-CN", "zh-JP"}
         assert all(str(item).split("-", 1)[0] in {"en", "zh"} for item in languages)
         assert not any(str(item).startswith("ja") for item in languages)
 
 
 def test_accept_language_header_follows_fingerprint_language() -> None:
+    assert browser_module._accept_language_header(["zh-JP", "zh-CN", "zh", "en-US", "en"]) == (
+        "zh-JP,zh-CN;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6"
+    )
     assert browser_module._accept_language_header(["zh-CN", "zh", "en-US", "en"]) == (
         "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
     )
@@ -136,7 +139,19 @@ def test_browser_session_disables_fingerprint_by_default(tmp_path, monkeypatch) 
     )
 
     assert session.fingerprint is None
-    assert session._context_options() == {}
+    assert session._context_options() == {
+        "locale": "zh-JP",
+        "viewport": {"width": 1720, "height": 900},
+        "screen": {
+            "width": 1720,
+            "height": 900,
+            "availWidth": 1720,
+            "availHeight": 860,
+        },
+        "extra_http_headers": {
+            "Accept-Language": "zh-JP,zh-CN;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6",
+        },
+    }
 
 
 def test_browser_session_fingerprint_can_be_enabled_explicitly(tmp_path, monkeypatch) -> None:
@@ -159,6 +174,200 @@ def test_browser_session_fingerprint_can_be_enabled_explicitly(tmp_path, monkeyp
     assert options["extra_http_headers"]["Accept-Language"] == browser_module._accept_language_header(
         session.fingerprint.get("languages")
     )
+
+
+def test_browser_session_defaults_to_chromium_engine(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("BROWSER_ENGINE", raising=False)
+
+    session = BrowserSession(
+        profile_dir=tmp_path / "profile",
+        headless=True,
+        slow_mo=0,
+        timeout_ms=1000,
+    )
+
+    assert session.browser_engine == "chromium"
+
+
+def test_browser_session_accepts_camoufox_engine_without_chrome_fingerprint(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BROWSER_FINGERPRINT_ENABLED", "1")
+
+    session = BrowserSession(
+        profile_dir=tmp_path / "profile",
+        headless=True,
+        slow_mo=0,
+        timeout_ms=1000,
+        browser_engine="camoufox",
+        fingerprint_seed="seed",
+    )
+
+    assert session.browser_engine == "camoufox"
+    assert session.fingerprint is None
+    assert session._context_options()["locale"] == "zh-JP"
+    assert session.browser_locale == "zh-JP"
+    assert session.browser_languages == ["zh-JP", "zh-CN", "zh", "en-US", "en"]
+
+
+def test_camoufox_launch_keeps_locale_out_of_launch_layer(tmp_path, monkeypatch) -> None:
+    captured = {}
+
+    class FakeCamoufox:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return object()
+
+    monkeypatch.setattr(browser_module, "_load_async_camoufox", lambda: FakeCamoufox)
+    session = BrowserSession(
+        profile_dir=tmp_path / "profile",
+        headless=True,
+        slow_mo=0,
+        timeout_ms=1000,
+        browser_engine="camoufox",
+        camoufox_geoip=True,
+        proxy="socks5h://japan.example:1080",
+    )
+
+    async def run() -> None:
+        proxy, bridge = await prepare_proxy_for_playwright(session.proxy)
+        assert bridge is None
+        await session._launch_camoufox(proxy)
+
+    asyncio.run(run())
+
+    assert captured["geoip"] is True
+    assert captured["window"] == (1720, 900)
+    assert captured["firefox_user_prefs"]["dom.storageManager.prompt.testing.allow"] is True
+    assert captured["firefox_user_prefs"]["permissions.default.persistent-storage"] == 1
+    assert "locale" not in captured
+    assert captured["proxy"] == {"server": "socks5://japan.example:1080"}
+
+
+def test_camoufox_launch_repairs_missing_geoip_extra(tmp_path, monkeypatch) -> None:
+    events: list[str] = []
+
+    class NotInstalledGeoIPExtra(RuntimeError):
+        pass
+
+    class FakeCamoufox:
+        def __init__(self, **kwargs):
+            events.append("init")
+
+        async def __aenter__(self):
+            if events.count("enter") == 0:
+                events.append("enter")
+                raise NotInstalledGeoIPExtra("Please install the geoip extra to use this feature: pip install camoufox[geoip]")
+            events.append("enter")
+            return object()
+
+    monkeypatch.setattr(browser_module, "_load_async_camoufox", lambda: FakeCamoufox)
+    monkeypatch.setattr(browser_module, "_repair_camoufox_geoip_extra", lambda: events.append("repair"))
+    session = BrowserSession(
+        profile_dir=tmp_path / "profile",
+        headless=True,
+        slow_mo=0,
+        timeout_ms=1000,
+        browser_engine="camoufox",
+        camoufox_geoip=True,
+    )
+
+    asyncio.run(session._launch_camoufox(None))
+
+    assert events == ["init", "enter", "repair", "init", "enter"]
+
+
+def test_browser_locale_env_can_use_english(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("BROWSER_LOCALE", "en-US")
+
+    session = BrowserSession(
+        profile_dir=tmp_path / "profile",
+        headless=True,
+        slow_mo=0,
+        timeout_ms=1000,
+        browser_engine="camoufox",
+    )
+
+    assert session.browser_locale == "en-US"
+    assert session.browser_languages == ["en-US", "en"]
+
+
+def test_browser_session_rejects_unknown_engine(tmp_path) -> None:
+    try:
+        BrowserSession(
+            profile_dir=tmp_path / "profile",
+            headless=True,
+            slow_mo=0,
+            timeout_ms=1000,
+            browser_engine="firefox",
+        )
+    except ValueError as exc:
+        assert "BROWSER_ENGINE 不支持" in str(exc)
+    else:
+        raise AssertionError("unknown browser engine should fail")
+
+
+def test_load_async_camoufox_installs_when_missing(monkeypatch) -> None:
+    class FakeCamoufox:
+        pass
+
+    state = {"installed": False}
+
+    def fake_import():
+        return FakeCamoufox if state["installed"] else None
+
+    def fake_install() -> None:
+        state["installed"] = True
+
+    monkeypatch.setattr(browser_module, "_import_async_camoufox", fake_import)
+    monkeypatch.setattr(browser_module, "_install_camoufox_runtime", fake_install)
+
+    assert browser_module._load_async_camoufox() is FakeCamoufox
+    assert state["installed"] is True
+
+
+def test_load_async_camoufox_reports_import_failure_after_install(monkeypatch) -> None:
+    monkeypatch.setattr(browser_module, "_import_async_camoufox", lambda: None)
+    monkeypatch.setattr(browser_module, "_install_camoufox_runtime", lambda: None)
+
+    try:
+        browser_module._load_async_camoufox()
+    except RuntimeError as exc:
+        assert "仍无法导入" in str(exc)
+    else:
+        raise AssertionError("Camoufox import failure should fail after attempted install")
+
+
+def test_install_camoufox_runtime_runs_pip_and_fetch(monkeypatch) -> None:
+    commands: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+
+    def fake_run(command, check=False):
+        commands.append(command)
+        assert check is False
+        return Result()
+
+    monkeypatch.setattr(browser_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(browser_module.sys, "frozen", False, raising=False)
+
+    browser_module._install_camoufox_runtime()
+
+    assert commands == [
+        [browser_module.sys.executable, "-m", "pip", "install", "-U", browser_module._CAMOUFOX_REQUIREMENT],
+        [browser_module.sys.executable, "-m", "camoufox", "fetch"],
+    ]
+
+
+def test_bundled_camoufox_executable_is_detected(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "app"
+    executable = root / "tools" / "camoufox" / "camoufox.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr(browser_module, "resolve_path", lambda value: root / value)
+
+    assert browser_module._bundled_camoufox_executable() == executable
 
 
 def test_account_fingerprint_refreshes_cached_non_english_chinese_language(tmp_path, monkeypatch) -> None:
@@ -185,7 +394,7 @@ def test_account_fingerprint_refreshes_cached_non_english_chinese_language(tmp_p
     store = json.loads(store_path.read_text(encoding="utf-8"))
 
     assert fingerprint["profile_id"] != stale["profile_id"]
-    assert fingerprint["locale"] in {"en-US", "zh-CN"}
+    assert fingerprint["locale"] in {"en-US", "zh-CN", "zh-JP"}
     assert not any(str(item).startswith("ja") for item in fingerprint["languages"])
     assert store[key]["fingerprint"]["profile_id"] == fingerprint["profile_id"]
 

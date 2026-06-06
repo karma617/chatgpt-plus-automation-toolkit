@@ -3,14 +3,18 @@
 import asyncio
 import contextlib
 import hashlib
+import importlib
 import json
 import os
 import platform
 import random
 import secrets
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -19,6 +23,7 @@ from .utils import log, resolve_path
 
 
 _WINDOWS_VIEWPORTS = [
+    {"width": 1720, "height": 900},
     {"width": 1366, "height": 768},
     {"width": 1440, "height": 900},
     {"width": 1536, "height": 864},
@@ -26,6 +31,7 @@ _WINDOWS_VIEWPORTS = [
     {"width": 1680, "height": 1050},
     {"width": 1920, "height": 1080},
 ]
+_DEFAULT_BROWSER_WINDOW = {"width": 1720, "height": 900}
 _US_TIMEZONES = [
     "America/New_York",
     "America/Chicago",
@@ -35,11 +41,25 @@ _US_TIMEZONES = [
 ]
 _JP_TIMEZONES = ["Asia/Tokyo"]
 _DEFAULT_TIMEZONES = ["Asia/Shanghai", "Asia/Tokyo", "America/Los_Angeles"]
-_ALLOWED_BROWSER_LOCALES = ("en-US", "zh-CN")
+_ALLOWED_BROWSER_LOCALES = ("en-US", "zh-CN", "zh-JP")
 _ALLOWED_BROWSER_LANGUAGE_BASES = ("en", "zh")
 _FINGERPRINT_STORE_LOCK = threading.Lock()
 _FINGERPRINT_SCHEMA_VERSION = 3
 _BROWSER_FINGERPRINT_ENABLED_ENV = "BROWSER_FINGERPRINT_ENABLED"
+_BROWSER_ENGINE_ENV = "BROWSER_ENGINE"
+_BROWSER_LOCALE_ENV = "BROWSER_LOCALE"
+_BROWSER_ENGINE_CHROMIUM = "chromium"
+_BROWSER_ENGINE_CAMOUFOX = "camoufox"
+_BROWSER_ENGINE_ALIASES = {
+    "": _BROWSER_ENGINE_CHROMIUM,
+    "default": _BROWSER_ENGINE_CHROMIUM,
+    "playwright": _BROWSER_ENGINE_CHROMIUM,
+    "chrome": _BROWSER_ENGINE_CHROMIUM,
+    "chromium": _BROWSER_ENGINE_CHROMIUM,
+    "camoufox": _BROWSER_ENGINE_CAMOUFOX,
+}
+_CAMOUFOX_REQUIREMENT = "camoufox[geoip]>=0.4.11"
+_CAMOUFOX_INSTALL_LOCK = threading.Lock()
 
 
 def _u(value: str) -> str:
@@ -304,6 +324,89 @@ def _browser_fingerprint_enabled() -> bool:
     return _is_truthy(os.environ.get(_BROWSER_FINGERPRINT_ENABLED_ENV), False)
 
 
+def _normalize_browser_engine(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    engine = _BROWSER_ENGINE_ALIASES.get(raw)
+    if engine:
+        return engine
+    allowed = ", ".join(sorted({item for item in _BROWSER_ENGINE_ALIASES if item}))
+    raise ValueError(f"BROWSER_ENGINE 不支持: {value!r}，可选: {allowed}")
+
+
+def _import_async_camoufox() -> Any | None:
+    try:
+        module = importlib.import_module("camoufox.async_api")
+        return getattr(module, "AsyncCamoufox")
+    except ImportError:
+        return None
+
+
+def _install_camoufox_runtime() -> None:
+    if getattr(sys, "frozen", False):
+        raise RuntimeError("当前为打包版运行环境，无法在运行时安装 Camoufox；请在打包前安装并重新构建。")
+
+    commands = [
+        [sys.executable, "-m", "pip", "install", "-U", _CAMOUFOX_REQUIREMENT],
+        [sys.executable, "-m", "camoufox", "fetch"],
+    ]
+    for command in commands:
+        log("Camoufox 自动安装执行: " + " ".join(command))
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"Camoufox 自动安装失败，命令退出码 {result.returncode}: {' '.join(command)}")
+
+
+def _reload_camoufox_modules() -> None:
+    # camoufox.locale 会在导入时缓存 GeoIP extra 状态；补装后必须重载。
+    for module_name in ("camoufox.locale", "camoufox.utils", "camoufox.async_api"):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            importlib.reload(module)
+
+
+def _is_camoufox_geoip_extra_error(exc: BaseException) -> bool:
+    name = exc.__class__.__name__
+    text = str(exc).lower()
+    return name == "NotInstalledGeoIPExtra" or "geoip extra" in text or "camoufox[geoip]" in text
+
+
+def _repair_camoufox_geoip_extra() -> None:
+    log("检测到 Camoufox GeoIP extra 缺失，开始自动补装。")
+    _install_camoufox_runtime()
+    _reload_camoufox_modules()
+    log("Camoufox GeoIP extra 自动补装完成，继续启动浏览器。")
+
+
+def _load_async_camoufox() -> Any:
+    async_camoufox = _import_async_camoufox()
+    if async_camoufox:
+        return async_camoufox
+
+    with _CAMOUFOX_INSTALL_LOCK:
+        async_camoufox = _import_async_camoufox()
+        if async_camoufox:
+            return async_camoufox
+        log("检测到未安装 Camoufox，开始自动安装。")
+        _install_camoufox_runtime()
+        async_camoufox = _import_async_camoufox()
+        if async_camoufox:
+            log("Camoufox 自动安装完成，继续启动浏览器。")
+            return async_camoufox
+
+    raise RuntimeError("Camoufox 自动安装完成后仍无法导入，请检查 Python 环境与 pip 安装路径。")
+
+
+def _bundled_camoufox_executable() -> Path | None:
+    candidates = [
+        resolve_path("tools/camoufox/camoufox.exe"),
+        resolve_path("tools/camoufox/Cache/camoufox.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _region_hint_from_proxy(proxy: str | None) -> str:
     text = (proxy or "").lower()
     if any(key in text for key in ("japan", ".jp", "tokyo", "osaka", "jp-")):
@@ -328,13 +431,31 @@ def _actual_chrome_major() -> int:
 
 def _browser_languages_for_locale(locale: str) -> list[str]:
     normalized = str(locale or "").strip()
+    if normalized.lower() == "zh-jp":
+        return ["zh-JP", "zh-CN", "zh", "en-US", "en"]
     if normalized.lower().startswith("zh"):
         return ["zh-CN", "zh", "en-US", "en"]
     return ["en-US", "en"]
 
 
+def _normalize_browser_locale(value: str | None, default: str = "zh-JP") -> str:
+    raw = str(value or "").strip().replace("_", "-")
+    if not raw:
+        return default
+    lowered = raw.lower()
+    if lowered in {"zh-jp", "jp", "jp-zh", "chinese-japan", "中文-日本"}:
+        return "zh-JP"
+    if lowered in {"zh", "zh-cn", "cn", "chinese", "中文"}:
+        return "zh-CN"
+    if lowered in {"en", "en-us", "us", "english", "英文"}:
+        return "en-US"
+    return default
+
+
 def _accept_language_header(languages: object) -> str:
     values = [str(item or "").strip() for item in languages if str(item or "").strip()] if isinstance(languages, list) else []
+    if values and values[0].lower() == "zh-jp":
+        return "zh-JP,zh-CN;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6"
     if values and values[0].lower().startswith("zh"):
         return "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
     return "en-US,en;q=0.9"
@@ -719,6 +840,10 @@ class BrowserSession:
         fingerprint_seed: str | None = None,
         account_id: str | None = None,
         log_prefix: str = "",
+        browser_engine: str | None = None,
+        camoufox_executable_path: str | None = None,
+        camoufox_geoip: bool | None = None,
+        browser_locale: str | None = None,
         **kwargs,
     ):
         self.profile_dir = resolve_path(profile_dir)
@@ -731,14 +856,34 @@ class BrowserSession:
         self.fingerprint_seed = fingerprint_seed
         self.account_id = account_id
         self.log_prefix = log_prefix
+        self.browser_engine = _normalize_browser_engine(browser_engine or os.environ.get(_BROWSER_ENGINE_ENV))
+        self.browser_locale = _normalize_browser_locale(
+            browser_locale if browser_locale is not None else os.environ.get(_BROWSER_LOCALE_ENV)
+        )
+        self.browser_languages = _browser_languages_for_locale(self.browser_locale)
+        self.camoufox_executable_path = str(
+            camoufox_executable_path
+            if camoufox_executable_path is not None
+            else os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "")
+        ).strip()
+        if camoufox_geoip is None:
+            self.camoufox_geoip = _is_truthy(os.environ.get("CAMOUFOX_GEOIP"), False)
+        elif isinstance(camoufox_geoip, str):
+            self.camoufox_geoip = _is_truthy(camoufox_geoip, False)
+        else:
+            self.camoufox_geoip = bool(camoufox_geoip)
         self.fingerprint = None
-        if _browser_fingerprint_enabled():
+        if self.browser_engine == _BROWSER_ENGINE_CHROMIUM and _browser_fingerprint_enabled():
             self.fingerprint = (
                 get_or_create_account_fingerprint(account_id, proxy, log_prefix=log_prefix)
                 if str(account_id or "").strip()
                 else _build_fingerprint(fingerprint_seed, proxy)
             )
+            # 浏览器 UI 语言只允许中/英；代理国家不应把页面文案带到日文等其他语言。
+            self.fingerprint["locale"] = self.browser_locale
+            self.fingerprint["languages"] = list(self.browser_languages)
         self._playwright = None
+        self._camoufox_context: Any | None = None
         self._browser: Browser | None = None
         self._proxy_bridge: Socks5AuthProxyBridge | None = None
         self.context: BrowserContext | None = None
@@ -747,34 +892,102 @@ class BrowserSession:
     async def __aenter__(self) -> "BrowserSession":
         try:
             proxy, self._proxy_bridge = await prepare_proxy_for_playwright(self.proxy)
-            self._playwright = await async_playwright().start()
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-gpu",
-            ]
-            if self.fingerprint:
-                launch_args.append(f"--lang={self.fingerprint.get('locale') or 'en-US'}")
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless,
-                slow_mo=self.slow_mo,
-                args=launch_args,
-                proxy=proxy,
-            )
+            self._browser = await self._launch_browser(proxy)
             self.context = await self._browser.new_context(**self._context_options())
         except Exception:
             await self.__aexit__(None, None, None)
             raise
         self.context.set_default_timeout(self.timeout_ms)
+        with contextlib.suppress(Exception):
+            await self.context.grant_permissions(["persistent-storage"], origin="https://chatgpt.com")
         if self.fingerprint:
             await _apply_context_fingerprint(self.context, self.fingerprint)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         return self
 
+    async def _launch_browser(self, proxy: dict[str, str] | None) -> Browser:
+        if self.browser_engine == _BROWSER_ENGINE_CAMOUFOX:
+            return await self._launch_camoufox(proxy)
+        return await self._launch_chromium(proxy)
+
+    async def _launch_chromium(self, proxy: dict[str, str] | None) -> Browser:
+        self._playwright = await async_playwright().start()
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-gpu",
+            f"--window-size={_DEFAULT_BROWSER_WINDOW['width']},{_DEFAULT_BROWSER_WINDOW['height']}",
+        ]
+        if self.fingerprint:
+            launch_args.append(f"--lang={self.fingerprint.get('locale') or 'en-US'}")
+        return await self._playwright.chromium.launch(
+            headless=self.headless,
+            slow_mo=self.slow_mo,
+            args=launch_args,
+            proxy=proxy,
+        )
+
+    async def _launch_camoufox(self, proxy: dict[str, str] | None) -> Browser:
+        AsyncCamoufox = await asyncio.to_thread(_load_async_camoufox)
+
+        launch_kwargs: dict[str, object] = {
+            "headless": self.headless,
+            "slow_mo": self.slow_mo,
+            # 固定窗口尺寸，避免套餐页右下角地区控件落到屏幕外。
+            "window": (_DEFAULT_BROWSER_WINDOW["width"], _DEFAULT_BROWSER_WINDOW["height"]),
+            "firefox_user_prefs": {
+                # 自动允许 StorageManager.persist()，避免左上角权限弹窗遮挡支付方式按钮。
+                "dom.storageManager.enabled": True,
+                "dom.storageManager.prompt.testing": True,
+                "dom.storageManager.prompt.testing.allow": True,
+                "permissions.default.persistent-storage": 1,
+            },
+        }
+        if platform.system().lower() == "windows":
+            launch_kwargs["os"] = "windows"
+        if proxy:
+            launch_kwargs["proxy"] = proxy
+        # 显式传入，避免 Camoufox 在代理场景下误用默认 GeoIP 行为。
+        launch_kwargs["geoip"] = self.camoufox_geoip
+        # 不在 Camoufox launch 层传 locale。Camoufox 0.4.11 会把 Intl.DisplayNames
+        # 的 region 名称全部伪装成当前地区，导致套餐页国家列表全显示为“日本/美国”。
+        # 语言与 Accept-Language 由 Playwright context 控制，仍保持中文界面与日区偏好。
+        executable_path = str(resolve_path(self.camoufox_executable_path)) if self.camoufox_executable_path else ""
+        if not executable_path:
+            bundled_executable = _bundled_camoufox_executable()
+            executable_path = str(bundled_executable) if bundled_executable else ""
+        if executable_path:
+            launch_kwargs["executable_path"] = executable_path
+        # Camoufox 自带 Firefox 指纹面，不能再叠加本项目的 Chrome UA/JS 指纹。
+        self._camoufox_context = AsyncCamoufox(**launch_kwargs)
+        try:
+            return await self._camoufox_context.__aenter__()
+        except Exception as exc:
+            self._camoufox_context = None
+            if not _is_camoufox_geoip_extra_error(exc):
+                raise
+            await asyncio.to_thread(_repair_camoufox_geoip_extra)
+            AsyncCamoufox = await asyncio.to_thread(_load_async_camoufox)
+            self._camoufox_context = AsyncCamoufox(**launch_kwargs)
+            return await self._camoufox_context.__aenter__()
+
     def _context_options(self) -> dict[str, object]:
+        language_options: dict[str, object] = {
+            "locale": self.browser_locale,
+            "viewport": dict(_DEFAULT_BROWSER_WINDOW),
+            "screen": {
+                "width": _DEFAULT_BROWSER_WINDOW["width"],
+                "height": _DEFAULT_BROWSER_WINDOW["height"],
+                "availWidth": _DEFAULT_BROWSER_WINDOW["width"],
+                "availHeight": _DEFAULT_BROWSER_WINDOW["height"] - 40,
+            },
+            "extra_http_headers": {
+                "Accept-Language": _accept_language_header(self.browser_languages),
+            },
+        }
         if not self.fingerprint:
-            return {}
+            return language_options
         return {
             "viewport": self.fingerprint["viewport"],
             "screen": self.fingerprint["screen"],
@@ -801,16 +1014,49 @@ class BrowserSession:
         self.page = await self.context.new_page()
         return self.page
 
+    async def _safe_close(self, label: str, closer) -> None:
+        """关闭浏览器资源；driver 已断开时只记日志，不覆盖主流程结果。"""
+        try:
+            await closer()
+        except Exception as exc:
+            text = str(exc)
+            if any(
+                marker in text
+                for marker in (
+                    "Connection closed while reading from the driver",
+                    "Target page, context or browser has been closed",
+                    "Browser has been closed",
+                    "Event loop is closed",
+                )
+            ):
+                if self.log_prefix:
+                    print(f"{self.log_prefix} browser cleanup ignored: {label}: {text}", flush=True)
+                return
+            raise
+
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self.context:
-            await self.context.close()
+            await self._safe_close("context", self.context.close)
             self.context = None
         if self._browser:
-            await self._browser.close()
+            if self._camoufox_context:
+                await self._safe_close(
+                    "camoufox",
+                    lambda: self._camoufox_context.__aexit__(exc_type, exc, tb),
+                )
+                self._camoufox_context = None
+            else:
+                await self._safe_close("browser", self._browser.close)
             self._browser = None
         if self._playwright:
-            await self._playwright.stop()
+            await self._safe_close("playwright", self._playwright.stop)
             self._playwright = None
+        if self._camoufox_context:
+            await self._safe_close(
+                "camoufox",
+                lambda: self._camoufox_context.__aexit__(exc_type, exc, tb),
+            )
+            self._camoufox_context = None
         if self._proxy_bridge:
-            await self._proxy_bridge.close()
+            await self._safe_close("proxy_bridge", self._proxy_bridge.close)
             self._proxy_bridge = None

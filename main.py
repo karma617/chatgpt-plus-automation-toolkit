@@ -157,8 +157,16 @@ def apply_env_config(cfg: dict, env_path: str = ".env", flow_key: str = "") -> d
     if mail_source:
         configure_mail_source(cfg, mail_source)
     use_proxy = env_bool(env.get("USE_PROXY"), default=bool(cfg.get("browser", {}).get("use_proxy", False)))
-    cfg.setdefault("browser", {})["use_proxy"] = use_proxy
-    cfg["browser"]["proxy_file"] = env.get("PROXY_FILE") or cfg["browser"].get("proxy_file", "data/proxies/proxies.txt")
+    browser_cfg = cfg.setdefault("browser", {})
+    default_camoufox_geoip = browser_cfg.get("camoufox_geoip", False)
+    if isinstance(default_camoufox_geoip, str):
+        default_camoufox_geoip = env_bool(default_camoufox_geoip, default=False)
+    browser_cfg["engine"] = env.get("BROWSER_ENGINE") or browser_cfg.get("engine", "chromium")
+    browser_cfg["locale"] = env.get("BROWSER_LOCALE") or browser_cfg.get("locale", "zh-JP")
+    browser_cfg["camoufox_executable_path"] = env.get("CAMOUFOX_EXECUTABLE_PATH") or browser_cfg.get("camoufox_executable_path", "")
+    browser_cfg["camoufox_geoip"] = env_bool(env.get("CAMOUFOX_GEOIP"), default=bool(default_camoufox_geoip))
+    browser_cfg["use_proxy"] = use_proxy
+    browser_cfg["proxy_file"] = env.get("PROXY_FILE") or browser_cfg.get("proxy_file", "data/proxies/proxies.txt")
     cfg.setdefault("mail", {})["account_mode"] = env.get("MAIL_ACCOUNT_MODE") or cfg.get("mail", {}).get("account_mode", "pool")
     cfg["mail"]["moemail_base_url"] = env.get("MOEMAIL_BASE_URL") or cfg["mail"].get("moemail_base_url", "")
     cfg["mail"]["moemail_api_key"] = env.get("MOEMAIL_API_KEY") or cfg["mail"].get("moemail_api_key", "")
@@ -446,6 +454,7 @@ async def run_account(
     browser_cfg = cfg["browser"]
     log(
         f"{prefix} 浏览器配置: headless={bool(browser_cfg.get('headless', False))}, "
+        f"engine={browser_cfg.get('engine', 'chromium')}, "
         f"proxy={display_proxy(proxy)}"
     )
     profile_dir = resolve_path("profiles") / safe_filename(account.email)
@@ -460,6 +469,10 @@ async def run_account(
         fingerprint_seed=f"{account.email}|main",
         account_id=account.email,
         log_prefix=prefix,
+        browser_engine=browser_cfg.get("engine"),
+        browser_locale=browser_cfg.get("locale"),
+        camoufox_executable_path=browser_cfg.get("camoufox_executable_path"),
+        camoufox_geoip=browser_cfg.get("camoufox_geoip"),
     )
     try:
         await session.__aenter__()

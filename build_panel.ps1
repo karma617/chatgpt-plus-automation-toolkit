@@ -109,6 +109,34 @@ function Remove-DeprecatedEnvKeys {
     Set-Content -LiteralPath $Path -Value $filtered -Encoding UTF8
 }
 
+function Patch-PlaywrightCoreBundle {
+    param([string]$Root)
+    $bundlePath = Join-Path $Root "_internal\playwright\driver\package\lib\coreBundle.js"
+    if (-not (Test-Path $bundlePath)) {
+        return
+    }
+    $old = @'
+            location: {
+              url: pageError.location.url,
+              line: pageError.location.lineNumber,
+              column: pageError.location.columnNumber
+            }
+'@
+    $new = @'
+            location: {
+              url: pageError.location?.url || "",
+              line: pageError.location?.lineNumber || 0,
+              column: pageError.location?.columnNumber || 0
+            }
+'@
+    $text = Get-Content -LiteralPath $bundlePath -Raw -Encoding UTF8
+    if ($text.Contains($old)) {
+        $text = $text.Replace($old, $new)
+        Set-Content -LiteralPath $bundlePath -Value $text -Encoding UTF8
+        Write-Host "[build] Patch Playwright coreBundle pageError location guard"
+    }
+}
+
 # Preserve runtime state in existing dist so rebuild does not re-import consumed pools.
 if (Test-Path $RuntimeBackupRoot) {
     try {
@@ -201,6 +229,22 @@ foreach ($file in $RuntimeStateFiles) {
     }
 }
 
+$CamoufoxTarget = Join-Path $DistRoot "tools\camoufox"
+try {
+    $CamoufoxSource = (& $Python -m camoufox path 2>$null | Select-Object -Last 1)
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($CamoufoxSource) -and (Test-Path -LiteralPath $CamoufoxSource)) {
+        if (Test-Path -LiteralPath $CamoufoxTarget) {
+            Remove-Item -LiteralPath $CamoufoxTarget -Recurse -Force -ErrorAction Stop
+        }
+        Write-Host "[build] Copy Camoufox browser"
+        Copy-Item -LiteralPath $CamoufoxSource -Destination $CamoufoxTarget -Recurse -Force
+    } else {
+        Write-Warning "Camoufox browser cache not found. Run: $Python -m camoufox fetch"
+    }
+} catch {
+    Write-Warning "Camoufox browser copy skipped: $_"
+}
+
 $buildIncludeEnv = [string]$env:BUILD_INCLUDE_PLAYWRIGHT_BROWSERS
 if ([string]::IsNullOrWhiteSpace($buildIncludeEnv)) {
     $IncludePlaywrightBrowsers = $true
@@ -222,6 +266,8 @@ if ($IncludePlaywrightBrowsers) {
 } else {
     Write-Host "[build] Skip Playwright browser cache copy (minimal package mode)"
 }
+
+Patch-PlaywrightCoreBundle -Root $DistRoot
 
 # Minimal package: do not bundle runtime artifacts that can grow very large.
 foreach ($name in @("logs")) {

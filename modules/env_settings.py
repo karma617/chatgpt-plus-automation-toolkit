@@ -36,6 +36,10 @@ SETTINGS: list[SettingItem] = [
     SettingItem("FREE_MAIL_SOURCE", "Free 邮箱源", "基础设置", "choice", ("moemail", "hotmail", "icloud_query"), help_text="Free 注册专用邮箱源；当前建议使用 moemail。"),
     SettingItem("USE_PROXY", "浏览器代理", "基础设置", "bool", help_text="开启后浏览器会从代理池取代理。"),
     SettingItem("PROXY_FILE", "代理池文件", "基础设置"),
+    SettingItem("BROWSER_ENGINE", "浏览器内核", "基础设置", "choice", ("chromium", "camoufox"), help_text="任务使用的浏览器：chromium 为 Playwright 默认浏览器；camoufox 未安装时会自动安装。"),
+    SettingItem("BROWSER_LOCALE", "浏览器语言/地区", "基础设置", "choice", ("zh-JP", "zh-CN", "en-US"), help_text="默认 zh-JP：中文界面且套餐页默认日本地区；日本代理仍按日本出口执行。"),
+    SettingItem("CAMOUFOX_EXECUTABLE_PATH", "Camoufox 路径", "基础设置", help_text="可选；留空使用 Camoufox 默认下载的浏览器。"),
+    SettingItem("CAMOUFOX_GEOIP", "Camoufox GeoIP", "基础设置", "bool", help_text="开启后让 Camoufox 按代理 IP 推断地理位置；无代理时通常保持关闭。"),
     SettingItem("REGISTER_ONLY_MODE", _u(r"\u4ec5\u6ce8\u518c\u65b9\u5f0f"), _u(r"\u4ec5\u6ce8\u518c"), "choice", ("email", "phone"), help_text=_u(r"\u4ec5\u6ce8\u518c\u8d26\u53f7\u6309\u94ae\u4f7f\u7528\u7684\u6ce8\u518c\u65b9\u5f0f\u3002"), section=_u(r"\u4ec5\u6ce8\u518c")),
     SettingItem("REGISTER_ONLY_MAX_ATTEMPTS", _u(r"\u4ec5\u6ce8\u518c\u6700\u5927\u5c1d\u8bd5\u6b21\u6570"), _u(r"\u4ec5\u6ce8\u518c"), "int", help_text=_u(r"\u7559\u7a7a\u65f6\u9ed8\u8ba4\u4e3a\u76ee\u6807\u6210\u529f\u6570 x 3\uff0c\u9632\u6b62\u5931\u8d25\u540e\u65e0\u9650\u91cd\u5f00\u6d4f\u89c8\u5668\u3002"), section=_u(r"\u4ec5\u6ce8\u518c")),
     SettingItem("FLARESOLVERR_ENABLED", _u(r"FlareSolverr \u5f00\u5173"), _u(r"Cloudflare \u9a8c\u8bc1"), "bool", help_text=_u(r"\u767b\u5f55\u72b6\u6001\u673a\u9047\u5230 Cloudflare managed challenge \u4e14 Playwright \u4f4e\u9891\u70b9\u51fb/\u7b49\u5f85\u65e0\u6cd5\u63a8\u8fdb\u65f6\uff0c\u8c03\u7528 FlareSolverr \u83b7\u53d6\u5e76\u56de\u653e cookie\u3002"), section=_u(r"Cloudflare \u9a8c\u8bc1")),
@@ -331,6 +335,8 @@ WIZARD_SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
             "FREE_MAIL_SOURCE",
             "FREE_SMS_ENABLED",
             "USE_PROXY",
+            "BROWSER_ENGINE",
+            "BROWSER_LOCALE",
             "GOPAY_UNLINK_AFTER_SUCCESS",
         ),
     ),
@@ -436,6 +442,10 @@ WIZARD_SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
             "MOEMAIL_CREATE_MODE",
             "USE_PROXY",
             "PROXY_FILE",
+            "BROWSER_ENGINE",
+            "BROWSER_LOCALE",
+            "CAMOUFOX_EXECUTABLE_PATH",
+            "CAMOUFOX_GEOIP",
             "SMS_ENABLED",
             "SMS_PROVIDER",
             "HERO_SMS_API_KEY",
@@ -729,6 +739,7 @@ def config_status(values: dict[str, str]) -> dict[str, str]:
         "截图": "成功保留" if is_true(values.get("FLOW2_SAVE_SUCCESS_SCREENSHOTS", "")) else "仅失败",
         "HTML": "保留" if is_true(values.get("FLOW2_SAVE_HTML", "")) else "少写",
         "代理": "开" if is_true(values.get("USE_PROXY", "")) else "关",
+        "浏览器": f"{values.get('BROWSER_ENGINE', '').strip() or 'camoufox'} / {values.get('BROWSER_LOCALE', '').strip() or 'zh-JP'}",
         "邮箱源": values.get("MAIL_SOURCE", "") or "-",
         "流程一": flow_summary(values, "FLOW1"),
         "流程三": flow_summary(values, "FLOW3"),
@@ -753,7 +764,7 @@ def render_header(title: str, original_values: dict[str, str], values: dict[str,
     dirty = dirty_count(original_values, values)
     print(paint("Config Center", MAGENTA, bold=True), paint(f"  {title}", CYAN, bold=True))
     print(
-        f"状态: Flow2={status['Flow2']} | Bridge={status['Bridge']} | ADB={status['ADB']} | "
+        f"状态: Browser={status['浏览器']} | Flow2={status['Flow2']} | Bridge={status['Bridge']} | ADB={status['ADB']} | "
         f"PIN={status['PIN']} | 流程一={status['流程一']} | Free={status['Free']} | 未保存={dirty}"
     )
     print()

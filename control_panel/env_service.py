@@ -92,6 +92,10 @@ KNOWN_ENV_FIELDS = [
     "USE_PROXY",
     "REGISTER_LOCAL_PROXY_URL",
     "PROXY_FILE",
+    "BROWSER_ENGINE",
+    "BROWSER_LOCALE",
+    "CAMOUFOX_EXECUTABLE_PATH",
+    "CAMOUFOX_GEOIP",
     "MAIL_SOURCE",
     "FLOW1_MAIL_SOURCE",
     "FLOW3_MAIL_SOURCE",
@@ -265,6 +269,10 @@ ENV_FIELD_LABELS = {
     "USE_PROXY": _u(r"\u6ce8\u518c\u6d41\u7a0b\u4f7f\u7528\u4ee3\u7406"),
     "REGISTER_LOCAL_PROXY_URL": _u(r"\u6ce8\u518c\u6d41\u7a0b\u672c\u5730\u4ee3\u7406\u5730\u5740"),
     "PROXY_FILE": _u(r"\u6ce8\u518c\u6d41\u7a0b\u4ee3\u7406\u6587\u4ef6"),
+    "BROWSER_ENGINE": _u(r"\u4efb\u52a1\u6d4f\u89c8\u5668\u5185\u6838"),
+    "BROWSER_LOCALE": _u(r"\u4efb\u52a1\u6d4f\u89c8\u5668\u8bed\u8a00"),
+    "CAMOUFOX_EXECUTABLE_PATH": _u(r"Camoufox \u6d4f\u89c8\u5668\u8def\u5f84"),
+    "CAMOUFOX_GEOIP": _u(r"Camoufox GeoIP \u5f00\u5173"),
     "MAIL_SOURCE": _u(r"\u9ed8\u8ba4\u90ae\u7bb1\u6765\u6e90"),
     "FLOW1_MAIL_SOURCE": _u(r"\u6d41\u7a0b1\u90ae\u7bb1\u6765\u6e90"),
     "FLOW3_MAIL_SOURCE": _u(r"\u6d41\u7a0b3\u90ae\u7bb1\u6765\u6e90"),
@@ -430,6 +438,10 @@ ENV_FIELD_GROUPS = {
     "USE_PROXY": _u(r"\u4ee3\u7406"),
     "REGISTER_LOCAL_PROXY_URL": _u(r"\u4ee3\u7406"),
     "PROXY_FILE": _u(r"\u4ee3\u7406"),
+    "BROWSER_ENGINE": _u(r"\u6d4f\u89c8\u5668"),
+    "BROWSER_LOCALE": _u(r"\u6d4f\u89c8\u5668"),
+    "CAMOUFOX_EXECUTABLE_PATH": _u(r"\u6d4f\u89c8\u5668"),
+    "CAMOUFOX_GEOIP": _u(r"\u6d4f\u89c8\u5668"),
     "PAYPAL_CARD_REDEEM_API_KEY": _u(r"PayPal \u5361\u5bc6"),
     "PAYPAL_CARD_REDEEM_ENABLED": _u(r"PayPal \u5361\u5bc6"),
     "PAYPAL_CARD_REDEEM_API_URL": _u(r"PayPal \u5361\u5bc6"),
@@ -571,6 +583,10 @@ ENV_FIELD_TOOLTIPS.update({
     "USE_PROXY": _u(r"\u6ce8\u518c\u6d41\u7a0b\u7684\u5168\u5c40\u4ee3\u7406\u5f00\u5173\u3002true \u65f6\u4ece\u6ce8\u518c\u4ee3\u7406\u6c60\u53d6\u4ee3\u7406\uff1bfalse \u6216\u7559\u7a7a\u65f6\u4f7f\u7528\u6ce8\u518c\u6d41\u7a0b\u672c\u5730\u4ee3\u7406\u5730\u5740\uff0c\u9ed8\u8ba4 http://127.0.0.1:7897\u3002"),
     "REGISTER_LOCAL_PROXY_URL": _u(r"\u6ce8\u518c\u6d41\u7a0b\u4ee3\u7406\u6c60\u672a\u542f\u7528\u6216\u4e3a\u7a7a\u65f6\u4f7f\u7528\u7684\u672c\u5730\u4ee3\u7406\u3002\u9ed8\u8ba4 http://127.0.0.1:7897\u3002"),
     "PROXY_FILE": _u(r"\u5168\u5c40\u4ee3\u7406\u6c60\u6587\u4ef6\u3002USE_PROXY=true \u65f6\u751f\u6548\uff0c\u4e00\u822c\u7528\u4e8e ChatGPT \u6ce8\u518c\u3001\u6388\u6743\u3001Free \u6ce8\u518c\u7b49\u975e PayPal \u4e13\u7528\u6d41\u7a0b\u3002"),
+    "BROWSER_ENGINE": _u(r"\u9009\u62e9\u4efb\u52a1\u4f7f\u7528\u7684\u6d4f\u89c8\u5668\u3002chromium=\u9879\u76ee\u539f Playwright Chromium\uff1bcamoufox=Camoufox \u6307\u7eb9\u6d4f\u89c8\u5668\uff0c\u672a\u5b89\u88c5\u65f6\u4f1a\u81ea\u52a8\u5b89\u88c5\u5e76 fetch\u3002"),
+    "BROWSER_LOCALE": _u(r"\u9650\u5236\u6d4f\u89c8\u5668\u9875\u9762\u8bed\u8a00\u548c\u5730\u533a\u3002\u9ed8\u8ba4 zh-JP\uff1a\u4e2d\u6587\u754c\u9762\uff0c\u5957\u9910\u9875\u9ed8\u8ba4\u65e5\u672c\u5730\u533a\uff1b\u968f\u540e\u81ea\u52a8\u5207\u6362\u5230\u7f8e\u56fd\u3002"),
+    "CAMOUFOX_EXECUTABLE_PATH": _u(r"\u53ef\u9009\u3002\u6307\u5b9a Camoufox/Firefox \u53ef\u6267\u884c\u6587\u4ef6\u8def\u5f84\uff1b\u7559\u7a7a\u65f6\u4f7f\u7528 camoufox fetch \u4e0b\u8f7d\u7684\u9ed8\u8ba4\u6d4f\u89c8\u5668\u3002"),
+    "CAMOUFOX_GEOIP": _u(r"\u5f00\u542f\u540e\u8ba9 Camoufox \u6309\u4ee3\u7406 IP \u63a8\u65ad\u5730\u7406\u4f4d\u7f6e\uff1b\u65e0\u4ee3\u7406\u6216\u4e0d\u9700\u8981\u65f6\u4fdd\u6301 false\u3002"),
     "MAIL_SOURCE": _u(r"\u9ed8\u8ba4\u90ae\u7bb1\u6765\u6e90\u3002\u5f53\u67d0\u4e2a\u6d41\u7a0b\u6ca1\u6709\u5355\u72ec\u914d\u7f6e\u90ae\u7bb1\u6765\u6e90\u65f6\uff0c\u4f1a\u4f7f\u7528\u8fd9\u4e2a\u503c\u3002"),
     "FLOW1_MAIL_SOURCE": _u(r"\u6d41\u7a0b1/\u751f\u6210\u957f\u94fe\u63a5\u6ce8\u518c\u9636\u6bb5\u7684\u90ae\u7bb1\u6765\u6e90\u3002\u4e5f\u4f1a\u5f71\u54cd\u4ec5\u6ce8\u518c\u4e2d\u590d\u7528\u7684\u6ce8\u518c\u8d26\u53f7\u6d41\u7a0b\u3002"),
     "FLOW3_MAIL_SOURCE": _u(r"\u6d41\u7a0b3/OAuth \u6388\u6743\u767b\u5f55\u65f6\u7684\u90ae\u7bb1\u6765\u6e90\u3002\u7528\u4e8e\u9700\u8981\u4ece\u90ae\u7bb1\u53d6\u767b\u5f55\u9a8c\u8bc1\u7801\u7684\u573a\u666f\u3002"),
@@ -625,6 +641,8 @@ CAPTCHA_MODE_CHOICES = ("manual", "api")
 CAPTCHA_PROVIDER_CHOICES = ("capsolver", "twocaptcha", "yescaptcha")
 UPLOAD_TARGET_CHOICES = ("cpa", "sub2api", "both", "none")
 AUTH_SCHEME_CHOICES = ("", "Bearer")
+BROWSER_ENGINE_CHOICES = ("chromium", "camoufox")
+BROWSER_LOCALE_CHOICES = ("zh-JP", "zh-CN", "en-US")
 PAYPAL_CHECKOUT_METHOD_CHOICES = (
     _u(r"\u81ea\u52a8\u515c\u5e95"),
     _u(r"\u5c0f\u9e21\u6bdb\u306e\u516c\u76ca\u4e91\u7aef"),
@@ -662,6 +680,9 @@ ENV_FIELD_CHOICES = {
     "PAYPAL_CHECKOUT_METHOD": PAYPAL_CHECKOUT_METHOD_CHOICES,
     "PAYPAL_CHECKOUT_LOCAL_GENERATOR_LINK_TYPE": PAYPAL_CHECKOUT_LOCAL_GENERATOR_LINK_TYPE_CHOICES,
     "USE_PROXY": BOOL_CHOICES,
+    "BROWSER_ENGINE": BROWSER_ENGINE_CHOICES,
+    "BROWSER_LOCALE": BROWSER_LOCALE_CHOICES,
+    "CAMOUFOX_GEOIP": BOOL_CHOICES,
     "MAIL_SOURCE": MAIL_SOURCE_CHOICES,
     "FLOW1_MAIL_SOURCE": MAIL_SOURCE_CHOICES,
     "FLOW3_MAIL_SOURCE": MAIL_SOURCE_CHOICES,

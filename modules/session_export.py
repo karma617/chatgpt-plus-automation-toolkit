@@ -127,6 +127,7 @@ def extract_session_record(
         "source_format": source_format,
         "code_address": code_address,
         "payment_link": payment_link,
+        "session_json": session,
         "access_token": access_token,
         "session_token": session_token,
         "account_id": account_id,

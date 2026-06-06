@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import random
@@ -34,6 +35,7 @@ from .paypal_phone_pool import PhoneInfo, PhonePool
 from .proxy_config import local_proxy_url, paypal_flow2_proxy_enabled, paypal_flow2_proxy_file
 from .storage import MailAccount, parse_mail_line
 from .utils import load_env, log, resolve_path, safe_filename
+from .zenpic_short_link import create_zenpic_short_link, find_session_text_for_email
 
 
 PAYPAL_OUTPUT_ROOT = resolve_path("output/paypal注册")
@@ -41,10 +43,11 @@ LINK_POOL_FILE = PAYPAL_OUTPUT_ROOT / "长链接账号" / "account.txt"
 PENDING_AUTH_DIR = PAYPAL_OUTPUT_ROOT / "待授权账号"
 PENDING_AUTH_FILE = PENDING_AUTH_DIR / "account.txt"
 REGISTER_ONLY_SUMMARY_FILE = resolve_path("output/register_only/registered_sessions.txt")
-PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_SHORT_LINK_US_PAY_JP_PROXY_2026-06-05_01"
+PAYPAL_FLOW2_CODE_VERSION = "PAYPAL_ZENPIC_JP_NOCARD_2026-06-07_01"
 PAYPAL_FLOW2_NONZERO_AMOUNT = "nonzero_checkout_amount"
 PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT = "stripe_paypal_redirect_timeout"
 PAYPAL_FLOW2_RECREATE_LINK = "generated_payment_link_invalid_recreate"
+PAYPAL_FLOW2_NO_PAYPAL_OPTION = "short_offer_checkout_no_paypal_option"
 PAYPAL_FLOW2_RECREATE_LINK_MAX = 3
 PAYPAL_FLOW2_JP_PROXY_COUNTRY_MISMATCH = "jp_short_link_proxy_country_mismatch"
 PAYPAL_PAYMENT_MODE_LONG_LINK = "long_link"
@@ -56,6 +59,8 @@ PAYPAL_FLOW2_RECREATE_METHOD_ORDER = (
     CHECKOUT_METHOD_LOCAL_GENERATOR,
     CHECKOUT_METHOD_BROWSER_CHECKOUT,
 )
+_CHATGPT_OFFER_SURFACE_MAX_ATTEMPTS = 36
+_CHATGPT_OFFER_DEBUG_KEYS: set[str] = set()
 
 
 def _zh(text: str) -> str:
@@ -96,6 +101,33 @@ _RANDOM_CARD_PROFILES_JP: list[tuple[str, str, str, str, str]] = [
     ("Sendai", "Miyagi", "9800004", "Aoba Ichibancho 1-7", "JP"),
     ("Hiroshima", "Hiroshima", "7300011", "Naka Motomachi 1-3", "JP"),
 ]
+
+_STRIPE_STABLE_US_BILLING_PROFILES: list[tuple[str, str, str, str]] = [
+    ("350 5th Ave", "New York", "NY", "10118"),
+    ("11 Wall St", "New York", "NY", "10005"),
+    ("1 Apple Park Way", "Cupertino", "CA", "95014"),
+    ("1600 Amphitheatre Pkwy", "Mountain View", "CA", "94043"),
+    ("500 Terry A Francois Blvd", "San Francisco", "CA", "94158"),
+    ("1 Microsoft Way", "Redmond", "WA", "98052"),
+    ("410 Terry Ave N", "Seattle", "WA", "98109"),
+    ("600 Congress Ave", "Austin", "TX", "78701"),
+    ("233 S Wacker Dr", "Chicago", "IL", "60606"),
+    ("4059 Mt Lee Dr", "Los Angeles", "CA", "90068"),
+]
+
+_US_STATE_NAMES: dict[str, str] = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
+    "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "DC": "District of Columbia", "FL": "Florida",
+    "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana",
+    "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine",
+    "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire",
+    "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota",
+    "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island",
+    "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia", "WI": "Wisconsin",
+    "WY": "Wyoming",
+}
 
 _MEIGUODIZHI_ADDRESS_URL = "https://www.meiguodizhi.com/api/v1/dz"
 _BILLING_ADDRESS_REGION_PATHS = {
@@ -242,6 +274,12 @@ def _billing_country_code(region_mode: str) -> str:
     return "JP" if _normalize_flow2_region_mode(region_mode) == "jp" else "US"
 
 
+def _pick_stripe_stable_us_billing_profile(seed_key: str) -> tuple[str, str, str, str]:
+    """为 Stripe hosted checkout 选稳定 US 地址，避免随机街道触发不可匹配的 Google 建议。"""
+    seed = int(hashlib.sha256(str(seed_key or "").encode("utf-8")).hexdigest()[:8], 16)
+    return _STRIPE_STABLE_US_BILLING_PROFILES[seed % len(_STRIPE_STABLE_US_BILLING_PROFILES)]
+
+
 def _payment_form_country_code(region_mode: str, *, use_long_link: bool) -> str:
     # Short-link JP mode enters the official offer under a JP IP, then switches
     # the Stripe hosted checkout billing country to US before entering PayPal.
@@ -254,6 +292,14 @@ def _paypal_form_country_code(region_mode: str, *, use_long_link: bool) -> str:
     # The browser/proxy remains JP in short-link JP mode, but hosted checkout
     # and PayPal billing fields are filled as US.
     return _payment_form_country_code(region_mode, use_long_link=use_long_link)
+
+
+def _short_link_entry_uses_zenpic(region_mode: str, *, use_long_link: bool, card_source_mode: str | None) -> bool:
+    return (
+        _normalize_flow2_region_mode(region_mode) == "jp"
+        and not use_long_link
+        and str(card_source_mode or "").strip().lower() in {"local_random", "random_local", "local"}
+    )
 
 
 def _probe_flow2_proxy_country(proxy: str | None, required_country_code: str, timeout_sec: int = 12) -> tuple[bool, str]:
@@ -583,7 +629,7 @@ def _env_bool(env: dict[str, str], key: str, default: bool = False) -> bool:
 def paypal_payment_mode(env: dict[str, str]) -> str:
     raw = str(env.get("PAYPAL_PAYMENT_MODE") or "").strip()
     if not raw:
-        return PAYPAL_PAYMENT_MODE_LONG_LINK if _env_bool(env, "PAYPAL_USE_LONG_LINK", True) else PAYPAL_PAYMENT_MODE_SHORT_LINK
+        return PAYPAL_PAYMENT_MODE_LONG_LINK if _env_bool(env, "PAYPAL_USE_LONG_LINK", False) else PAYPAL_PAYMENT_MODE_SHORT_LINK
     normalized = raw.lower().replace("-", "_")
     compact = re.sub(r"[\s_]+", "", normalized)
     if compact in {
@@ -619,7 +665,7 @@ def paypal_payment_mode(env: dict[str, str]) -> str:
         return PAYPAL_PAYMENT_MODE_LONG_LINK
     if normalized in {PAYPAL_PAYMENT_MODE_SHORT_LINK, "short_link_payment"}:
         return PAYPAL_PAYMENT_MODE_SHORT_LINK
-    return PAYPAL_PAYMENT_MODE_LONG_LINK if _env_bool(env, "PAYPAL_USE_LONG_LINK", True) else PAYPAL_PAYMENT_MODE_SHORT_LINK
+    return PAYPAL_PAYMENT_MODE_LONG_LINK if _env_bool(env, "PAYPAL_USE_LONG_LINK", False) else PAYPAL_PAYMENT_MODE_SHORT_LINK
 
 
 def paypal_use_long_link(env: dict[str, str]) -> bool:
@@ -677,7 +723,13 @@ def _load_direct_pay_accounts(selected_email: str = "") -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    def add_account(account: MailAccount | None, *, source: str) -> None:
+    def add_account(
+        account: MailAccount | None,
+        *,
+        source: str,
+        payment_link: str = "",
+        link_method: str = "",
+    ) -> None:
         if not account:
             return
         email = account.email.strip().lower()
@@ -686,7 +738,12 @@ def _load_direct_pay_accounts(selected_email: str = "") -> list[dict[str, str]]:
         if selected and email != selected:
             return
         seen.add(email)
-        items.append(_account_item_from_account(account, source=source))
+        item = _account_item_from_account(account, source=source)
+        if payment_link:
+            item["payment_link"] = payment_link
+        if link_method:
+            item["link_method"] = link_method
+        items.append(item)
 
     for path, source in ((LINK_POOL_FILE, "link_pool_account"), (REGISTER_ONLY_SUMMARY_FILE, "registered_file")):
         if not path.exists():
@@ -706,12 +763,58 @@ def _load_direct_pay_accounts(selected_email: str = "") -> list[dict[str, str]]:
     return items
 
 
+def _load_mail_pool_direct_accounts(cfg: dict[str, Any], selected_email: str = "") -> list[dict[str, str]]:
+    """短链直付池为空时，从当前邮箱池取未处理账号继续登录/注册。"""
+    selected = (selected_email or "").strip().lower()
+    mail_cfg = cfg.get("mail", {}) if isinstance(cfg, dict) else {}
+    accounts_path_raw = str(mail_cfg.get("accounts_file") or "").strip()
+    if not accounts_path_raw:
+        return []
+    accounts_path = resolve_path(accounts_path_raw)
+    if not accounts_path.exists():
+        return []
+    paypal_flow_state.sync_from_files(
+        registered_file=REGISTER_ONLY_SUMMARY_FILE,
+        link_file=LINK_POOL_FILE,
+        pending_file=PENDING_AUTH_FILE,
+    )
+    blocked = paypal_flow_state.link_pool_blocked_emails(pending_file=PENDING_AUTH_FILE)
+    blocked |= paypal_flow_state.flow1_blocked_emails(link_file=LINK_POOL_FILE, pending_file=PENDING_AUTH_FILE)
+    blocked |= paypal_flow_state.load_manual_discarded_emails()
+    state = paypal_flow_state.load_state()
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in accounts_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        account = parse_mail_line(line)
+        if not account:
+            continue
+        email = account.email.strip().lower()
+        if not email or email in seen or email in blocked:
+            continue
+        # 已进入状态机的账号应由 registered/link_ready 入口接管；这里仅兜底全新邮箱池账号。
+        if email in state:
+            continue
+        if selected and email != selected:
+            continue
+        seen.add(email)
+        items.append(_account_item_from_account(account, source="mail_pool_direct"))
+    return items
+
+
 async def _install_click_watcher(page, email: str, *, enabled: bool, label: str = "flow2") -> Path | None:
     if not enabled:
         return None
     out_dir = resolve_path("output/paypal\u6ce8\u518c/debug/click_watcher")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"{safe_filename(email)}_{int(time.time())}.jsonl"
+    try:
+        out_file.touch(exist_ok=True)
+    except Exception:
+        pass
+    binding_name = "__paypalClickWatcherRecord_" + re.sub(r"[^A-Za-z0-9_]", "_", out_file.stem)
 
     async def _record_click(payload: dict[str, Any]) -> None:
         try:
@@ -725,12 +828,14 @@ async def _install_click_watcher(page, email: str, *, enabled: bool, label: str 
             return
 
     try:
-        await page.expose_function("__paypalClickWatcherRecord", _record_click)
+        await page.expose_function(binding_name, _record_click)
     except Exception:
         pass
     script = """(() => {
-        if (window.__paypalClickWatcherInstalled) return;
-        window.__paypalClickWatcherInstalled = true;
+        const bindingName = __PAYPAL_CLICK_WATCHER_BINDING__;
+        const installKey = "__paypalClickWatcherInstalled_" + bindingName;
+        if (window[installKey]) return;
+        window[installKey] = true;
         const cssPath = (el) => {
             if (!el || !el.tagName) return "";
             const parts = [];
@@ -754,15 +859,38 @@ async def _install_click_watcher(page, email: str, *, enabled: bool, label: str 
             }
             return parts.join(" > ");
         };
+        const brief = (el) => {
+            if (!el || !el.tagName) return null;
+            const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : {};
+            return {
+                tag: el.tagName || "",
+                role: el.getAttribute ? (el.getAttribute("role") || "") : "",
+                aria: el.getAttribute ? (el.getAttribute("aria-label") || "") : "",
+                testid: el.getAttribute ? (el.getAttribute("data-testid") || "") : "",
+                text: String(el.innerText || el.textContent || el.value || "").replace(/\\s+/g, " ").trim().slice(0, 140),
+                selector: cssPath(el),
+                x: Math.round(rect.left || 0),
+                y: Math.round(rect.top || 0),
+                w: Math.round(rect.width || 0),
+                h: Math.round(rect.height || 0),
+            };
+        };
         document.addEventListener("click", (event) => {
             const target = event.target && event.target.closest
-                ? event.target.closest("button, a, input, [role='button'], [data-testid], div, span")
+                ? event.target.closest("button, a, input, [role='button'], [role='option'], [role='menuitem'], [aria-haspopup], [data-testid], [tabindex], div, span")
                 : event.target;
             if (!target) return;
             const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : {};
+            const path = (event.composedPath ? event.composedPath() : [])
+                .filter((el) => el && el.nodeType === 1)
+                .slice(0, 8)
+                .map(brief)
+                .filter(Boolean);
             const payload = {
                 url: location.href,
                 title: document.title || "",
+                eventX: Math.round(event.clientX || 0),
+                eventY: Math.round(event.clientY || 0),
                 tag: target.tagName || "",
                 role: target.getAttribute ? (target.getAttribute("role") || "") : "",
                 type: target.getAttribute ? (target.getAttribute("type") || "") : "",
@@ -775,10 +903,14 @@ async def _install_click_watcher(page, email: str, *, enabled: bool, label: str 
                 y: Math.round(rect.top || 0),
                 w: Math.round(rect.width || 0),
                 h: Math.round(rect.height || 0),
+                path,
             };
-            try { window.__paypalClickWatcherRecord(payload); } catch {}
+            try {
+                const fn = window[bindingName];
+                if (typeof fn === "function") Promise.resolve(fn(payload)).catch(() => {});
+            } catch {}
         }, true);
-    })()"""
+    })()""".replace("__PAYPAL_CLICK_WATCHER_BINDING__", json.dumps(binding_name))
     try:
         await page.add_init_script(script)
         await page.evaluate(script)
@@ -882,6 +1014,61 @@ async def _checkout_surface_ready(page) -> bool:
     return False
 
 
+async def _wait_checkout_surface_after_offer_submit(
+    page,
+    prefix: str,
+    *,
+    email: str | None = None,
+    timeout_ms: int = 90_000,
+) -> bool:
+    """套餐提交后等待 ChatGPT 的“正在加载安全结账”过渡页跳到账单页。"""
+    deadline = time.monotonic() + max(5.0, timeout_ms / 1000)
+    saw_loading = False
+    last_sample = ""
+    last_url = ""
+    while time.monotonic() < deadline:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=1500)
+        except Exception:
+            pass
+        if await _checkout_surface_ready(page):
+            if saw_loading:
+                log(f"{prefix} checkout loading finished, billing page ready: url={page.url}")
+            return True
+        try:
+            state = await page.evaluate(
+                r"""() => {
+                    const text = String(document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
+                    const loading = /\u6b63\u5728\u52a0\u8f7d\u5b89\u5168\u7ed3\u8d26|\u65e0\u9700\u957f\u671f\u7ed1\u5b9a|\u96a8\u65f6\u53ef\u4ee5\u53d6\u6d88|loading\s+secure\s+checkout|secure\s+checkout|cancel\s+anytime/i.test(text);
+                    const hasStripeShell = /OpenAI|Stripe|Payment method|Due today|\u652f\u4ed8\u65b9\u5f0f|\u4eca\u65e5\u5e94\u4ed8/.test(text);
+                    return { loading, hasStripeShell, sample: text.slice(0, 220) };
+                }"""
+            )
+            if isinstance(state, dict):
+                last_sample = str(state.get("sample") or "")[:220]
+                if state.get("loading"):
+                    if not saw_loading:
+                        log(f"{prefix} waiting checkout loading transition: {last_sample}")
+                    saw_loading = True
+                if state.get("hasStripeShell") and await _checkout_surface_ready(page):
+                    return True
+        except Exception:
+            pass
+        current_url = str(page.url or "")
+        if current_url != last_url and ("pay.openai.com" in current_url or "checkout" in current_url):
+            log(f"{prefix} checkout navigation in progress: url={current_url}")
+            last_url = current_url
+        await page.wait_for_timeout(1000)
+    log(f"{prefix} checkout loading did not finish: url={page.url} sample={last_sample}")
+    if email:
+        await _save_chatgpt_offer_failure_debug_once(
+            page,
+            email,
+            f"checkout loading did not finish after offer submit: {last_sample}",
+        )
+    return False
+
+
 async def _detect_link_payment_invalid_long_link(page) -> dict[str, Any]:
     try:
         result = await page.evaluate(
@@ -926,6 +1113,43 @@ async def _detect_link_payment_invalid_long_link(page) -> dict[str, Any]:
 
 
 async def _dismiss_chatgpt_interstitials(page, prefix: str) -> None:
+    try:
+        if await page.locator('#modal-account-payment, [data-testid="modal-account-payment"]').first.is_visible(timeout=300):
+            return
+    except Exception:
+        pass
+    try:
+        ready_result = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+                const body = textOf(document.body);
+                const isReadyModal = /\u4f60\u5df2\u51c6\u5907\u5c31\u7eea|ChatGPT\s*\u53ef\u80fd\u4f1a\u51fa\u9519|\u7ee7\u7eed\u64cd\u4f5c\u5373\u8868\u793a\u4f60\u540c\u610f/.test(body);
+                if (!isReadyModal) return { clicked: false, reason: 'no-ready-modal' };
+                const blocked = document.querySelector('#modal-account-payment, [data-testid="modal-account-payment"]');
+                if (blocked && visible(blocked)) return { clicked: false, reason: 'pricing-modal' };
+                const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+                const btn = buttons.find((node) => {
+                    const text = textOf(node);
+                    const disabled = !!node.disabled || String(node.getAttribute?.('aria-disabled') || '').toLowerCase() === 'true';
+                    return !disabled && /^(?:\u7ee7\u7eed|Continue)$/.test(text);
+                });
+                if (!btn) return { clicked: false, reason: 'no-continue-button' };
+                try { btn.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+                btn.click();
+                return { clicked: true, reason: 'ready-continue', text: textOf(btn).slice(0, 80) };
+            }"""
+        )
+        if isinstance(ready_result, dict) and ready_result.get("clicked"):
+            log(f"{prefix} dismissed ChatGPT ready interstitial: {ready_result.get('text', '')}")
+            await page.wait_for_timeout(900)
+    except Exception:
+        pass
     skip_cn = _zh(r"\u8df3\u8fc7")
     later_cn_1 = _zh(r"\u4ee5\u540e\u518d\u8bf4")
     later_cn_2 = _zh(r"\u7a0d\u540e")
@@ -955,7 +1179,36 @@ async def _dismiss_chatgpt_interstitials(page, prefix: str) -> None:
             return
 
 
+async def _chatgpt_offer_modal_visible(page) -> bool:
+    """判断当前是否已进入 ChatGPT 套餐选择弹层。"""
+    try:
+        return bool(
+            await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+                    const nodes = Array.from(document.querySelectorAll('#modal-account-payment, [data-testid="modal-account-payment"], [role="dialog"]'))
+                        .filter(visible);
+                    return nodes.some((node) => /plus|trial|free|country|currency|jpy|usd|套餐|試用|支払|支払い/i.test(textOf(node)));
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 async def _click_zero_trial_plus_option(page, prefix: str) -> bool:
+    if not await _select_chatgpt_offer_region_us(page, prefix):
+        log(f"{prefix} zero/free Plus trial click skipped before US region")
+        return False
+    if await _chatgpt_offer_modal_visible(page):
+        log(f"{prefix} zero/free Plus trial click skipped inside pricing modal")
+        return False
     free_trial_cn = _zh(r"\u514d\u8d39\u8bd5\u7528")
     free_trial_tw = _zh(r"\u514d\u8cbb\u8a66\u7528")
     free_trial_jp = _zh(r"\u7121\u6599\u30c8\u30e9\u30a4\u30a2\u30eb")
@@ -1034,7 +1287,2527 @@ async def _click_zero_trial_plus_option(page, prefix: str) -> bool:
     return False
 
 
+async def _chatgpt_offer_region_state(page) -> dict[str, Any]:
+    """读取套餐弹窗右下角真实地区文本。"""
+    try:
+        state = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const usText = /united states|usa|\bus\b|usd|美国|美國|アメリカ|米国|estados unidos/i;
+                const jpText = /japan|\bjp\b|jpy|日本|japon|japón/i;
+                const node = Array.from(document.querySelectorAll('[data-testid="country-selector-in-pricing-modal"]')).filter(visible)[0] || null;
+                const label = textOf(node).slice(0, 180);
+                return {
+                    label,
+                    isUS: !!label && usText.test(label) && !jpText.test(label),
+                    isJP: !!label && jpText.test(label) && !usText.test(label),
+                };
+            }"""
+        )
+        return state if isinstance(state, dict) else {"label": "", "isUS": False, "isJP": False}
+    except Exception as exc:
+        return {"label": f"probe-error:{exc}", "isUS": False, "isJP": False}
+
+
+async def _click_chatgpt_offer_region_option_strict(page, prefix: str, target: str, mode: str) -> bool:
+    """只在套餐页国家下拉真实 listbox/item 内点选，避免把父容器误当国家选项。"""
+    normalized_target = str(target or "").strip().lower()
+    if normalized_target not in {"us", "jp", "non_us"}:
+        return False
+
+    target_label = {"us": "US", "jp": "JP", "non_us": "non-US"}[normalized_target]
+    typeahead_queries = {
+        "us": ("美国", "美國", "米国", "United States", "United States of America", "US"),
+        "jp": ("日本", "Japan", "JP"),
+        "non_us": ("日本", "Japan"),
+    }[normalized_target]
+    trigger_selector = (
+        '[data-testid="country-selector-in-pricing-modal"] [role="combobox"], '
+        '[data-testid="country-selector-in-pricing-modal"] button'
+    )
+
+    async def _confirm_selected() -> bool:
+        state = await _chatgpt_offer_region_state(page)
+        if normalized_target == "us":
+            return bool(state.get("isUS"))
+        if normalized_target == "jp":
+            return bool(state.get("isJP"))
+        return bool(state.get("label")) and not bool(state.get("isUS"))
+
+    async def _menu_state() -> dict[str, Any]:
+        try:
+            state = await page.evaluate(
+                r"""() => {
+                    const optionSelector = '[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [cmdk-item], [data-value]';
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.03;
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const valueOf = (el) => String(el?.getAttribute?.('data-value') || el?.getAttribute?.('value') || el?.getAttribute?.('aria-label') || '').trim();
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    const roots = [];
+                    const pushRoot = (root, source) => {
+                        if (!root || !visible(root) || roots.some((item) => item.root === root)) return;
+                        const rows = Array.from(root.querySelectorAll(optionSelector)).filter(visible);
+                        if (!rows.length) return;
+                        roots.push({ root, source, rows });
+                    };
+                    if (controlId) pushRoot(document.getElementById(controlId), 'aria-controls');
+                    const active = document.activeElement;
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    if (activeDescendantId) {
+                        pushRoot(document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-descendant');
+                    }
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-root');
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper], [data-state="open"]')).filter(visible)) {
+                        pushRoot(node, 'open-node');
+                    }
+                    const rootInfo = roots[0] || null;
+                    const activeRole = active?.getAttribute?.('role') || '';
+                    const activeTag = String(active?.tagName || '').toLowerCase();
+                    const activeEditable = !!(active && (active.isContentEditable || /^(input|textarea)$/.test(activeTag) || activeRole === 'textbox'));
+                    return {
+                        open: !!rootInfo,
+                        controlId,
+                        ariaExpanded: trigger?.getAttribute?.('aria-expanded') || '',
+                        triggerText: textOf(trigger).slice(0, 140),
+                        activeRole,
+                        activeTag,
+                        activeEditable,
+                        activeText: textOf(active).slice(0, 120),
+                        rootSource: rootInfo?.source || '',
+                        rootRole: rootInfo?.root?.getAttribute?.('role') || '',
+                        optionCount: rootInfo?.rows?.length || 0,
+                        samples: rootInfo ? Array.from(new Set(rootInfo.rows.map(textOf).filter(Boolean))).slice(0, 10) : [],
+                        valueSamples: rootInfo ? Array.from(new Set(rootInfo.rows.map(valueOf).filter(Boolean))).slice(0, 16) : []
+                    };
+                }"""
+            )
+            return state if isinstance(state, dict) else {"open": False, "reason": "invalid-menu-state"}
+        except Exception as exc:
+            return {"open": False, "reason": f"menu-state-error:{exc}"}
+
+    async def _open_menu(open_mode: str) -> bool:
+        try:
+            before = await _menu_state()
+            if before.get("open"):
+                return True
+            trigger = page.locator(trigger_selector).first
+            if not await trigger.is_visible(timeout=900) or not await trigger.is_enabled(timeout=900):
+                return False
+            await trigger.scroll_into_view_if_needed(timeout=1000)
+            if open_mode == "keyboard":
+                await trigger.focus(timeout=1000)
+                await page.keyboard.press("Enter")
+            else:
+                box = await trigger.bounding_box()
+                if box:
+                    await page.mouse.move(float(box["x"] + max(8, box["width"] - 12)), float(box["y"] + box["height"] / 2))
+                    await page.mouse.down()
+                    await page.wait_for_timeout(60)
+                    await page.mouse.up()
+                else:
+                    await trigger.click(timeout=1800, force=True, no_wait_after=True)
+            await page.wait_for_timeout(500)
+            after = await _menu_state()
+            if not after.get("open"):
+                log(f"{prefix} offer region strict menu not open by {mode}/{open_mode}: {after}")
+                return False
+            return True
+        except Exception:
+            return False
+
+    async def _find_point() -> dict[str, Any]:
+        point = await page.evaluate(
+            r"""(target) => {
+                const optionSelector = '[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [cmdk-item], [data-value]';
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.03;
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const valueOf = (el) => String(el?.getAttribute?.('data-value') || el?.getAttribute?.('value') || el?.getAttribute?.('aria-label') || '').trim();
+                const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                const triggerRect = trigger?.getBoundingClientRect?.() || null;
+                const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                const itemOf = (el) => el.closest?.(optionSelector) || el;
+                const optionRows = (root) => {
+                    const seen = new Set();
+                    return Array.from(root.querySelectorAll(optionSelector))
+                        .map(itemOf)
+                        .filter((item) => {
+                            if (!item || item === root || seen.has(item)) return false;
+                            seen.add(item);
+                            if (!visible(item)) return false;
+                            const rect = item.getBoundingClientRect();
+                            if (rect.width <= 0 || rect.height <= 0 || rect.width > Math.max(640, window.innerWidth * 0.55) || rect.height > 92) return false;
+                            const text = textOf(item);
+                            const value = valueOf(item);
+                            return !!(text || value);
+                        });
+                };
+                const roots = [];
+                const pushRoot = (root, source) => {
+                    if (!root || !visible(root) || roots.some((x) => x.root === root)) return;
+                    const rows = optionRows(root);
+                    if (!rows.length) return;
+                    const labels = Array.from(new Set(rows.map((row) => norm(textOf(row) || valueOf(row))).filter(Boolean)));
+                    const rect = root.getBoundingClientRect();
+                    if (rect.width > window.innerWidth * 0.85 || rect.height > window.innerHeight * 0.85) return;
+                    if (!labels.length) return;
+                    let score = rows.length + labels.length * 3;
+                    if (controlId && root.id === controlId) score += 100;
+                    if (/listbox|menu/i.test(root.getAttribute?.('role') || '')) score += 30;
+                    if (root.hasAttribute?.('data-radix-select-content') || /radix/i.test(String(root.className || ''))) score += 20;
+                    if (triggerRect) {
+                        score -= Math.abs(rect.right - triggerRect.right) / 80;
+                        score -= Math.abs(rect.top - triggerRect.bottom) / 80;
+                    }
+                    roots.push({ root, rows, labels, score, source });
+                };
+                if (controlId) pushRoot(document.getElementById(controlId), 'aria-controls');
+                const active = document.activeElement;
+                const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                if (activeDescendantId) {
+                    pushRoot(document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-descendant');
+                }
+                pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-root');
+                for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper], [data-state="open"]')).filter(visible)) {
+                    pushRoot(node, 'open-node');
+                }
+                roots.sort((a, b) => b.score - a.score);
+                const rootInfo = roots[0] || null;
+                if (!rootInfo) return { ok: false, reason: 'no-country-listbox', controlId };
+
+                const usText = /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国|estados unidos/i;
+                const jpText = /japan|\bjp\b|日本|japon|japón/i;
+                const badText = /country|currency|search|select|region|国家|地区|地域|货币|貨幣/i;
+                const toOption = (item) => {
+                    const rect = item.getBoundingClientRect();
+                    const text = textOf(item);
+                    const value = valueOf(item);
+                    const label = text || value;
+                    const sig = `${label} ${value}`;
+                    const valueNorm = norm(value);
+                    const textNorm = norm(label);
+                    const isUS = valueNorm === 'us' || usText.test(sig);
+                    const isJP = valueNorm === 'jp' || jpText.test(sig);
+                    let matched = false;
+                    if (target === 'us') matched = isUS && !isJP;
+                    else if (target === 'jp') matched = isJP && !isUS;
+                    else matched = !isUS && !badText.test(sig);
+                    if (!matched) return null;
+                    let score = 0;
+                    if (/option|menuitem/i.test(item.getAttribute?.('role') || '')) score += 20;
+                    if (item.hasAttribute?.('data-radix-collection-item')) score += 8;
+                    if (valueNorm === target || (target === 'non_us' && isJP)) score += 12;
+                    if (/^(united states|united states of america|usa|us|美国|美國|アメリカ|米国|日本|japan|jp|estados unidos)$/i.test(textNorm)) score += 10;
+                    score -= rect.width * rect.height / 1000000;
+                    return {
+                        item,
+                        label: label.slice(0, 120),
+                        value,
+                        score,
+                        x: Math.round(rect.left + Math.max(6, Math.min(rect.width - 6, rect.width / 2))),
+                        y: Math.round(rect.top + Math.max(6, Math.min(rect.height - 6, rect.height / 2)))
+                    };
+                };
+                const matches = rootInfo.rows.map(toOption).filter(Boolean).sort((a, b) => b.score - a.score);
+                const samples = Array.from(new Set(rootInfo.rows.map((row) => textOf(row)).filter(Boolean))).slice(0, 12);
+                const valueSamples = Array.from(new Set(rootInfo.rows.map((row) => valueOf(row)).filter(Boolean))).slice(0, 24);
+                const rowDetails = rootInfo.rows.slice(0, 18).map((row) => {
+                    const rect = row.getBoundingClientRect();
+                    return {
+                        text: textOf(row).slice(0, 120),
+                        value: valueOf(row).slice(0, 80),
+                        role: row.getAttribute?.('role') || '',
+                        tag: row.tagName || '',
+                        x: Math.round(rect.left),
+                        y: Math.round(rect.top),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height)
+                    };
+                });
+                const hit = matches[0] || null;
+                if (!hit) {
+                    return {
+                        ok: false,
+                        reason: 'target-not-visible',
+                        target,
+                        controlId,
+                        rootSource: rootInfo.source,
+                        optionCount: rootInfo.rows.length,
+                        samples,
+                        valueSamples,
+                        rowDetails
+                    };
+                }
+                try { hit.item.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch {}
+                const finalRect = hit.item.getBoundingClientRect();
+                const finalX = Math.round(finalRect.left + Math.max(6, Math.min(finalRect.width - 6, finalRect.width / 2)));
+                const finalY = Math.round(finalRect.top + Math.max(6, Math.min(finalRect.height - 6, finalRect.height / 2)));
+                return {
+                    ok: true,
+                    target,
+                    controlId,
+                    rootSource: rootInfo.source,
+                    label: hit.label,
+                    value: hit.value,
+                    optionCount: rootInfo.rows.length,
+                    samples,
+                    valueSamples,
+                    rowDetails,
+                    staleX: hit.x,
+                    staleY: hit.y,
+                    x: finalX,
+                    y: finalY
+                };
+            }""",
+            normalized_target,
+        )
+        return point if isinstance(point, dict) else {"ok": False, "reason": "invalid-point"}
+
+    async def _scroll_menu() -> dict[str, Any]:
+        scrolled = await page.evaluate(
+            r"""() => {
+                const optionSelector = '[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [cmdk-item], [data-value]';
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                const roots = [];
+                const rowsOf = (root) => Array.from(root.querySelectorAll(optionSelector)).filter(visible);
+                const pushRoot = (root) => {
+                    if (!root || !visible(root) || roots.includes(root) || !rowsOf(root).length) return;
+                    roots.push(root);
+                };
+                if (controlId) pushRoot(document.getElementById(controlId));
+                pushRoot(document.activeElement?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper], [data-state="open"]')).filter(visible)) {
+                    pushRoot(node);
+                }
+                const root = roots[0] || null;
+                if (!root) return { ok: false, reason: 'no-root', controlId };
+                const scrollables = Array.from(root.querySelectorAll('[data-radix-select-viewport], [data-radix-scroll-area-viewport], [style*="overflow"], div'))
+                    .filter(visible)
+                    .filter((el) => el.scrollHeight > el.clientHeight + 8);
+                if (root.scrollHeight > root.clientHeight + 8) scrollables.push(root);
+                const hit = scrollables.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0] || null;
+                if (!hit) return { ok: false, reason: 'no-scrollable', controlId, samples: rowsOf(root).map(textOf).filter(Boolean).slice(0, 8) };
+                const before = hit.scrollTop;
+                hit.scrollTop = Math.min(hit.scrollHeight, hit.scrollTop + Math.max(220, Math.floor(hit.clientHeight * 0.9)));
+                hit.dispatchEvent(new Event('scroll', { bubbles: true }));
+                return {
+                    ok: hit.scrollTop !== before,
+                    reason: hit.scrollTop === before ? 'end' : 'scrolled',
+                    controlId,
+                    before,
+                    after: hit.scrollTop,
+                    samples: rowsOf(root).map(textOf).filter(Boolean).slice(0, 8)
+                };
+            }"""
+        )
+        return scrolled if isinstance(scrolled, dict) else {"ok": False, "reason": "invalid-scroll"}
+
+    async def _activate_matched_option_by_dom(open_mode: str) -> dict[str, Any]:
+        """Radix Select 对鼠标坐标很敏感；命中选项后直接向真实 option 派发选择事件。"""
+        try:
+            result = await page.evaluate(
+                r"""(target) => {
+                    const optionSelector = '[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [cmdk-item], [data-value]';
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.03;
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const valueOf = (el) => String(el?.getAttribute?.('data-value') || el?.getAttribute?.('value') || el?.getAttribute?.('aria-label') || '').trim();
+                    const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    const roots = [];
+                    const pushRoot = (root, source) => {
+                        if (!root || !visible(root) || roots.some((item) => item.root === root)) return;
+                        const rows = Array.from(root.querySelectorAll(optionSelector)).filter(visible);
+                        if (!rows.length) return;
+                        let score = rows.length;
+                        if (controlId && root.id === controlId) score += 100;
+                        if (/listbox|menu/i.test(root.getAttribute?.('role') || '')) score += 30;
+                        roots.push({ root, source, rows, score });
+                    };
+                    if (controlId) pushRoot(document.getElementById(controlId), 'aria-controls');
+                    const active = document.activeElement;
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    if (activeDescendantId) {
+                        pushRoot(document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-descendant');
+                    }
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-root');
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper], [data-state="open"]')).filter(visible)) {
+                        pushRoot(node, 'open-node');
+                    }
+                    roots.sort((a, b) => b.score - a.score);
+                    const rootInfo = roots[0] || null;
+                    if (!rootInfo) return { ok: false, reason: 'no-root', controlId };
+                    const usText = /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国|estados unidos/i;
+                    const jpText = /japan|\bjp\b|日本|japon|japón/i;
+                    const badText = /country|currency|search|select|region|国家|地区|地域|货币|貨幣/i;
+                    const matchRow = () => {
+                        const rows = rootInfo.rows.map((row) => row.closest?.(optionSelector) || row);
+                        return rows.find((row) => {
+                            const sig = `${textOf(row)} ${valueOf(row)}`;
+                            const valueNorm = norm(valueOf(row));
+                            const isUS = valueNorm === 'us' || usText.test(sig);
+                            const isJP = valueNorm === 'jp' || jpText.test(sig);
+                            if (target === 'us') return isUS && !isJP;
+                            if (target === 'jp') return isJP && !isUS;
+                            return !isUS && !badText.test(sig);
+                        }) || null;
+                    };
+                    let hit = matchRow();
+                    const rows = rootInfo.rows.map((row) => row.closest?.(optionSelector) || row);
+                    if (!hit) {
+                        return {
+                            ok: false,
+                            reason: 'target-not-found',
+                            controlId,
+                            optionCount: rows.length,
+                            samples: Array.from(new Set(rows.map(textOf).filter(Boolean))).slice(0, 12),
+                            valueSamples: Array.from(new Set(rows.map(valueOf).filter(Boolean))).slice(0, 16)
+                        };
+                    }
+                    try { hit.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch {}
+                    hit = matchRow() || hit;
+                    const rect = hit.getBoundingClientRect();
+                    const x = rect.left + Math.max(6, Math.min(rect.width - 6, rect.width / 2));
+                    const y = rect.top + Math.max(6, Math.min(rect.height - 6, rect.height / 2));
+                    const pointerUp = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+                    const pointerDown = { ...pointerUp, buttons: 1 };
+                    const mouseUp = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0, buttons: 0 };
+                    const mouseDown = { ...mouseUp, buttons: 1 };
+                    const keyInit = { bubbles: true, cancelable: true, composed: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13 };
+                    const hoverTarget = document.elementFromPoint(x, y) || hit;
+                    const targets = Array.from(new Set([hit, hoverTarget]));
+                    for (const el of targets) {
+                        try { el.focus?.({ preventScroll: true }); } catch {}
+                        for (const type of ['pointerover', 'pointerenter', 'pointermove']) {
+                            try { el.dispatchEvent(new PointerEvent(type, pointerUp)); } catch { el.dispatchEvent(new MouseEvent(type.replace('pointer', 'mouse'), mouseUp)); }
+                        }
+                        for (const type of ['mouseover', 'mouseenter', 'mousemove']) {
+                            el.dispatchEvent(new MouseEvent(type, mouseUp));
+                        }
+                        try { el.dispatchEvent(new PointerEvent('pointerdown', pointerDown)); } catch { el.dispatchEvent(new MouseEvent('mousedown', mouseDown)); }
+                        el.dispatchEvent(new MouseEvent('mousedown', mouseDown));
+                        try { el.dispatchEvent(new PointerEvent('pointerup', pointerUp)); } catch { el.dispatchEvent(new MouseEvent('mouseup', mouseUp)); }
+                        el.dispatchEvent(new MouseEvent('mouseup', mouseUp));
+                        el.dispatchEvent(new MouseEvent('click', mouseUp));
+                        el.dispatchEvent(new KeyboardEvent('keydown', keyInit));
+                        el.dispatchEvent(new KeyboardEvent('keyup', keyInit));
+                    }
+                    try { hit.click(); } catch {}
+                    return {
+                        ok: true,
+                        controlId,
+                        rootSource: rootInfo.source,
+                        label: textOf(hit).slice(0, 120),
+                        value: valueOf(hit).slice(0, 80),
+                        x: Math.round(x),
+                        y: Math.round(y),
+                        optionCount: rows.length
+                    };
+                }""",
+                normalized_target,
+            )
+            return result if isinstance(result, dict) else {"ok": False, "reason": "invalid-dom-activate"}
+        except Exception as exc:
+            return {"ok": False, "reason": f"dom-activate-error:{exc}", "mode": open_mode}
+
+    async def _click_matched_option_by_locator(open_mode: str) -> dict[str, Any]:
+        """给已命中的国家 option 临时打标，再用 Playwright 真实点击，避免只点坐标不触发 Radix 选择。"""
+        marker = f"paypal-region-{normalized_target}-{int(time.time() * 1000)}"
+        try:
+            marked = await page.evaluate(
+                r"""({ target, marker }) => {
+                    const optionSelector = '[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [cmdk-item], [data-value]';
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.03;
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const valueOf = (el) => String(el?.getAttribute?.('data-value') || el?.getAttribute?.('value') || el?.getAttribute?.('aria-label') || '').trim();
+                    const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    const roots = [];
+                    const pushRoot = (root, source) => {
+                        if (!root || !visible(root) || roots.some((item) => item.root === root)) return;
+                        const rows = Array.from(root.querySelectorAll(optionSelector)).filter(visible);
+                        if (!rows.length) return;
+                        let score = rows.length;
+                        if (controlId && root.id === controlId) score += 100;
+                        if (/listbox|menu/i.test(root.getAttribute?.('role') || '')) score += 30;
+                        roots.push({ root, source, rows, score });
+                    };
+                    if (controlId) pushRoot(document.getElementById(controlId), 'aria-controls');
+                    const active = document.activeElement;
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    if (activeDescendantId) {
+                        pushRoot(document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-descendant');
+                    }
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-root');
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper], [data-state="open"]')).filter(visible)) {
+                        pushRoot(node, 'open-node');
+                    }
+                    roots.sort((a, b) => b.score - a.score);
+                    const rootInfo = roots[0] || null;
+                    if (!rootInfo) return { ok: false, reason: 'no-root', controlId };
+                    const usText = /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国|estados unidos/i;
+                    const jpText = /japan|\bjp\b|日本|japon|japón/i;
+                    const badText = /country|currency|search|select|region|国家|地区|地域|货币|貨幣/i;
+                    const rowsOf = () => Array.from(rootInfo.root.querySelectorAll(optionSelector))
+                        .filter(visible)
+                        .map((row) => row.closest?.(optionSelector) || row);
+                    const matchRow = () => rowsOf().find((row) => {
+                        const sig = `${textOf(row)} ${valueOf(row)}`;
+                        const valueNorm = norm(valueOf(row));
+                        const isUS = valueNorm === 'us' || usText.test(sig);
+                        const isJP = valueNorm === 'jp' || jpText.test(sig);
+                        if (target === 'us') return isUS && !isJP;
+                        if (target === 'jp') return isJP && !isUS;
+                        return !isUS && !badText.test(sig);
+                    }) || null;
+                    let hit = matchRow();
+                    if (!hit) {
+                        const rows = rowsOf();
+                        return {
+                            ok: false,
+                            reason: 'target-not-found',
+                            controlId,
+                            optionCount: rows.length,
+                            samples: Array.from(new Set(rows.map(textOf).filter(Boolean))).slice(0, 12),
+                            valueSamples: Array.from(new Set(rows.map(valueOf).filter(Boolean))).slice(0, 16)
+                        };
+                    }
+                    try { hit.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch {}
+                    hit = matchRow() || hit;
+                    for (const node of Array.from(document.querySelectorAll('[data-paypal-offer-region-target]'))) {
+                        node.removeAttribute('data-paypal-offer-region-target');
+                    }
+                    hit.setAttribute('data-paypal-offer-region-target', marker);
+                    const rect = hit.getBoundingClientRect();
+                    return {
+                        ok: true,
+                        controlId,
+                        rootSource: rootInfo.source,
+                        label: textOf(hit).slice(0, 120),
+                        value: valueOf(hit).slice(0, 80),
+                        x: Math.round(rect.left + rect.width / 2),
+                        y: Math.round(rect.top + rect.height / 2),
+                        optionCount: rowsOf().length
+                    };
+                }""",
+                {"target": normalized_target, "marker": marker},
+            )
+            if not isinstance(marked, dict) or not marked.get("ok"):
+                return marked if isinstance(marked, dict) else {"ok": False, "reason": "invalid-marker"}
+            option = page.locator(f'[data-paypal-offer-region-target="{marker}"]').first
+            await option.hover(timeout=1200, force=True)
+            await option.click(timeout=2600, force=True, no_wait_after=True)
+            await page.wait_for_timeout(900)
+            return {**marked, "ok": True, "mode": f"locator:{open_mode}"}
+        except Exception as exc:
+            return {"ok": False, "reason": f"locator-activate-error:{exc}", "mode": open_mode}
+
+    async def _typeahead_confirm(query: str, open_mode: str) -> bool:
+        if not query or not await _open_menu(open_mode):
+            return False
+        try:
+            trigger = page.locator(trigger_selector).first
+            if await trigger.is_visible(timeout=600):
+                await trigger.focus(timeout=800)
+        except Exception:
+            pass
+        safe_state = await page.evaluate(
+            r"""(target) => {
+                const optionSelector = '[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [cmdk-item], [data-value]';
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.03;
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const valueOf = (el) => String(el?.getAttribute?.('data-value') || el?.getAttribute?.('value') || el?.getAttribute?.('aria-label') || '').trim();
+                const active = document.activeElement;
+                const activeRole = active?.getAttribute?.('role') || '';
+                const activeTag = String(active?.tagName || '').toLowerCase();
+                const activeEditable = !!(active && (active.isContentEditable || /^(input|textarea)$/.test(activeTag) || activeRole === 'textbox'));
+                const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                const roots = [];
+                const pushRoot = (root, source) => {
+                    if (!root || !visible(root) || roots.some((item) => item.root === root)) return;
+                    const rows = Array.from(root.querySelectorAll(optionSelector)).filter(visible);
+                    if (!rows.length) return;
+                    roots.push({ root, source, rows });
+                };
+                if (controlId) pushRoot(document.getElementById(controlId), 'aria-controls');
+                const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                const activeDescendant = activeDescendantId ? document.getElementById(activeDescendantId) : null;
+                if (activeDescendant) {
+                    pushRoot(activeDescendant.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-descendant');
+                }
+                pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-root');
+                for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper], [data-state="open"]')).filter(visible)) {
+                    pushRoot(node, 'open-node');
+                }
+                const rootInfo = roots[0] || null;
+                const highlighted = rootInfo ? Array.from(rootInfo.root.querySelectorAll('[data-highlighted], [aria-selected="true"], [data-state="checked"], [aria-current="true"]')).filter(visible)[0] || null : null;
+                const usText = /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国|estados unidos/i;
+                const jpText = /japan|\bjp\b|日本|japon|japón/i;
+                const targetPattern = target === 'us' ? usText : jpText;
+                const antiPattern = target === 'us' ? jpText : usText;
+                const rows = rootInfo?.rows || [];
+                const matched = rows.find((row) => targetPattern.test(`${textOf(row)} ${valueOf(row)}`) && !antiPattern.test(`${textOf(row)} ${valueOf(row)}`)) || null;
+                const activeText = textOf(activeDescendant) || textOf(highlighted) || textOf(active);
+                const highlightedText = textOf(highlighted);
+                const activeSig = `${activeText} ${valueOf(activeDescendant || highlighted || active)}`;
+                const safeFocus = !!rootInfo && !activeEditable && (
+                    active === trigger ||
+                    activeRole === 'combobox' ||
+                    (active && rootInfo.root.contains(active)) ||
+                    active === document.body
+                );
+                return {
+                    ok: safeFocus,
+                    controlId,
+                    activeRole,
+                    activeTag,
+                    activeEditable,
+                    activeText: activeText.slice(0, 120),
+                    highlightedText: highlightedText.slice(0, 120),
+                    rootSource: rootInfo?.source || '',
+                    optionCount: rows.length,
+                    matchedText: matched ? textOf(matched).slice(0, 120) : '',
+                    matchedValue: matched ? valueOf(matched).slice(0, 80) : '',
+                    targetActive: targetPattern.test(activeSig) && !antiPattern.test(activeSig),
+                    samples: Array.from(new Set(rows.map(textOf).filter(Boolean))).slice(0, 10),
+                    valueSamples: Array.from(new Set(rows.map(valueOf).filter(Boolean))).slice(0, 16)
+                };
+            }""",
+            normalized_target,
+        )
+        if not isinstance(safe_state, dict) or not safe_state.get("ok"):
+            log(f"{prefix} offer region strict typeahead skipped unsafe focus {target_label}: {safe_state}")
+            return False
+        try:
+            await page.keyboard.type(query, delay=30)
+            await page.wait_for_timeout(420)
+            focus_state = await page.evaluate(
+                r"""(target) => {
+                    const optionSelector = '[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [cmdk-item], [data-value]';
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.03;
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const valueOf = (el) => String(el?.getAttribute?.('data-value') || el?.getAttribute?.('value') || el?.getAttribute?.('aria-label') || '').trim();
+                    const active = document.activeElement;
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    const roots = [];
+                    const pushRoot = (root, source) => {
+                        if (!root || !visible(root) || roots.some((item) => item.root === root)) return;
+                        const rows = Array.from(root.querySelectorAll(optionSelector)).filter(visible);
+                        if (!rows.length) return;
+                        roots.push({ root, source, rows });
+                    };
+                    if (controlId) pushRoot(document.getElementById(controlId), 'aria-controls');
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    const activeDescendant = activeDescendantId ? document.getElementById(activeDescendantId) : null;
+                    if (activeDescendant) {
+                        pushRoot(activeDescendant.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-descendant');
+                    }
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-root');
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper], [data-state="open"]')).filter(visible)) {
+                        pushRoot(node, 'open-node');
+                    }
+                    const rootInfo = roots[0] || null;
+                    const rows = rootInfo?.rows || [];
+                    const highlighted = rootInfo ? Array.from(rootInfo.root.querySelectorAll('[data-highlighted], [aria-selected="true"], [data-state="checked"], [aria-current="true"]')).filter(visible)[0] || null : null;
+                    const usText = /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国|estados unidos/i;
+                    const jpText = /japan|\bjp\b|日本|japon|japón/i;
+                    const targetPattern = target === 'us' ? usText : jpText;
+                    const antiPattern = target === 'us' ? jpText : usText;
+                    const activeText = textOf(activeDescendant) || textOf(highlighted) || textOf(active);
+                    const activeValue = valueOf(activeDescendant || highlighted || active);
+                    const matched = rows.find((row) => targetPattern.test(`${textOf(row)} ${valueOf(row)}`) && !antiPattern.test(`${textOf(row)} ${valueOf(row)}`)) || null;
+                    return {
+                        open: !!rootInfo,
+                        controlId,
+                        rootSource: rootInfo?.source || '',
+                        optionCount: rows.length,
+                        activeText: activeText.slice(0, 120),
+                        activeValue: activeValue.slice(0, 80),
+                        highlightedText: textOf(highlighted).slice(0, 120),
+                        matchedText: matched ? textOf(matched).slice(0, 120) : '',
+                        matchedValue: matched ? valueOf(matched).slice(0, 80) : '',
+                        targetActive: targetPattern.test(`${activeText} ${activeValue}`) && !antiPattern.test(`${activeText} ${activeValue}`),
+                        samples: Array.from(new Set(rows.map(textOf).filter(Boolean))).slice(0, 10),
+                        valueSamples: Array.from(new Set(rows.map(valueOf).filter(Boolean))).slice(0, 16)
+                    };
+                }""",
+                normalized_target,
+            )
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(1200)
+            if await _confirm_selected():
+                state = await _chatgpt_offer_region_state(page)
+                log(
+                    f"{prefix} offer region strict selected {target_label} by typeahead {mode}/{open_mode}: "
+                    f"query={query} -> {state.get('label', '')}"
+                )
+                return True
+            after = await _chatgpt_offer_region_state(page)
+            log(
+                f"{prefix} offer region strict typeahead unconfirmed {target_label}: "
+                f"query={query} state={focus_state} -> {after.get('label', '')}"
+            )
+        except Exception as exc:
+            log(f"{prefix} offer region strict typeahead failed {target_label}: query={query} err={exc}")
+        return False
+
+    last_state: dict[str, Any] = {}
+    for open_mode in ("keyboard", "mouse"):
+        if not await _open_menu(open_mode):
+            continue
+        for query in ("", *typeahead_queries):
+            if query:
+                if await _typeahead_confirm(query, open_mode):
+                    return True
+                await _open_menu(open_mode)
+            for _ in range(20):
+                point = await _find_point()
+                last_state = point
+                if point.get("ok"):
+                    locator_pick = await _click_matched_option_by_locator(open_mode)
+                    if await _confirm_selected():
+                        state = await _chatgpt_offer_region_state(page)
+                        log(
+                            f"{prefix} offer region strict selected {target_label} by {mode}/{open_mode}/locator: "
+                            f"{locator_pick.get('label', '') or point.get('label', '')} -> {state.get('label', '')}"
+                        )
+                        return True
+                    if locator_pick.get("ok"):
+                        state = await _chatgpt_offer_region_state(page)
+                        log(
+                            f"{prefix} offer region strict locator pick unconfirmed {target_label}: "
+                            f"{locator_pick.get('label', '')} -> {state.get('label', '')}"
+                        )
+                    dom_pick = await _activate_matched_option_by_dom(open_mode)
+                    await page.wait_for_timeout(900)
+                    if await _confirm_selected():
+                        state = await _chatgpt_offer_region_state(page)
+                        log(
+                            f"{prefix} offer region strict selected {target_label} by {mode}/{open_mode}/dom: "
+                            f"{dom_pick.get('label', '') or point.get('label', '')} -> {state.get('label', '')}"
+                        )
+                        return True
+                    if dom_pick.get("ok"):
+                        state = await _chatgpt_offer_region_state(page)
+                        log(
+                            f"{prefix} offer region strict DOM pick unconfirmed {target_label}: "
+                            f"{dom_pick.get('label', '')} -> {state.get('label', '')}"
+                        )
+                    await page.mouse.click(float(point.get("x") or 0), float(point.get("y") or 0), delay=70)
+                    await page.wait_for_timeout(1400)
+                    if await _confirm_selected():
+                        state = await _chatgpt_offer_region_state(page)
+                        log(
+                            f"{prefix} offer region strict selected {target_label} by {mode}/{open_mode}: "
+                            f"{point.get('label', '')} -> {state.get('label', '')}"
+                        )
+                        return True
+                    state = await _chatgpt_offer_region_state(page)
+                    log(
+                        f"{prefix} offer region strict click unconfirmed {target_label}: "
+                        f"{point.get('label', '')} -> {state.get('label', '')}"
+                    )
+                    break
+                scrolled = await _scroll_menu()
+                if not scrolled.get("ok"):
+                    last_state = {**point, "scroll": scrolled}
+                    break
+                await page.wait_for_timeout(180)
+            if query != typeahead_queries[-1]:
+                await _open_menu(open_mode)
+
+    log(f"{prefix} offer region strict {target_label} not selected by {mode}: {last_state}")
+    return False
+
+
+async def _select_chatgpt_offer_region_us(page, prefix: str, *, force: bool = False) -> bool:
+    async def _probe_region() -> dict[str, Any]:
+        try:
+            result = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const usText = /united states|usa|\bus\b|usd|美国|美國|アメリカ|米国/i;
+                    const jpText = /japan|\bjp\b|jpy|日本/i;
+                    const candidates = [];
+                    const modalVisible = Array.from(document.querySelectorAll('#modal-account-payment, [data-testid="modal-account-payment"], [role="dialog"]'))
+                        .filter(visible)
+                        .some((node) => /plus|trial|free|country|currency|jpy|usd|套餐|試用|支払|支払い/i.test(textOf(node)));
+                    const exactRegion = Array.from(document.querySelectorAll('[data-testid="country-selector-in-pricing-modal"]'))
+                        .filter(visible)
+                        .map((el) => ({ label: textOf(el), source: 'country-selector-in-pricing-modal' }))
+                        .find((item) => item.label);
+                    if (exactRegion) {
+                        const label = String(exactRegion.label || '').trim();
+                        return {
+                            ok: usText.test(label) && !jpText.test(label),
+                            isJP: jpText.test(label) && !usText.test(label),
+                            label: label.slice(0, 180),
+                            source: exactRegion.source
+                        };
+                    }
+                    if (!modalVisible) {
+                        return { ok: false, isJP: false, label: '', source: 'missing-modal' };
+                    }
+
+                    for (const sel of Array.from(document.querySelectorAll('select')).filter(visible)) {
+                        const opt = sel.options && sel.options[sel.selectedIndex >= 0 ? sel.selectedIndex : 0];
+                        const label = [sel.value || '', opt?.text || opt?.label || '', sel.getAttribute('aria-label') || ''].join(' ').trim();
+                        if (/country|region|currency|国家|地区|地域|国/i.test(label) || usText.test(label) || jpText.test(label)) {
+                            candidates.push({ label, source: 'select' });
+                        }
+                    }
+
+                    const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"], [aria-haspopup], [data-testid], div, span'))
+                        .filter(visible)
+                        .filter((el) => {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.top < window.innerHeight * 0.38 || rect.left < window.innerWidth * 0.38) return false;
+                            if (rect.width > window.innerWidth * 0.45 || rect.height > window.innerHeight * 0.22) return false;
+                            const text = textOf(el);
+                            if (!text || text.length > 80) return false;
+                            if (/open image|chatgpt said|you said|chatgpt can make mistakes|ask anything/i.test(text)) return false;
+                            return /country|currency|region|japan|united states|\bus\b|usa|usd|jpy|国家|地区|地域|国|日本|美国|美國|アメリカ|米国/i.test(text);
+                        })
+                        .sort((a, b) => {
+                            const ar = a.getBoundingClientRect();
+                            const br = b.getBoundingClientRect();
+                            const aScore = (ar.top / Math.max(1, window.innerHeight)) + (ar.left / Math.max(1, window.innerWidth));
+                            const bScore = (br.top / Math.max(1, window.innerHeight)) + (br.left / Math.max(1, window.innerWidth));
+                            const aText = textOf(a);
+                            const bText = textOf(b);
+                            const aSpecific = /country|currency|国家|地区|地域|国/i.test(aText) ? 1 : 0;
+                            const bSpecific = /country|currency|国家|地区|地域|国/i.test(bText) ? 1 : 0;
+                            return (bSpecific - aSpecific) || (bScore - aScore);
+                        });
+                    if (nodes.length) candidates.push({ label: textOf(nodes[0]), source: 'bottom-right' });
+
+                    const best = candidates[0] || { label: '', source: 'missing' };
+                    const label = String(best.label || '').trim();
+                    const isUS = usText.test(label) && !jpText.test(label);
+                    const isJP = jpText.test(label) && !usText.test(label);
+                    return { ok: isUS, isJP, label: label.slice(0, 180), source: best.source || 'missing' };
+                }"""
+            )
+            return result if isinstance(result, dict) else {"ok": False, "label": "", "source": "invalid"}
+        except Exception as exc:
+            return {"ok": False, "label": f"probe-error:{exc}", "source": "exception"}
+
+    before = await _probe_region()
+    if before.get("ok") and not force:
+        log(f"{prefix} offer region already US: {before.get('source', '')} {before.get('label', '')}")
+        return True
+    if before.get("ok") and force:
+        log(f"{prefix} offer region US label found, force reselect before submit: {before.get('label', '')}")
+
+    try:
+        result = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const fire = (el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                };
+                const selectTargets = Array.from(document.querySelectorAll('select')).filter((sel) => {
+                    if (!visible(sel)) return false;
+                    const sig = String(sel.name || '') + ' ' + String(sel.id || '') + ' ' + String(sel.getAttribute('aria-label') || '') + ' ' + textOf(sel.closest('label'));
+                    return /country|region|location|billing|国家|地区|區域|地域|国|地域/i.test(sig) || (sel.options && sel.options.length > 10);
+                });
+                for (const sel of selectTargets) {
+                    const opts = Array.from(sel.options || []);
+                    const hit = opts.find((opt) => {
+                        const text = String(opt.text || opt.label || '').trim();
+                        const value = String(opt.value || '').trim();
+                        return value.toUpperCase() === 'US' || /united states|usa|u\.s\.|美国|美國|アメリカ|米国/i.test(text);
+                    });
+                    if (!hit) continue;
+                    if (String(sel.value || '').toUpperCase() === 'US' || /united states|usa|美国|美國|アメリカ|米国/i.test(textOf(sel))) {
+                        return { ok: true, mode: 'native-already', label: textOf(hit) || hit.value || 'US' };
+                    }
+                    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+                    if (setter) setter.call(sel, hit.value);
+                    else sel.value = hit.value;
+                    fire(sel);
+                    return { ok: true, mode: 'native-select', label: textOf(hit) || hit.value || 'US' };
+                }
+                return { ok: false, mode: 'not-found', label: '' };
+            }"""
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            await page.wait_for_timeout(1000)
+            after_native = await _probe_region()
+            if after_native.get("ok"):
+                log(
+                    f"{prefix} offer region selected US: {result.get('mode', '')} "
+                    f"{after_native.get('label', '')}"
+                )
+                return True
+            log(
+                f"{prefix} offer region native set unconfirmed: "
+                f"{result.get('mode', '')} -> {after_native.get('label', '')}"
+            )
+    except Exception:
+        pass
+
+    if await _click_chatgpt_offer_region_option_strict(page, prefix, "us", "select"):
+        return True
+
+    async def _click_open_us_region_option(mode: str) -> bool:
+        option_clicked = ""
+        try:
+            scoped_point = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const usText = /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国/i;
+                    const jpText = /japan|\bjp\b|jpy|日本/i;
+                    const roots = [];
+                    const pushRoot = (el) => {
+                        if (el && visible(el) && !roots.includes(el)) roots.push(el);
+                    };
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    pushRoot(controlId ? document.getElementById(controlId) : null);
+                    const active = document.activeElement;
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    pushRoot(activeDescendantId ? document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]') : null);
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]')).filter(visible)) {
+                        const rect = node.getBoundingClientRect();
+                        const text = textOf(node);
+                        if (rect.left < window.innerWidth * 0.45 && rect.width > window.innerWidth * 0.35) continue;
+                        if (/japan|andorra|angola|country|currency|united states|cape verde|djibouti/i.test(text)) pushRoot(node);
+                    }
+                    const root = roots[0] || null;
+                    if (!root) return { ok: false, reason: 'no-scoped-root', controlId };
+                    const itemOf = (el) => el.closest?.('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex]') || el;
+                    const options = Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex], div, span'))
+                        .filter(visible)
+                        .map((el) => {
+                            const item = itemOf(el);
+                            const rect = item.getBoundingClientRect();
+                            const text = textOf(item) || textOf(el);
+                            const value = String(item.getAttribute?.('data-value') || item.getAttribute?.('value') || item.getAttribute?.('aria-label') || '');
+                            const sig = [text, value, item.getAttribute?.('role') || ''].join(' ');
+                            if (!text || text.length > 140) return null;
+                            if (rect.width <= 0 || rect.height <= 0 || rect.width > Math.max(480, window.innerWidth * 0.45) || rect.height > 96) return null;
+                            if (!usText.test(sig) || jpText.test(sig)) return null;
+                            const exact = /^(united states|united states of america|usa|us|美国|美國|アメリカ|米国)$/i.test(text.toLowerCase()) ? 10 : 0;
+                            const roleScore = /option|menuitem/i.test(item.getAttribute?.('role') || '') ? 5 : 0;
+                            return { item, label: text.slice(0, 140), score: exact + roleScore - (rect.width * rect.height / 1000000) };
+                        })
+                        .filter(Boolean)
+                        .sort((a, b) => b.score - a.score);
+                    const hit = options[0] || null;
+                    const optionTexts = Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex]'))
+                        .filter(visible)
+                        .map((el) => textOf(el))
+                        .filter((text) => text && text.length <= 120);
+                    if (!hit) {
+                        return {
+                            ok: false,
+                            reason: 'us-not-visible',
+                            controlId,
+                            optionCount: optionTexts.length,
+                            firstOption: optionTexts[0] || '',
+                            lastOption: optionTexts[optionTexts.length - 1] || '',
+                            rootText: textOf(root).slice(0, 160)
+                        };
+                    }
+                    hit.item.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    const rect = hit.item.getBoundingClientRect();
+                    return {
+                        ok: true,
+                        controlId,
+                        label: hit.label,
+                        optionCount: optionTexts.length,
+                        x: Math.round(rect.left + Math.max(6, Math.min(rect.width - 6, rect.width / 2))),
+                        y: Math.round(rect.top + Math.max(6, Math.min(rect.height - 6, rect.height / 2)))
+                    };
+                }"""
+            )
+            if isinstance(scoped_point, dict) and scoped_point.get("ok"):
+                await page.mouse.move(float(scoped_point.get("x") or 0), float(scoped_point.get("y") or 0))
+                await page.mouse.down()
+                await page.wait_for_timeout(70)
+                await page.mouse.up()
+                option_clicked = f"scoped:{scoped_point.get('label', '')}"
+                await page.wait_for_timeout(1500)
+                after_scoped_pick = await _probe_region()
+                if after_scoped_pick.get("ok"):
+                    log(
+                        f"{prefix} offer region selected US by exact combobox {mode}: "
+                        f"{after_scoped_pick.get('label', '')}"
+                    )
+                    return True
+        except Exception:
+            pass
+        for option_selector in (
+            '[role="option"]:has-text("美国")',
+            '[role="menuitem"]:has-text("美国")',
+            '[data-radix-collection-item]:has-text("美国")',
+            'li:has-text("美国")',
+            'button:has-text("美国")',
+            '[role="option"]:has-text("美國")',
+            '[role="menuitem"]:has-text("美國")',
+            '[role="option"]:has-text("米国")',
+            '[role="menuitem"]:has-text("米国")',
+            '[role="option"]:has-text("United States")',
+            '[role="option"]:has-text("United States of America")',
+            '[role="menuitem"]:has-text("United States")',
+            '[data-radix-collection-item]:has-text("United States")',
+            '[cmdk-item]:has-text("United States")',
+            '[data-value="US"]',
+            '[data-value="us"]',
+            'li:has-text("United States")',
+            'button:has-text("United States")',
+        ):
+            try:
+                option = page.locator(option_selector).last
+                if await option.is_visible(timeout=450):
+                    await option.scroll_into_view_if_needed(timeout=1000)
+                    box = await option.bounding_box()
+                    if box:
+                        x_offset = float(box["width"] / 2)
+                        if box["width"] > 18:
+                            x_offset = min(float(box["width"] - 6), 14.0)
+                        await page.mouse.move(float(box["x"] + x_offset), float(box["y"] + box["height"] / 2))
+                        await page.mouse.down()
+                        await page.wait_for_timeout(70)
+                        await page.mouse.up()
+                        option_clicked = f"{option_selector}:mouse"
+                        await page.wait_for_timeout(1600)
+                        after_mouse_pick = await _probe_region()
+                        if not after_mouse_pick.get("ok") and not after_mouse_pick.get("label"):
+                            await page.wait_for_timeout(1000)
+                            after_mouse_pick = await _probe_region()
+                        if after_mouse_pick.get("ok"):
+                            log(
+                                f"{prefix} offer region selected US by exact combobox {mode}: "
+                                f"{after_mouse_pick.get('label', '')}"
+                            )
+                            return True
+                    await option.click(timeout=2500, force=True, no_wait_after=True)
+                    option_clicked = option_selector
+                    await page.wait_for_timeout(1800)
+                    break
+            except Exception:
+                continue
+        if not option_clicked:
+            try:
+                picked = await page.evaluate(
+                    r"""() => {
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                        };
+                        const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                        const clickLikeUser = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const x = rect.left + Math.max(6, Math.min(rect.width - 6, rect.width / 2));
+                            const y = rect.top + Math.max(6, Math.min(rect.height - 6, rect.height / 2));
+                            const pointerUpInit = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+                            const pointerDownInit = { ...pointerUpInit, buttons: 1 };
+                            const mouseUpInit = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0, buttons: 0 };
+                            const mouseDownInit = { ...mouseUpInit, buttons: 1 };
+                            el.focus?.();
+                            for (const type of ['pointerover', 'pointermove']) {
+                                try { el.dispatchEvent(new PointerEvent(type, pointerUpInit)); } catch { el.dispatchEvent(new MouseEvent(type.replace('pointer', 'mouse'), mouseUpInit)); }
+                            }
+                            try { el.dispatchEvent(new PointerEvent('pointerdown', pointerDownInit)); } catch { el.dispatchEvent(new MouseEvent('mousedown', mouseDownInit)); }
+                            el.dispatchEvent(new MouseEvent('mousedown', mouseDownInit));
+                            try { el.dispatchEvent(new PointerEvent('pointerup', pointerUpInit)); } catch { el.dispatchEvent(new MouseEvent('mouseup', mouseUpInit)); }
+                            el.dispatchEvent(new MouseEvent('mouseup', mouseUpInit));
+                            el.dispatchEvent(new MouseEvent('click', mouseUpInit));
+                        };
+                        const targetOf = (el) => (
+                            el.closest?.('[role="option"], [role="menuitem"], [data-radix-collection-item], [cmdk-item], [data-value], li, button, [tabindex]') ||
+                            el
+                        );
+                        const options = Array.from(document.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-collection-item], [cmdk-item], [data-value], [tabindex], li, button, div, span'))
+                            .filter(visible)
+                            .map((el) => {
+                                const target = targetOf(el);
+                                const rect = target.getBoundingClientRect();
+                                const text = textOf(target) || textOf(el);
+                                const value = String(target.getAttribute?.('data-value') || target.getAttribute?.('value') || target.getAttribute?.('aria-label') || '');
+                                const sig = [text, value, target.getAttribute?.('role') || '', target.getAttribute?.('data-radix-collection-item') || ''].join(' ');
+                                if (!text || text.length > 140) return null;
+                                if (rect.width <= 0 || rect.height <= 0 || rect.width > window.innerWidth * 0.72 || rect.height > 90) return null;
+                                if (/japan|日本|jpy/i.test(sig)) return null;
+                                if (!/united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国/i.test(sig)) return null;
+                                const exact = /^(united states|united states of america|usa|us|美国|美國|アメリカ|米国)$/i.test(text.toLowerCase()) ? 8 : 0;
+                                const roleScore = /option|menuitem/i.test(target.getAttribute?.('role') || '') ? 5 : 0;
+                                return { target, label: text.slice(0, 140), score: exact + roleScore - (rect.width * rect.height / 1000000) };
+                            })
+                            .filter(Boolean)
+                            .sort((a, b) => b.score - a.score);
+                        const hit = options[0];
+                        if (!hit) return { ok: false, label: '' };
+                        hit.target.scrollIntoView({ block: 'center', inline: 'center' });
+                        clickLikeUser(hit.target);
+                        return { ok: true, label: hit.label };
+                    }"""
+                )
+                if isinstance(picked, dict) and picked.get("ok"):
+                    option_clicked = f"js:{picked.get('label', '')}"
+                    await page.wait_for_timeout(1300)
+            except Exception:
+                pass
+        if not option_clicked:
+            return False
+        after_pick = await _probe_region()
+        if not after_pick.get("ok") and not after_pick.get("label"):
+            await page.wait_for_timeout(1000)
+            after_pick = await _probe_region()
+        if after_pick.get("ok"):
+            log(f"{prefix} offer region selected US by exact combobox {mode}: {after_pick.get('label', '')}")
+            return True
+        log(
+            f"{prefix} offer region exact combobox pick unconfirmed: "
+            f"mode={mode} option={option_clicked} -> {after_pick.get('label', '')}"
+        )
+        return False
+
+    async def _typeahead_us_from_open_region_menu(mode: str) -> bool:
+        for query in ("美国", "美國", "米国", "United States", "United States of America", "US"):
+            safe_state = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+                    const active = document.activeElement;
+                    const activeRole = active?.getAttribute?.('role') || '';
+                    const activeTag = String(active?.tagName || '').toLowerCase();
+                    const activeEditable = !!(active && (active.isContentEditable || /^(input|textarea)$/.test(activeTag) || activeRole === 'textbox'));
+                    const activeCombo = !!(active && activeRole === 'combobox' && active.closest?.('[data-testid="country-selector-in-pricing-modal"]'));
+                    const roots = [];
+                    const pushRoot = (el) => {
+                        if (el && visible(el) && !roots.includes(el)) roots.push(el);
+                    };
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    pushRoot(controlId ? document.getElementById(controlId) : null);
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    pushRoot(activeDescendantId ? document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]') : null);
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]')).filter(visible)) {
+                        const rect = node.getBoundingClientRect();
+                        const text = textOf(node);
+                        if (rect.left < window.innerWidth * 0.45 && rect.width > window.innerWidth * 0.35) continue;
+                        if (/japan|andorra|angola|country|currency|united states|cape verde|djibouti/i.test(text)) pushRoot(node);
+                    }
+                    const root = roots[0] || null;
+                    const activeOption = !!(active && root && /option|menuitem/i.test(activeRole) && root.contains(active));
+                    const activeInScopedMenu = !!(active && root && root.contains(active));
+                    return {
+                        ok: !activeEditable && !!root && (activeCombo || activeOption || activeInScopedMenu),
+                        controlId,
+                        activeRole,
+                        activeTag,
+                        activeEditable,
+                        activeText: textOf(active).slice(0, 100),
+                        openNodes: roots.length
+                    };
+                }"""
+            )
+            if not isinstance(safe_state, dict) or not safe_state.get("ok"):
+                log(f"{prefix} offer region typeahead skipped unsafe focus: mode={mode} state={safe_state}")
+                return False
+            await page.keyboard.type(query, delay=25)
+            await page.wait_for_timeout(550)
+            selected_state = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const usText = /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国/i;
+                    const jpText = /japan|\bjp\b|jpy|日本/i;
+                    const active = document.activeElement;
+                    const activeRole = active?.getAttribute?.('role') || '';
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    const activeDescendant = activeDescendantId ? document.getElementById(activeDescendantId) : null;
+                    const roots = [];
+                    const pushRoot = (el) => {
+                        if (el && visible(el) && !roots.includes(el)) roots.push(el);
+                    };
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    pushRoot(controlId ? document.getElementById(controlId) : null);
+                    pushRoot(activeDescendant?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]')).filter(visible)) {
+                        const rect = node.getBoundingClientRect();
+                        const text = textOf(node);
+                        if (rect.left < window.innerWidth * 0.45 && rect.width > window.innerWidth * 0.35) continue;
+                        if (/japan|andorra|angola|country|currency|united states|cape verde|djibouti/i.test(text)) pushRoot(node);
+                    }
+                    const root = roots[0] || null;
+                    const highlighted = root ? Array.from(root.querySelectorAll('[data-highlighted], [data-state="checked"], [aria-current="true"]')).filter(visible)[0] || null : null;
+                    const activeText = textOf(activeDescendant) || textOf(highlighted) || textOf(active);
+                    const highlightedText = textOf(highlighted);
+                    return {
+                        ok: !!root,
+                        controlId,
+                        activeRole,
+                        activeText: activeText.slice(0, 120),
+                        highlightedText: highlightedText.slice(0, 120),
+                        usActive: usText.test(activeText) && !jpText.test(activeText),
+                        usHighlighted: usText.test(highlightedText) && !jpText.test(highlightedText),
+                        openNodes: roots.length
+                    };
+                }"""
+            )
+            if isinstance(selected_state, dict) and (selected_state.get("usActive") or selected_state.get("usHighlighted")):
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(1300)
+            else:
+                log(
+                    f"{prefix} offer region typeahead no US highlight: "
+                    f"mode={mode} query={query} state={selected_state}"
+                )
+                await page.wait_for_timeout(1100)
+                continue
+            after_typeahead = await _probe_region()
+            if after_typeahead.get("ok"):
+                log(f"{prefix} offer region selected US by typeahead {mode}: {after_typeahead.get('label', '')}")
+                return True
+            log(
+                f"{prefix} offer region typeahead unconfirmed: "
+                f"mode={mode} query={query} state={safe_state} -> {after_typeahead.get('label', '')}"
+            )
+            await page.wait_for_timeout(1100)
+        return False
+
+    async def _keyboard_select_open_us_region_option(mode: str) -> bool:
+        """只用地区弹层内键盘导航选美国，避免把 United States 输入聊天框。"""
+        last_state: dict[str, Any] | None = None
+        last_marker = ""
+        stalled_steps = 0
+        for step in range(0, 180):
+            state = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const usText = /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国/i;
+                    const jpText = /japan|\bjp\b|jpy|日本/i;
+                    const active = document.activeElement;
+                    const activeRole = active?.getAttribute?.('role') || '';
+                    const activeTag = String(active?.tagName || '').toLowerCase();
+                    const activeEditable = !!(active && (active.isContentEditable || /^(input|textarea)$/.test(activeTag) || activeRole === 'textbox'));
+                    const activeCombo = !!(active && activeRole === 'combobox' && active.closest?.('[data-testid="country-selector-in-pricing-modal"]'));
+                    const roots = [];
+                    const pushRoot = (el) => {
+                        if (el && visible(el) && !roots.includes(el)) roots.push(el);
+                    };
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    pushRoot(controlId ? document.getElementById(controlId) : null);
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    const activeDescendant = activeDescendantId ? document.getElementById(activeDescendantId) : null;
+                    pushRoot(activeDescendant?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]')).filter(visible)) {
+                        const rect = node.getBoundingClientRect();
+                        const text = textOf(node);
+                        if (rect.left < window.innerWidth * 0.45 && rect.width > window.innerWidth * 0.35) continue;
+                        if (/japan|andorra|angola|country|currency|united states|cape verde|djibouti/i.test(text)) pushRoot(node);
+                    }
+                    const root = roots[0] || null;
+                    const activeOption = !!(active && root && /option|menuitem/i.test(activeRole) && root.contains(active));
+                    const activeInScopedMenu = !!(active && root && root.contains(active));
+                    const highlighted = root ? Array.from(root.querySelectorAll('[data-highlighted], [data-state="checked"], [aria-current="true"]')).filter(visible)[0] || null : null;
+                    const optionNodes = root ? Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex]'))
+                        .filter(visible)
+                        .filter((el) => {
+                            const text = textOf(el);
+                            const rect = el.getBoundingClientRect();
+                            if (!text || text.length > 150) return false;
+                            if (rect.width > Math.max(480, window.innerWidth * 0.45) || rect.height > 120) return false;
+                            return true;
+                        }) : [];
+                    const activeText = textOf(activeDescendant) || textOf(highlighted) || textOf(active);
+                    const usNode = optionNodes.find((el) => {
+                        const sig = [textOf(el), el.getAttribute?.('data-value') || '', el.getAttribute?.('value') || '', el.getAttribute?.('aria-label') || ''].join(' ');
+                        return usText.test(sig) && !jpText.test(sig);
+                    });
+                    const highlightedText = textOf(highlighted);
+                    const safeFocus = !activeEditable && !!root && (activeCombo || activeOption || activeInScopedMenu);
+                    return {
+                        ok: safeFocus,
+                        controlId,
+                        activeRole,
+                        activeTag,
+                        activeEditable,
+                        activeText: activeText.slice(0, 120),
+                        highlightedText: highlightedText.slice(0, 120),
+                        openNodes: roots.length,
+                        optionCount: optionNodes.length,
+                        usVisible: !!usNode,
+                        usText: usNode ? textOf(usNode).slice(0, 120) : '',
+                        usActive: usText.test(activeText) && !jpText.test(activeText),
+                        usHighlighted: usText.test(highlightedText) && !jpText.test(highlightedText)
+                    };
+                }"""
+            )
+            if not isinstance(state, dict) or not state.get("ok"):
+                log(f"{prefix} offer region keyboard skipped unsafe focus: mode={mode} step={step} state={state}")
+                return False
+            last_state = state
+            marker = f"{state.get('activeText', '')}|{state.get('highlightedText', '')}"
+            if marker == last_marker and step > 0:
+                stalled_steps += 1
+            else:
+                stalled_steps = 0
+                last_marker = marker
+            if stalled_steps >= 18 and not state.get("usActive") and not state.get("usHighlighted"):
+                log(f"{prefix} offer region keyboard stalled: mode={mode} step={step} state={state}")
+                return False
+            if state.get("usActive") or state.get("usHighlighted"):
+                await page.keyboard.press("Enter")
+                await page.wait_for_timeout(1400)
+                after_enter = await _probe_region()
+                if after_enter.get("ok"):
+                    log(
+                        f"{prefix} offer region selected US by keyboard {mode}: "
+                        f"{after_enter.get('label', '')}"
+                    )
+                    return True
+                log(
+                    f"{prefix} offer region keyboard enter unconfirmed: "
+                    f"mode={mode} step={step} state={state} -> {after_enter.get('label', '')}"
+                )
+                return False
+            await page.keyboard.press("ArrowDown")
+            await page.wait_for_timeout(85 if step < 80 else 55)
+        log(f"{prefix} offer region keyboard exhausted: mode={mode} state={last_state}")
+        return False
+
+    async def _wheel_open_region_menu_for_us(mode: str) -> bool:
+        """Radix 国家列表常用虚拟滚动；用鼠标滚轮逐屏找 United States。"""
+        last_state: dict[str, Any] | None = None
+        for step in range(1, 140):
+            if await _click_open_us_region_option(f"{mode}:wheel-{step}"):
+                return True
+            menu_state = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const active = document.activeElement;
+                    const activeRole = active?.getAttribute?.('role') || '';
+                    const activeTag = String(active?.tagName || '').toLowerCase();
+                    const activeEditable = !!(active && (active.isContentEditable || /^(input|textarea)$/.test(activeTag) || activeRole === 'textbox'));
+                    const roots = [];
+                    const pushRoot = (el) => {
+                        if (el && visible(el) && !roots.includes(el)) roots.push(el);
+                    };
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    pushRoot(controlId ? document.getElementById(controlId) : null);
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    pushRoot(activeDescendantId ? document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]') : null);
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]')).filter(visible)) {
+                        const rect = node.getBoundingClientRect();
+                        const text = textOf(node);
+                        if (rect.left < window.innerWidth * 0.45 && rect.width > window.innerWidth * 0.35) continue;
+                        if (/japan|andorra|angola|country|currency|united states|cape verde|djibouti/i.test(text)) pushRoot(node);
+                    }
+                    const root = roots[0] || null;
+                    const optionNodes = root ? Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex]'))
+                        .filter(visible)
+                        .filter((el) => {
+                            const text = textOf(el);
+                            const rect = el.getBoundingClientRect();
+                            if (!text || text.length > 160) return false;
+                            if (rect.width > Math.max(520, window.innerWidth * 0.45) || rect.height > 140) return false;
+                            return true;
+                        }) : [];
+                    const scrollTargets = root ? Array.from(root.querySelectorAll('[data-radix-select-viewport], [data-radix-scroll-area-viewport], [style*="overflow"], div'))
+                        .filter(visible)
+                        .filter((el) => el.scrollHeight > el.clientHeight + 8) : [];
+                    if (root && root.scrollHeight > root.clientHeight + 8) scrollTargets.push(root);
+                    const scroller = scrollTargets.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0] || root;
+                    const activeOptionForPoint = active && root && root.contains(active) && /option|menuitem/i.test(activeRole) && visible(active) ? active : null;
+                    const optionForPoint = activeOptionForPoint || optionNodes[0] || null;
+                    const pointRect = optionForPoint?.getBoundingClientRect?.() || root?.getBoundingClientRect?.() || null;
+                    if (!root || !pointRect || activeEditable) {
+                        return {
+                            ok: false,
+                            reason: activeEditable ? 'unsafe-focus' : 'no-menu-point',
+                            controlId,
+                            activeRole,
+                            activeTag,
+                            activeText: textOf(active).slice(0, 100),
+                            optionCount: optionNodes.length,
+                            openCount: roots.length
+                        };
+                    }
+                    const x = Math.max(40, Math.min(window.innerWidth - 40, pointRect.left + pointRect.width / 2));
+                    const y = Math.max(60, Math.min(window.innerHeight - 60, pointRect.top + pointRect.height / 2));
+                    let before = 0;
+                    let after = 0;
+                    let scrollHeight = 0;
+                    if (scroller && scroller.scrollHeight > scroller.clientHeight + 8) {
+                        before = scroller.scrollTop;
+                        scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(220, Math.floor(scroller.clientHeight * 0.9)));
+                        scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+                        after = scroller.scrollTop;
+                        scrollHeight = scroller.scrollHeight;
+                    }
+                    return {
+                        ok: true,
+                        controlId,
+                        x: Math.round(x),
+                        y: Math.round(y),
+                        activeRole,
+                        activeTag,
+                        activeText: textOf(active).slice(0, 100),
+                        firstOption: optionNodes.length ? textOf(optionNodes[0]).slice(0, 80) : '',
+                        lastOption: optionNodes.length ? textOf(optionNodes[optionNodes.length - 1]).slice(0, 80) : '',
+                        optionCount: optionNodes.length,
+                        openCount: roots.length,
+                        before,
+                        after,
+                        scrollHeight
+                    };
+                }"""
+            )
+            if not isinstance(menu_state, dict) or not menu_state.get("ok"):
+                log(f"{prefix} offer region wheel skipped: mode={mode} step={step} state={menu_state}")
+                return False
+            last_state = menu_state
+            await page.mouse.move(float(menu_state.get("x") or 0), float(menu_state.get("y") or 0))
+            await page.mouse.wheel(0, 520)
+            await page.wait_for_timeout(140)
+        log(f"{prefix} offer region wheel exhausted: mode={mode} state={last_state}")
+        return False
+
+    async def _scroll_open_region_menu_for_us(mode: str) -> bool:
+        for step in range(1, 32):
+            if await _click_open_us_region_option(f"{mode}:scroll-{step}"):
+                return True
+            scrolled = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+                    const roots = [];
+                    const pushRoot = (el) => {
+                        if (el && visible(el) && !roots.includes(el)) roots.push(el);
+                    };
+                    const active = document.activeElement;
+                    const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                    const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                    pushRoot(controlId ? document.getElementById(controlId) : null);
+                    const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                    pushRoot(activeDescendantId ? document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]') : null);
+                    pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                    for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]')).filter(visible)) {
+                        const rect = node.getBoundingClientRect();
+                        const text = textOf(node);
+                        if (rect.left < window.innerWidth * 0.45 && rect.width > window.innerWidth * 0.35) continue;
+                        if (/japan|andorra|angola|country|currency|united states|cape verde|djibouti/i.test(text)) pushRoot(node);
+                    }
+                    const root = roots[0] || null;
+                    if (!root) return { ok: false, reason: 'no-scoped-root', controlId };
+                    const containers = Array.from(root.querySelectorAll('[data-radix-select-viewport], [data-radix-scroll-area-viewport], [style*="overflow"], div'))
+                        .filter(visible)
+                        .filter((el) => el.scrollHeight > el.clientHeight + 8)
+                        .map((el) => {
+                            const rect = el.getBoundingClientRect();
+                            const text = textOf(el);
+                            return { el, text, area: rect.width * rect.height, top: el.scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight };
+                        })
+                        .filter((item) => item.area > 80 && item.area < window.innerWidth * window.innerHeight * 0.35)
+                        .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+                    if (root.scrollHeight > root.clientHeight + 8) {
+                        const rect = root.getBoundingClientRect();
+                        containers.push({ el: root, text: textOf(root), area: rect.width * rect.height, top: root.scrollTop, clientHeight: root.clientHeight, scrollHeight: root.scrollHeight });
+                    }
+                    const hit = containers[0];
+                    if (!hit) return { ok: false, reason: 'no-scroll-container', controlId, rootText: textOf(root).slice(0, 120) };
+                    const before = hit.el.scrollTop;
+                    hit.el.scrollTop = Math.min(hit.el.scrollHeight, hit.el.scrollTop + Math.max(220, Math.floor(hit.el.clientHeight * 0.9)));
+                    hit.el.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    const options = Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex]'))
+                        .filter(visible)
+                        .map((el) => textOf(el))
+                        .filter((text) => text && text.length <= 120);
+                    return {
+                        ok: hit.el.scrollTop !== before,
+                        reason: hit.el.scrollTop === before ? 'end' : 'scrolled',
+                        controlId,
+                        before,
+                        after: hit.el.scrollTop,
+                        scrollHeight: hit.el.scrollHeight,
+                        text: hit.text.slice(0, 120),
+                        firstOption: options[0] || '',
+                        lastOption: options[options.length - 1] || ''
+                    };
+                }"""
+            )
+            if not isinstance(scrolled, dict) or not scrolled.get("ok"):
+                if step == 1:
+                    log(f"{prefix} offer region menu scroll skipped: {scrolled}")
+                break
+            await page.wait_for_timeout(300)
+        return False
+
+    try:
+        opened_selector = ""
+        opened_modes: list[str] = []
+        for selector in (
+            '[data-testid="country-selector-in-pricing-modal"] button[role="combobox"]',
+            '[data-testid="country-selector-in-pricing-modal"] [role="combobox"]',
+            'button[role="combobox"][aria-labelledby*="_r_"]:has-text("Japan")',
+        ):
+            try:
+                region_button = page.locator(selector).first
+                if not await region_button.is_visible(timeout=700) or not await region_button.is_enabled(timeout=700):
+                    continue
+                opened_selector = selector
+                await region_button.scroll_into_view_if_needed(timeout=1000)
+                box = await region_button.bounding_box()
+                if box:
+                    click_points = (
+                        ("mouse-right", float(box["x"] + max(6, box["width"] - 12)), float(box["y"] + box["height"] / 2)),
+                        ("mouse-center", float(box["x"] + box["width"] / 2), float(box["y"] + box["height"] / 2)),
+                    )
+                    for mode, x, y in click_points:
+                        await page.mouse.move(x, y)
+                        await page.mouse.down()
+                        await page.wait_for_timeout(60)
+                        await page.mouse.up()
+                        opened_modes.append(mode)
+                        await page.wait_for_timeout(650)
+                        if await _click_open_us_region_option(mode):
+                            return True
+                        if await _typeahead_us_from_open_region_menu(mode):
+                            return True
+                        if await _wheel_open_region_menu_for_us(mode):
+                            return True
+                        if await _scroll_open_region_menu_for_us(mode):
+                            return True
+                        if await _keyboard_select_open_us_region_option(mode):
+                            return True
+                try:
+                    await region_button.click(timeout=2500, force=True, no_wait_after=True)
+                    opened_modes.append("locator-click")
+                    await page.wait_for_timeout(700)
+                    if await _click_open_us_region_option("locator-click"):
+                        return True
+                    if await _typeahead_us_from_open_region_menu("locator-click"):
+                        return True
+                    if await _wheel_open_region_menu_for_us("locator-click"):
+                        return True
+                    if await _scroll_open_region_menu_for_us("locator-click"):
+                        return True
+                    if await _keyboard_select_open_us_region_option("locator-click"):
+                        return True
+                except Exception:
+                    pass
+
+                # Radix Select 有时只响应键盘开关；仅当焦点确认为地区 combobox 时才发键，避免误输入聊天框。
+                await region_button.focus(timeout=1000)
+                active_safe = await region_button.evaluate(
+                    r"""(el) => {
+                        const active = document.activeElement;
+                        return active === el && active.getAttribute('role') === 'combobox' && !!active.closest('[data-testid="country-selector-in-pricing-modal"]');
+                    }"""
+                )
+                if active_safe:
+                    for key in ("Enter", "Space", "ArrowDown", "Alt+ArrowDown"):
+                        await page.keyboard.press(key)
+                        opened_modes.append(f"key:{key}")
+                        await page.wait_for_timeout(750)
+                        if await _click_open_us_region_option(f"key:{key}"):
+                            return True
+                        if await _typeahead_us_from_open_region_menu(f"key:{key}"):
+                            return True
+                        if await _wheel_open_region_menu_for_us(f"key:{key}"):
+                            return True
+                        if await _scroll_open_region_menu_for_us(f"key:{key}"):
+                            return True
+                        if await _keyboard_select_open_us_region_option("focused-combobox"):
+                            return True
+                if await _click_open_us_region_option("open-menu"):
+                    return True
+                if await _typeahead_us_from_open_region_menu("open-menu"):
+                    return True
+                if await _wheel_open_region_menu_for_us("open-menu"):
+                    return True
+                if await _keyboard_select_open_us_region_option("open-menu"):
+                    return True
+                if await _scroll_open_region_menu_for_us("open-menu"):
+                    return True
+                after_exact = await _probe_region()
+                menu_state = await page.evaluate(
+                    r"""(sel) => {
+                        const btn = document.querySelector(sel);
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                        };
+                        const openNodes = Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-popper-content-wrapper], [data-state="open"]')).filter(visible).length;
+                        return {
+                            ariaExpanded: btn?.getAttribute?.('aria-expanded') || '',
+                            dataState: btn?.getAttribute?.('data-state') || '',
+                            openNodes,
+                            activeRole: document.activeElement?.getAttribute?.('role') || '',
+                            activeText: String(document.activeElement?.innerText || document.activeElement?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+                        };
+                    }""",
+                    selector,
+                )
+                log(
+                    f"{prefix} offer region exact combobox not confirmed: "
+                    f"opened={opened_selector} modes={opened_modes} state={menu_state} -> {after_exact.get('label', '')}"
+                )
+                break
+            except Exception:
+                continue
+    except Exception as exc:
+        log(f"{prefix} offer region exact combobox path skipped: {exc}")
+
+    try:
+        # ChatGPT 套餐页国家控件是自绘弹层，DOM click 常只点到 span；需向上找真正可交互父级。
+        menu_point = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const interactiveOf = (el) => {
+                    const wanted = /country|currency|region|japan|\bjp\b|jpy|国家|地区|地域|国|日本/i;
+                    let best = null;
+                    let bestScore = -9999;
+                    let node = el;
+                    for (let depth = 0; node && node.nodeType === 1 && depth < 9; depth++, node = node.parentElement) {
+                        if (!visible(node)) continue;
+                        const rect = node.getBoundingClientRect();
+                        if (rect.width > window.innerWidth * 0.82 || rect.height > window.innerHeight * 0.45) continue;
+                        const tag = String(node.tagName || '').toLowerCase();
+                        const role = String(node.getAttribute?.('role') || '').toLowerCase();
+                        const aria = String(node.getAttribute?.('aria-label') || '');
+                        const testid = String(node.getAttribute?.('data-testid') || '');
+                        const cls = String(node.className || '');
+                        const style = getComputedStyle(node);
+                        const text = textOf(node) || textOf(el);
+                        let score = 0 - depth;
+                        if (/^(button|select)$/.test(tag)) score += 12;
+                        if (/button|combobox|menuitem|option/.test(role)) score += 10;
+                        if (node.hasAttribute?.('aria-haspopup')) score += 9;
+                        if (node.tabIndex >= 0) score += 6;
+                        if (typeof node.onclick === 'function') score += 5;
+                        if (style.cursor === 'pointer') score += 5;
+                        if (/cursor-pointer|select|dropdown|menu|popover|country|currency/i.test(cls + ' ' + testid + ' ' + aria)) score += 4;
+                        if (/country|currency|国家|地区|地域|国/i.test(text + ' ' + aria + ' ' + testid)) score += 4;
+                        if (wanted.test(text + ' ' + aria + ' ' + testid)) score += 2;
+                        if (score > bestScore) {
+                            best = node;
+                            bestScore = score;
+                        }
+                    }
+                    return best || el;
+                };
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"], [aria-haspopup], [data-testid], [tabindex], div, span'))
+                    .filter(visible)
+                    .filter((el) => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.top < window.innerHeight * 0.35 || rect.left < window.innerWidth * 0.35) return false;
+                        if (rect.width > window.innerWidth * 0.65 || rect.height > window.innerHeight * 0.35) return false;
+                        const text = textOf(el);
+                        if (!text || text.length > 180) return false;
+                        if (/open image|chatgpt said|you said|chatgpt can make mistakes|ask anything/i.test(text)) return false;
+                        return /country|currency|region|japan|\bjp\b|jpy|国家|地区|地域|国|日本/i.test(text);
+                    })
+                    .map((el) => {
+                        const target = interactiveOf(el);
+                        const rect = target.getBoundingClientRect();
+                        const text = textOf(target) || textOf(el);
+                        const targetSig = [
+                            target.tagName || '',
+                            target.getAttribute?.('role') || '',
+                            target.getAttribute?.('aria-label') || '',
+                            target.getAttribute?.('data-testid') || '',
+                            String(target.className || '').slice(0, 80)
+                        ].join(' ');
+                        const specific = /country|currency|国家|地区|地域|国/i.test(text) ? 2 : 0;
+                        const jp = /japan|\bjp\b|jpy|日本/i.test(text) ? 1 : 0;
+                        const interactive = /button|combobox|menuitem|option|cursor-pointer|select|dropdown|menu|popover/i.test(targetSig) || target.tabIndex >= 0 || target.hasAttribute?.('aria-haspopup') ? 3 : 0;
+                        const score = specific + jp + (rect.top / Math.max(1, window.innerHeight)) + (rect.left / Math.max(1, window.innerWidth));
+                        return {
+                            ok: true,
+                            label: text.slice(0, 180),
+                            tag: target.tagName || '',
+                            role: target.getAttribute?.('role') || '',
+                            aria: target.getAttribute?.('aria-label') || '',
+                            testid: target.getAttribute?.('data-testid') || '',
+                            x: Math.round(rect.left + Math.max(6, Math.min(rect.width - 6, rect.width / 2))),
+                            y: Math.round(rect.top + Math.max(6, Math.min(rect.height - 6, rect.height / 2))),
+                            score: score + interactive
+                        };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                return nodes[0] || { ok: false, label: '' };
+            }"""
+        )
+        if isinstance(menu_point, dict) and menu_point.get("ok"):
+            await page.mouse.move(float(menu_point.get("x") or 0), float(menu_point.get("y") or 0))
+            await page.mouse.down()
+            await page.wait_for_timeout(80)
+            await page.mouse.up()
+            await page.wait_for_timeout(1100)
+            option_point = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const interactiveOf = (el) => (
+                        el.closest?.('[role="option"], [role="menuitem"], button, [data-radix-collection-item], [cmdk-item], [data-value], [tabindex]') ||
+                        el
+                    );
+                    const options = Array.from(document.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-collection-item], [cmdk-item], [data-value], [tabindex], li, button, div, span'))
+                        .filter(visible)
+                        .filter((el) => {
+                            const rect = el.getBoundingClientRect();
+                            const text = textOf(el);
+                            const value = String(el.getAttribute?.('data-value') || el.getAttribute?.('value') || el.getAttribute?.('aria-label') || '');
+                            if (!text || text.length > 140) return false;
+                            if (rect.width > window.innerWidth * 0.75 || rect.height > window.innerHeight * 0.35) return false;
+                            if (/chatgpt said|you said|ask anything|new chat|search chats/i.test(text)) return false;
+                            if (/japan|日本|jpy/i.test(text + ' ' + value)) return false;
+                            return /united states|united states of america|usa|\bus\b|美国|美國|アメリカ|米国/i.test(text + ' ' + value);
+                        })
+                        .map((el) => {
+                            const target = interactiveOf(el);
+                            const rect = target.getBoundingClientRect();
+                            const text = textOf(target) || textOf(el);
+                            const exact = /^(united states|united states of america|usa|us|美国|美國|アメリカ|米国)$/i.test(norm(text)) ? 2 : 0;
+                            const small = Math.max(1, rect.width * rect.height);
+                            return {
+                                ok: true,
+                                label: text.slice(0, 140),
+                                x: Math.round(rect.left + Math.max(6, Math.min(rect.width - 6, rect.width / 2))),
+                                y: Math.round(rect.top + Math.max(6, Math.min(rect.height - 6, rect.height / 2))),
+                                score: exact - (small / 1000000)
+                            };
+                        })
+                        .sort((a, b) => b.score - a.score);
+                    return options[0] || { ok: false, label: '' };
+                }"""
+            )
+            if isinstance(option_point, dict) and option_point.get("ok"):
+                await page.mouse.click(float(option_point.get("x") or 0), float(option_point.get("y") or 0))
+                await page.wait_for_timeout(1400)
+                after_mouse = await _probe_region()
+                if after_mouse.get("ok"):
+                    log(
+                        f"{prefix} offer region selected US by mouse: "
+                        f"{after_mouse.get('label', '')}"
+                    )
+                    return True
+                log(
+                    f"{prefix} offer region mouse pick unconfirmed: "
+                    f"{option_point.get('label', '')} -> {after_mouse.get('label', '')}"
+                )
+            else:
+                log(
+                    f"{prefix} offer region mouse menu opened but US option not found: "
+                    f"{menu_point.get('label', '')}"
+                )
+    except Exception as exc:
+        log(f"{prefix} offer region mouse path skipped: {exc}")
+
+    try:
+        clicked = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const interactiveOf = (el) => {
+                    let best = el;
+                    let bestScore = -9999;
+                    let node = el;
+                    for (let depth = 0; node && node.nodeType === 1 && depth < 9; depth++, node = node.parentElement) {
+                        if (!visible(node)) continue;
+                        const rect = node.getBoundingClientRect();
+                        if (rect.width > window.innerWidth * 0.82 || rect.height > window.innerHeight * 0.45) continue;
+                        const tag = String(node.tagName || '').toLowerCase();
+                        const role = String(node.getAttribute?.('role') || '').toLowerCase();
+                        const sig = [
+                            node.getAttribute?.('aria-label') || '',
+                            node.getAttribute?.('data-testid') || '',
+                            String(node.className || ''),
+                            textOf(node)
+                        ].join(' ');
+                        const style = getComputedStyle(node);
+                        let score = 0 - depth;
+                        if (/^(button|select)$/.test(tag)) score += 12;
+                        if (/button|combobox|menuitem|option/.test(role)) score += 10;
+                        if (node.hasAttribute?.('aria-haspopup')) score += 9;
+                        if (node.tabIndex >= 0) score += 6;
+                        if (typeof node.onclick === 'function') score += 5;
+                        if (style.cursor === 'pointer') score += 5;
+                        if (/cursor-pointer|select|dropdown|menu|popover|country|currency/i.test(sig)) score += 4;
+                        if (/country|currency|region|japan|\bjp\b|日本|united states|\bus\b|usa|美国|美國|アメリカ|米国/i.test(sig)) score += 2;
+                        if (score > bestScore) {
+                            best = node;
+                            bestScore = score;
+                        }
+                    }
+                    return best || el;
+                };
+                const clickEl = (el) => {
+                    const target = interactiveOf(el);
+                    try { target.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+                    try {
+                        const rect = target.getBoundingClientRect();
+                        const x = rect.left + Math.max(4, Math.min(rect.width - 4, rect.width / 2));
+                        const y = rect.top + Math.max(4, Math.min(rect.height - 4, rect.height / 2));
+                        target.focus?.();
+                        for (const type of ['pointerover', 'mouseover', 'pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                            target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
+                        }
+                        return { ok: true, label: textOf(target), tag: target.tagName, role: target.getAttribute?.('role') || '', aria: target.getAttribute?.('aria-label') || '' };
+                    } catch {}
+                    return { ok: false, label: textOf(el), tag: el.tagName, role: el.getAttribute?.('role') || '', aria: el.getAttribute?.('aria-label') || '' };
+                };
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"], [aria-haspopup], [data-testid], div, span'))
+                    .filter(visible)
+                    .filter((el) => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.top < window.innerHeight * 0.38 || rect.left < window.innerWidth * 0.38) return false;
+                        if (rect.width > window.innerWidth * 0.65 || rect.height > window.innerHeight * 0.35) return false;
+                        return true;
+                    });
+                const countryLike = nodes.filter((el) => {
+                    const text = textOf(el);
+                    if (!text || text.length > 180) return false;
+                    return /country|currency|region|japan|\bjp\b|日本|united states|\bus\b|usa|美国|美國|アメリカ|米国/i.test(text);
+                }).sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    const aText = textOf(a);
+                    const bText = textOf(b);
+                    const aSpecific = /country|currency|国家|地区|地域|国/i.test(aText) ? 1 : 0;
+                    const bSpecific = /country|currency|国家|地区|地域|国/i.test(bText) ? 1 : 0;
+                    return (bSpecific - aSpecific) || ((br.top + br.left) - (ar.top + ar.left));
+                });
+                const target = countryLike[0];
+                if (!target) return { ok: false, label: '' };
+                return clickEl(target);
+            }"""
+        )
+        clicked_ok = bool(clicked) if not isinstance(clicked, dict) else bool(clicked.get("ok"))
+        if clicked_ok:
+            await page.wait_for_timeout(600)
+            picked = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const exactUS = (el) => {
+                        const text = norm(textOf(el));
+                        const value = norm(el.getAttribute?.('data-value') || el.getAttribute?.('value') || '');
+                        return (
+                            text === 'united states' || text === 'united states of america' || text === 'usa' || text === 'us' ||
+                            value === 'us' || text === '美国' || text === '美國' || text === 'アメリカ' || text === '米国'
+                        );
+                    };
+                    const likelyUS = (el) => {
+                        const text = textOf(el);
+                        const value = String(el.getAttribute?.('data-value') || el.getAttribute?.('value') || '');
+                        if (/japan|日本|jpy/i.test(text + ' ' + value)) return false;
+                        return /united states|usa|\bus\b|美国|美國|アメリカ|米国/i.test(text + ' ' + value);
+                    };
+                    const selectors = [
+                        '[role="option"]',
+                        '[role="menuitem"]',
+                        '[role="listbox"] [role="option"]',
+                        '[data-radix-collection-item]',
+                        '[cmdk-item]',
+                        '[data-value]',
+                        'li',
+                        'button',
+                        'div',
+                        'span'
+                    ];
+                    const options = [];
+                    for (const sel of selectors) {
+                        for (const el of Array.from(document.querySelectorAll(sel))) {
+                            if (!visible(el)) continue;
+                            const text = textOf(el);
+                            if (!text || text.length > 120) continue;
+                            if (!likelyUS(el)) continue;
+                            options.push(el);
+                        }
+                    }
+                    const uniq = Array.from(new Set(options));
+                    const target = uniq.find(exactUS) || uniq[0];
+                    if (!target) return { ok: false, label: '' };
+                    target.scrollIntoView({ block: 'center', inline: 'center' });
+                    target.click();
+                    return { ok: true, label: textOf(target).slice(0, 120) };
+                }"""
+            )
+            if isinstance(picked, dict) and picked.get("ok"):
+                await page.wait_for_timeout(1200)
+                after_menu = await _probe_region()
+                if after_menu.get("ok"):
+                    log(f"{prefix} offer region selected US by menu: {after_menu.get('label', '')}")
+                    return True
+                log(
+                    f"{prefix} offer region menu pick unconfirmed: "
+                    f"{picked.get('label', '')} -> {after_menu.get('label', '')}"
+                )
+            try:
+                candidates = await page.evaluate(
+                    r"""() => {
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                        };
+                        const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                        return Array.from(document.querySelectorAll('button, [role], [aria-haspopup], [data-testid], li, option, div, span'))
+                            .filter(visible)
+                            .map((el) => {
+                                const rect = el.getBoundingClientRect();
+                                return {
+                                    tag: el.tagName,
+                                    role: el.getAttribute?.('role') || '',
+                                    aria: el.getAttribute?.('aria-label') || '',
+                                    testid: el.getAttribute?.('data-testid') || '',
+                                    text: textOf(el).slice(0, 120),
+                                    x: Math.round(rect.left),
+                                    y: Math.round(rect.top),
+                                    w: Math.round(rect.width),
+                                    h: Math.round(rect.height)
+                                };
+                            })
+                            .filter((x) => x.text && x.text.length <= 140 && /country|currency|region|japan|united states|\bus\b|usa|usd|jpy|国家|地区|地域|日本|美国|美國|アメリカ|米国/i.test([x.text, x.aria, x.testid].join(' ')))
+                            .slice(0, 12);
+                    }"""
+                )
+                log(f"{prefix} offer region menu opened but US option not found: clicked={clicked} candidates={candidates}")
+            except Exception:
+                log(f"{prefix} offer region menu opened but US option not found: {clicked}")
+    except Exception:
+        pass
+    final_probe = await _probe_region()
+    if final_probe.get("label"):
+        log(f"{prefix} offer region still not US: {final_probe.get('label', '')}")
+    return False
+
+
+async def _wait_chatgpt_offer_us_pricing(page, prefix: str, *, timeout_ms: int = 10_000) -> bool:
+    """提交套餐前确认弹窗价格已随美国地区刷新，避免生成 JPY checkout。"""
+    deadline = time.monotonic() + max(1.0, timeout_ms / 1000)
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        try:
+            status = await page.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                    const scopes = Array.from(document.querySelectorAll('#modal-account-payment, [data-testid="modal-account-payment"], [role="dialog"]'))
+                        .filter(visible);
+                    const scope = scopes.find((el) => /plus|trial|free|country|currency|jpy|usd|\$|¥|套餐|試用|支払|支払い/i.test(textOf(el))) || null;
+                    if (!scope) return { ok: true, reason: 'missing-modal' };
+                    const text = textOf(scope).slice(0, 3000);
+                    const exactRegion = Array.from(scope.querySelectorAll('[data-testid="country-selector-in-pricing-modal"]'))
+                        .filter(visible)
+                        .map((el) => textOf(el))
+                        .find(Boolean) || '';
+                    const fallbackRegion = Array.from(scope.querySelectorAll('[role="combobox"], button'))
+                        .filter(visible)
+                        .map((el) => textOf(el))
+                        .find((value) => /country|currency|japan|united states|usa|\bus\b|usd|jpy|美国|美國|日本|アメリカ|米国/i.test(value)) || '';
+                    const region = exactRegion || fallbackRegion;
+                    const countryUS = /united states|usa|\bus\b|usd|美国|美國|アメリカ|米国/i.test(region);
+                    const countryJP = /japan|\bjp\b|jpy|日本/i.test(region);
+                    const hasJPY = /jpy|¥|￥|円/i.test(text);
+                    const hasUSD = /usd|us\$|\$|united states|usa|\bus\b/i.test(text + ' ' + region);
+                    return {
+                        ok: (countryUS && !countryJP && !hasJPY) || (!hasJPY && hasUSD),
+                        reason: 'modal-pricing',
+                        countryUS,
+                        countryJP,
+                        hasJPY,
+                        hasUSD,
+                        region: region.slice(0, 160),
+                        sample: text.slice(0, 220)
+                    };
+                }"""
+            )
+            if isinstance(status, dict):
+                last = status
+                if status.get("ok"):
+                    return True
+        except Exception as exc:
+            last = {"reason": f"probe-error:{exc}"}
+        await page.wait_for_timeout(500)
+    log(
+        f"{prefix} offer US pricing not ready before submit: "
+        f"region={last.get('region', '')} hasJPY={last.get('hasJPY', '')} "
+        f"hasUSD={last.get('hasUSD', '')} sample={last.get('sample', '')}"
+    )
+    return False
+
+
+async def _typeahead_chatgpt_offer_region(page, prefix: str, query: str, expected: str, label: str) -> bool:
+    """用地区下拉自身 typeahead 选择国家，避免把文本输入聊天框。"""
+    try:
+        trigger = page.locator(
+            '[data-testid="country-selector-in-pricing-modal"] [role="combobox"], '
+            '[data-testid="country-selector-in-pricing-modal"] button'
+        ).first
+        if not await trigger.is_visible(timeout=900) or not await trigger.is_enabled(timeout=900):
+            return False
+        await trigger.scroll_into_view_if_needed(timeout=1000)
+        await trigger.click(timeout=1800)
+        await page.wait_for_timeout(450)
+        safe_state = await page.evaluate(
+            r"""() => {
+                const active = document.activeElement;
+                const activeRole = active?.getAttribute?.('role') || '';
+                const activeTag = String(active?.tagName || '').toLowerCase();
+                const activeEditable = !!(active && (active.isContentEditable || /^(input|textarea)$/.test(activeTag) || activeRole === 'textbox'));
+                const activeCombo = !!(active && activeRole === 'combobox' && active.closest?.('[data-testid="country-selector-in-pricing-modal"]'));
+                const openMenu = !!document.querySelector('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]');
+                return { ok: !activeEditable && (activeCombo || openMenu), activeRole, activeTag, activeEditable, openMenu };
+            }"""
+        )
+        if not isinstance(safe_state, dict) or not safe_state.get("ok"):
+            log(f"{prefix} offer region refresh typeahead skipped unsafe focus: {label} state={safe_state}")
+            return False
+        await page.keyboard.type(query, delay=30)
+        await page.wait_for_timeout(650)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(1700)
+        selected = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const node = Array.from(document.querySelectorAll('[data-testid="country-selector-in-pricing-modal"]')).filter(visible)[0] || null;
+                return textOf(node).slice(0, 180);
+            }"""
+        )
+        if re.search(expected, str(selected or ""), re.I):
+            log(f"{prefix} offer region refresh selected {label}: {selected}")
+            return True
+        log(f"{prefix} offer region refresh unconfirmed {label}: {selected}")
+    except Exception as exc:
+        log(f"{prefix} offer region refresh failed {label}: {exc}")
+    return False
+
+
+async def _click_visible_us_chatgpt_offer_region_option(page, prefix: str) -> bool:
+    """右下角已显示 US 时，仍打开菜单点一次 United States 选项，确保前端提交真实变更。"""
+    if await _click_chatgpt_offer_region_option_strict(page, prefix, "us", "force"):
+        return True
+    try:
+        trigger = page.locator(
+            '[data-testid="country-selector-in-pricing-modal"] [role="combobox"], '
+            '[data-testid="country-selector-in-pricing-modal"] button'
+        ).first
+        if not await trigger.is_visible(timeout=900) or not await trigger.is_enabled(timeout=900):
+            return False
+        await trigger.scroll_into_view_if_needed(timeout=1000)
+        await trigger.click(timeout=1800, force=True)
+        await page.wait_for_timeout(650)
+        point = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const roots = [];
+                const pushRoot = (el) => {
+                    if (el && visible(el) && !roots.includes(el)) roots.push(el);
+                };
+                const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                pushRoot(controlId ? document.getElementById(controlId) : null);
+                pushRoot(document.activeElement?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]')).filter(visible)) {
+                    const text = textOf(node);
+                    if (/united states|usa|\bus\b|usd|美国|美國|アメリカ|米国/i.test(text)) pushRoot(node);
+                }
+                const root = roots[0] || null;
+                if (!root) return { ok: false, reason: 'no-root', controlId };
+                const usText = /united states|usa|\bus\b|usd|美国|美國|アメリカ|米国/i;
+                const badText = /country|currency|search|select|region|国家|地区|地域/i;
+                const options = Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex], div, span, button'))
+                    .filter(visible)
+                    .map((el) => {
+                        const item = el.closest?.('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex], button') || el;
+                        const rect = item.getBoundingClientRect();
+                        const text = textOf(item) || textOf(el);
+                        const sig = [text, item.getAttribute?.('data-value') || '', item.getAttribute?.('value') || '', item.getAttribute?.('aria-label') || ''].join(' ');
+                        if (!text || text.length > 120) return null;
+                        if (!usText.test(sig) || badText.test(sig)) return null;
+                        if (rect.width <= 0 || rect.height <= 0 || rect.width > Math.max(560, window.innerWidth * 0.48) || rect.height > 100) return null;
+                        return {
+                            item,
+                            label: text.slice(0, 120),
+                            x: Math.round(rect.left + Math.max(6, Math.min(rect.width - 6, rect.width / 2))),
+                            y: Math.round(rect.top + Math.max(6, Math.min(rect.height - 6, rect.height / 2)))
+                        };
+                    })
+                    .filter(Boolean);
+                const hit = options.find((x) => /^united states$/i.test(x.label)) || options[0] || null;
+                if (!hit) {
+                    const samples = Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex], button'))
+                        .filter(visible)
+                        .map((el) => textOf(el))
+                        .filter((text) => text && text.length <= 120)
+                        .slice(0, 12);
+                    return { ok: false, reason: 'no-us-option', samples };
+                }
+                hit.item.scrollIntoView({ block: 'center', inline: 'nearest' });
+                return { ok: true, label: hit.label, x: hit.x, y: hit.y };
+            }"""
+        )
+        if not isinstance(point, dict) or not point.get("ok"):
+            log(f"{prefix} offer region force US option not found: {point}")
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
+        await page.mouse.move(float(point.get("x") or 0), float(point.get("y") or 0))
+        await page.mouse.down()
+        await page.wait_for_timeout(80)
+        await page.mouse.up()
+        await page.wait_for_timeout(1800)
+        selected = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const node = Array.from(document.querySelectorAll('[data-testid="country-selector-in-pricing-modal"]')).filter(visible)[0] || null;
+                return textOf(node).slice(0, 180);
+            }"""
+        )
+        log(f"{prefix} offer region force clicked US option: {point.get('label', '')} -> {selected}")
+        return True
+    except Exception as exc:
+        log(f"{prefix} offer region force US option failed: {exc}")
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+    return False
+
+
+async def _click_visible_non_us_chatgpt_offer_region(page, prefix: str) -> bool:
+    """地区已显示 US 但价格未刷新时，先点任一非 US 选项制造真实变更。"""
+    if await _click_chatgpt_offer_region_option_strict(page, prefix, "jp", "refresh"):
+        return True
+    if await _click_chatgpt_offer_region_option_strict(page, prefix, "non_us", "refresh"):
+        return True
+    try:
+        trigger = page.locator(
+            '[data-testid="country-selector-in-pricing-modal"] [role="combobox"], '
+            '[data-testid="country-selector-in-pricing-modal"] button'
+        ).first
+        if not await trigger.is_visible(timeout=900) or not await trigger.is_enabled(timeout=900):
+            return False
+        await trigger.scroll_into_view_if_needed(timeout=1000)
+        await trigger.click(timeout=1800)
+        await page.wait_for_timeout(600)
+        point = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const active = document.activeElement;
+                const roots = [];
+                const pushRoot = (el) => {
+                    if (el && visible(el) && !roots.includes(el)) roots.push(el);
+                };
+                const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                pushRoot(controlId ? document.getElementById(controlId) : null);
+                pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'));
+                for (const node of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]')).filter(visible)) {
+                    const rect = node.getBoundingClientRect();
+                    const text = textOf(node);
+                    if (rect.left < window.innerWidth * 0.35 && rect.width > window.innerWidth * 0.35) continue;
+                    if (/japan|andorra|angola|country|currency|united states|united kingdom|canada|australia|euro|cape verde|djibouti/i.test(text)) pushRoot(node);
+                }
+                const root = roots[0] || null;
+                if (!root) return { ok: false, reason: 'no-root', controlId };
+                const usText = /united states|usa|\bus\b|usd|美国|美國|アメリカ|米国/i;
+                const badText = /country|currency|search|select|region|国家|地区|地域/i;
+                const options = Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex], div, span'))
+                    .filter(visible)
+                    .map((el) => {
+                        const item = el.closest?.('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex]') || el;
+                        const rect = item.getBoundingClientRect();
+                        const text = textOf(item) || textOf(el);
+                        const sig = [text, item.getAttribute?.('data-value') || '', item.getAttribute?.('value') || '', item.getAttribute?.('aria-label') || ''].join(' ');
+                        if (!text || text.length > 120) return null;
+                        if (rect.width <= 0 || rect.height <= 0 || rect.width > Math.max(520, window.innerWidth * 0.45) || rect.height > 96) return null;
+                        if (usText.test(sig) || badText.test(sig)) return null;
+                        return { item, label: text.slice(0, 120), x: Math.round(rect.left + Math.max(6, Math.min(rect.width - 6, rect.width / 2))), y: Math.round(rect.top + Math.max(6, Math.min(rect.height - 6, rect.height / 2))) };
+                    })
+                    .filter(Boolean);
+                const hit = options[0] || null;
+                if (!hit) {
+                    const samples = Array.from(root.querySelectorAll('[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [data-value], [tabindex]'))
+                        .filter(visible)
+                        .map((el) => textOf(el))
+                        .filter((text) => text && text.length <= 120)
+                        .slice(0, 12);
+                    return { ok: false, reason: 'no-non-us-option', samples };
+                }
+                hit.item.scrollIntoView({ block: 'center', inline: 'nearest' });
+                return { ok: true, label: hit.label, x: hit.x, y: hit.y };
+            }"""
+        )
+        if not isinstance(point, dict) or not point.get("ok"):
+            log(f"{prefix} offer region refresh non-US option not found: {point}")
+            return False
+        await page.mouse.move(float(point.get("x") or 0), float(point.get("y") or 0))
+        await page.mouse.down()
+        await page.wait_for_timeout(80)
+        await page.mouse.up()
+        await page.wait_for_timeout(1800)
+        selected = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const node = Array.from(document.querySelectorAll('[data-testid="country-selector-in-pricing-modal"]')).filter(visible)[0] || null;
+                return textOf(node).slice(0, 180);
+            }"""
+        )
+        log(f"{prefix} offer region refresh selected non-US option: {point.get('label', '')} -> {selected}")
+        return True
+    except Exception as exc:
+        log(f"{prefix} offer region refresh non-US option failed: {exc}")
+    return False
+
+
+async def _refresh_chatgpt_offer_region_us(page, prefix: str) -> bool:
+    """价格仍 JPY 时先切 Japan 再切回 US，强制触发价格刷新。"""
+    if not await _click_visible_non_us_chatgpt_offer_region(page, prefix):
+        await _typeahead_chatgpt_offer_region(page, prefix, "Japan", r"japan|\bjp\b|jpy|日本", "Japan")
+    if await _typeahead_chatgpt_offer_region(
+        page,
+        prefix,
+        "美国",
+        r"united states|usa|\bus\b|usd|美国|美國|アメリカ|米国",
+        "美国",
+    ):
+        return True
+    return await _typeahead_chatgpt_offer_region(
+        page,
+        prefix,
+        "United States",
+        r"united states|usa|\bus\b|usd|美国|美國|アメリカ|米国",
+        "United States",
+    )
+
+
+async def _ensure_chatgpt_offer_region_jp_before_us(page, prefix: str, email: str | None = None) -> bool:
+    """日区短链优惠页必须先呈现日本地区，再由自动化切到美国。"""
+    state = await _chatgpt_offer_region_state(page)
+
+    label = str(state.get("label", "") if isinstance(state, dict) else "")
+    if isinstance(state, dict) and state.get("isJP"):
+        log(f"{prefix} offer region default JP before US switch: {label}")
+        return True
+    if not isinstance(state, dict) or not state.get("isUS"):
+        log(f"{prefix} offer region JP precheck unknown; continue switch path: {label}")
+        return True
+
+    log(f"{prefix} offer region unexpectedly US before manual switch; reset to Japan first: {label}")
+    if await _click_chatgpt_offer_region_option_strict(page, prefix, "jp", "precheck-reset"):
+        await page.wait_for_timeout(800)
+        return True
+    for query, name in (("日本", "日本"), ("Japan", "Japan"), ("JP", "JP")):
+        if await _typeahead_chatgpt_offer_region(page, prefix, query, r"japan|\bjp\b|jpy|日本", name):
+            await page.wait_for_timeout(800)
+            return True
+
+    log(f"{prefix} offer plan submit skipped: cannot reset region to Japan before US switch")
+    if email:
+        await _save_chatgpt_offer_failure_debug_once(page, email, "cannot reset region to Japan before US switch")
+    return False
+
+
+async def _click_chatgpt_offer_plan_submit(page, prefix: str, email: str | None = None) -> bool:
+    """套餐确认页：先把右下角地区切到美国，再点击继续/提交。"""
+    current_region = await _chatgpt_offer_region_state(page)
+    if isinstance(current_region, dict) and current_region.get("isUS"):
+        log(f"{prefix} offer region already US before submit; skip JP precheck: {current_region.get('label', '')}")
+    elif not await _ensure_chatgpt_offer_region_jp_before_us(page, prefix, email):
+        return False
+    if not await _select_chatgpt_offer_region_us(page, prefix):
+        log(f"{prefix} offer plan submit skipped before US region: region switch failed")
+        if email:
+            await _save_chatgpt_offer_failure_debug_once(page, email, "region switch failed before offer submit")
+        return False
+    await _click_visible_us_chatgpt_offer_region_option(page, prefix)
+    if not await _wait_chatgpt_offer_us_pricing(page, prefix, timeout_ms=4500):
+        log(f"{prefix} offer plan submit skipped before US pricing: region/currency did not refresh to US")
+        if email:
+            await _save_chatgpt_offer_failure_debug_once(page, email, "region/currency did not refresh to US before offer submit")
+        return False
+    try:
+        result = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const enabled = (el) => !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const signatureOf = (el) => [
+                    textOf(el),
+                    el?.getAttribute?.('aria-label') || '',
+                    el?.getAttribute?.('data-testid') || '',
+                    el?.getAttribute?.('title') || '',
+                    el?.getAttribute?.('name') || ''
+                ].join(' ');
+                const usText = /united states|usa|\bus\b|usd|美国|美國|アメリカ|米国/i;
+                const jpText = /japan|\bjp\b|jpy|日本/i;
+                const exactRegionNode = Array.from(document.querySelectorAll('[data-testid="country-selector-in-pricing-modal"]')).filter(visible)[0] || null;
+                const exactRegionText = textOf(exactRegionNode);
+                const exactRegionUS = !!exactRegionText && usText.test(exactRegionText) && !jpText.test(exactRegionText);
+                if (exactRegionText && jpText.test(exactRegionText) && !usText.test(exactRegionText)) {
+                    return { ok: false, reason: 'region-not-us', label: exactRegionText };
+                }
+                const bottomRightNodes = Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"], select, [data-testid], div, span'))
+                    .filter(visible)
+                    .filter((el) => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.top > window.innerHeight * 0.45 && rect.left > window.innerWidth * 0.45;
+                    });
+                const countryNode = bottomRightNodes.find((el) => {
+                    const text = textOf(el);
+                    return text && text.length <= 80 && /japan|jp|日本|united states|usa|\bus\b|美国|美國|アメリカ|米国/i.test(text);
+                });
+                const countryText = countryNode ? textOf(countryNode) : '';
+                if (!exactRegionUS && countryText && /japan|jp|日本/i.test(countryText) && !/united states|usa|\bus\b|美国|美國|アメリカ|米国/i.test(countryText)) {
+                    return { ok: false, reason: 'region-not-us', label: countryText };
+                }
+
+                const scopes = Array.from(document.querySelectorAll('#modal-account-payment, [data-testid="modal-account-payment"], [role="dialog"], main, body'))
+                    .filter(visible);
+                const scope = scopes[0] || document.body;
+                const bodyText = textOf(scope).slice(0, 4000);
+                if (!/plus|trial|free|subscribe|payment|套餐|免费|免費|試用|支払|支払い/i.test(bodyText)) {
+                    return { ok: false, reason: 'no-plan-surface', label: bodyText.slice(0, 120) };
+                }
+                const bad = /team|business|enterprise|workspace|education|country|region|japan|united states|paypal|card|close|cancel|dismiss|esc|back|团队|企業|地域|地区|国|国家|关闭|關閉|取消|閉じる|キャンセル|カード/i;
+                const action = /claim\s+(?:plus\s+)?(?:free\s+)?offer|claim\s+offer|get\s+plus|upgrade|continue|next|start(?:\s+free)?\s+trial|try\s+plus|subscribe|confirm|checkout|check\s*out|proceed|领取\s*(?:plus\s*)?免费优惠|领取\s*plus|领取优惠|免费试用|开始.*试用|继续|下一步|订阅|訂閱|确认|確認|続行|次へ|申し込む|始める|支払いへ/i;
+                const targets = Array.from(scope.querySelectorAll('button, [role="button"], a, input[type="submit"]'))
+                    .filter((el) => visible(el) && enabled(el))
+                    .map((el) => {
+                        const text = textOf(el);
+                        const rect = el.getBoundingClientRect();
+                        const aria = el.getAttribute?.('aria-label') || '';
+                        const testid = el.getAttribute?.('data-testid') || '';
+                        return { el, text, aria, testid, signature: signatureOf(el), bottom: rect.top / Math.max(1, window.innerHeight), right: rect.left / Math.max(1, window.innerWidth) };
+                    })
+                    .filter((item) => item.text && item.text.length <= 180);
+                const direct = targets.find((item) => (
+                    !bad.test(item.signature) && (
+                        /select-plan-button-plus-upgrade/i.test(item.testid) ||
+                        /claim\s+plus\s+free\s+offer|领取\s*Plus\s*免费优惠|领取\s*免费优惠/i.test(item.signature)
+                    )
+                ));
+                if (direct) {
+                    direct.el.scrollIntoView({ block: 'center', inline: 'center' });
+                    direct.el.click();
+                    return { ok: true, reason: 'clicked-direct', label: direct.text.slice(0, 160) };
+                }
+                const filteredTargets = targets
+                    .filter((item) => action.test(item.signature) && !bad.test(item.signature))
+                    .sort((a, b) => ((b.bottom + b.right) - (a.bottom + a.right)));
+                const target = filteredTargets[0];
+                if (!target) {
+                    return {
+                        ok: false,
+                        reason: 'submit-not-found',
+                        label: bodyText.slice(0, 160),
+                        candidates: targets.map((item) => ({ text: item.text.slice(0, 120), aria: item.aria.slice(0, 120), testid: item.testid })).slice(0, 12)
+                    };
+                }
+                target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                target.el.click();
+                return { ok: true, reason: 'clicked', label: target.text.slice(0, 160) };
+            }"""
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            log(f"{prefix} clicked offer plan submit after US region: {result.get('label', '')}")
+            return await _wait_checkout_surface_after_offer_submit(page, prefix, email=email)
+        if isinstance(result, dict) and result.get("reason") == "region-not-us":
+            log(f"{prefix} offer plan submit skipped before US region: {result.get('label', '')}")
+            if email:
+                await _save_chatgpt_offer_failure_debug_once(page, email, "region still not US before offer submit")
+        elif isinstance(result, dict):
+            log(
+                f"{prefix} offer plan submit not found after US region: "
+                f"reason={result.get('reason', '')} label={result.get('label', '')}"
+            )
+    except Exception:
+        pass
+    return False
+
+
 async def _click_visible_offer_entry(page, prefix: str) -> bool:
+    try:
+        url = str(page.url or "").lower()
+        if "/checkout/" in url or "checkout.openai" in url:
+            log(f"{prefix} offer entry click skipped on checkout URL")
+            return False
+    except Exception:
+        pass
+    if await _chatgpt_offer_modal_visible(page):
+        log(f"{prefix} offer entry click skipped inside pricing modal")
+        return False
     claim_offer = _zh(r"\u9886\u53d6\u4f18\u60e0")
     free_trial = _zh(r"\u514d\u8d39\u8bd5\u7528")
     claim_offer_jp = _zh(r"\u30aa\u30d5\u30a1\u30fc\u3092\u53d7\u3051\u53d6\u308b")
@@ -1044,6 +3817,11 @@ async def _click_visible_offer_entry(page, prefix: str) -> bool:
     upgrade_cn = _zh(r"\u5347\u7ea7")
     upgrade_jp = _zh(r"\u30a2\u30c3\u30d7\u30b0\u30ec\u30fc\u30c9")
     selectors = (
+        'button:has-text("Claim offer")',
+        'a:has-text("Claim offer")',
+        '[role="button"]:has-text("Claim offer")',
+        'button[aria-label*="Claim offer" i]',
+        'a[aria-label*="Claim offer" i]',
         f'button:has-text("{claim_offer}")',
         f'a:has-text("{claim_offer}")',
         f'[role="button"]:has-text("{claim_offer}")',
@@ -1068,16 +3846,38 @@ async def _click_visible_offer_entry(page, prefix: str) -> bool:
         'a:has-text("Try Plus")',
         'button:has-text("Get Plus")',
         'a:has-text("Get Plus")',
-        'button:has-text("Plus")',
-        'a:has-text("Plus")',
-        'button:has-text("Subscribe")',
-        'a:has-text("Subscribe")',
+        'button:has-text("Free offer")',
+        'a:has-text("Free offer")',
+        '[role="button"]:has-text("Free offer")',
+        'button[aria-label*="Free offer" i]',
+        'a[aria-label*="Free offer" i]',
     )
     for selector in selectors:
         try:
             locator = page.locator(selector).first
             if await locator.is_visible(timeout=700) and await locator.is_enabled(timeout=700):
+                in_pricing_modal = await locator.evaluate(
+                    r"""(el) => {
+                        const visible = (node) => {
+                            if (!node) return false;
+                            const rect = node.getBoundingClientRect();
+                            const style = getComputedStyle(node);
+                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                        };
+                        const textOf = (node) => String(node?.innerText || node?.textContent || node?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                        const modal = el.closest('#modal-account-payment, [data-testid="modal-account-payment"]');
+                        if (modal && visible(modal)) return true;
+                        const dialog = el.closest('[role="dialog"]');
+                        return !!(dialog && visible(dialog) && /plus|trial|free|country|currency|jpy|usd|套餐|試用|支払|支払い/i.test(textOf(dialog)));
+                    }"""
+                )
+                if in_pricing_modal:
+                    log(f"{prefix} offer modal plan button skipped by entry click: {selector}")
+                    return False
                 await locator.scroll_into_view_if_needed(timeout=1000)
+                if await _chatgpt_offer_modal_visible(page):
+                    log(f"{prefix} offer entry click skipped inside pricing modal")
+                    return False
                 await locator.click(timeout=2500)
                 log(f"{prefix} clicked offer entry: {selector}")
                 await page.wait_for_timeout(1800)
@@ -1095,8 +3895,15 @@ async def _click_visible_offer_entry(page, prefix: str) -> bool:
                     return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
                 };
                 const textOf = (el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                const modal = Array.from(document.querySelectorAll('#modal-account-payment, [data-testid="modal-account-payment"], [role="dialog"]'))
+                    .filter(visible)
+                    .find((el) => /plus|trial|free|country|currency|jpy|usd|套餐|試用|支払|支払い/i.test(textOf(el)));
+                if (modal) return "";
                 const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter(visible);
+                const bad = /team|business|enterprise|workspace|education|close|cancel|dismiss|\\u56e2\\u961f|\\u5718\\u968a|\\u4f01\\u4e1a|\\u4f01\\u696d|\\u5173\\u95ed|\\u95dc\\u9589|\\u53d6\\u6d88|\\u9589\\u3058\\u308b|\\u30ad\\u30e3\\u30f3\\u30bb\\u30eb|\\u30c1\\u30fc\\u30e0|\\u30d3\\u30b8\\u30cd\\u30b9|\\u30a8\\u30f3\\u30bf\\u30fc\\u30d7\\u30e9\\u30a4\\u30ba/i;
                 const patterns = [
+                    /free\\s*offer/i,
+                    /claim\\s*offer/i,
                     /\u9886\u53d6\u4f18\u60e0/,
                     /\u514d\u8d39\u8bd5\u7528/,
                     /\u5347\u7ea7/,
@@ -1108,10 +3915,13 @@ async def _click_visible_offer_entry(page, prefix: str) -> bool:
                     /upgrade/i,
                     /try\\s*plus/i,
                     /get\\s*plus/i,
-                    /subscribe/i,
-                    /plus/i
+                    /trial/i
                 ];
-                const target = nodes.find((node) => patterns.some((pattern) => pattern.test(textOf(node))));
+                const target = nodes.find((node) => {
+                    const text = textOf(node);
+                    const signature = [text, node.getAttribute('aria-label') || '', node.getAttribute('data-testid') || '', node.getAttribute('href') || ''].join(' ');
+                    return text && !bad.test(signature) && patterns.some((pattern) => pattern.test(signature));
+                });
                 if (!target) return "";
                 target.scrollIntoView({ block: 'center', inline: 'center' });
                 target.click();
@@ -1125,6 +3935,336 @@ async def _click_visible_offer_entry(page, prefix: str) -> bool:
     except Exception:
         pass
     return False
+
+
+async def _save_chatgpt_offer_failure_debug(page, email: str, reason: str) -> Path | None:
+    """ChatGPT 优惠入口失败时保存当前页，定位真实按钮/地区控件。"""
+    try:
+        out_dir = PAYPAL_OUTPUT_ROOT / "debug" / "chatgpt_offer_failure" / f"{safe_filename(email)}_{int(time.time())}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log(f"[ChatGPTOffer] debug dir create failed: {exc}")
+        return None
+    try:
+        (out_dir / "page.html").write_text(await page.content(), encoding="utf-8")
+    except Exception as exc:
+        log(f"[ChatGPTOffer] debug html save failed: {exc}")
+    try:
+        body_text = await page.evaluate("() => document.body?.innerText || ''")
+        (out_dir / "body.txt").write_text(str(body_text or ""), encoding="utf-8")
+    except Exception as exc:
+        log(f"[ChatGPTOffer] debug body save failed: {exc}")
+    try:
+        state = await page.evaluate(
+            r"""(reason) => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const itemOf = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        tag: el.tagName,
+                        id: el.getAttribute?.('id') || '',
+                        role: el.getAttribute?.('role') || '',
+                        aria: el.getAttribute?.('aria-label') || '',
+                        ariaControls: el.getAttribute?.('aria-controls') || '',
+                        ariaExpanded: el.getAttribute?.('aria-expanded') || '',
+                        dataState: el.getAttribute?.('data-state') || '',
+                        testid: el.getAttribute?.('data-testid') || '',
+                        value: el.getAttribute?.('value') || '',
+                        dataValue: el.getAttribute?.('data-value') || '',
+                        className: String(el.className || '').slice(0, 180),
+                        href: el.getAttribute?.('href') || '',
+                        text: textOf(el).slice(0, 220),
+                        x: Math.round(rect.left),
+                        y: Math.round(rect.top),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height)
+                    };
+                };
+                const ancestorsOf = (el) => {
+                    const items = [];
+                    let node = el;
+                    for (let depth = 0; node && node.nodeType === 1 && depth < 9; depth++, node = node.parentElement) {
+                        const item = itemOf(node);
+                        item.depth = depth;
+                        item.className = String(node.className || '').slice(0, 180);
+                        item.tabIndex = node.tabIndex;
+                        item.cursor = getComputedStyle(node).cursor || '';
+                        item.hasPopup = node.hasAttribute?.('aria-haspopup') || false;
+                        items.push(item);
+                    }
+                    return items;
+                };
+                const rowOf = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        tag: el.tagName,
+                        id: el.getAttribute?.('id') || '',
+                        role: el.getAttribute?.('role') || '',
+                        text: textOf(el).slice(0, 160),
+                        value: el.getAttribute?.('value') || '',
+                        dataValue: el.getAttribute?.('data-value') || '',
+                        aria: el.getAttribute?.('aria-label') || '',
+                        dataState: el.getAttribute?.('data-state') || '',
+                        highlighted: el.hasAttribute?.('data-highlighted') || el.getAttribute?.('aria-selected') === 'true',
+                        x: Math.round(rect.left),
+                        y: Math.round(rect.top),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height)
+                    };
+                };
+                const trigger = document.querySelector('[data-testid="country-selector-in-pricing-modal"] [role="combobox"], [data-testid="country-selector-in-pricing-modal"] button');
+                const controlId = trigger?.getAttribute?.('aria-controls') || '';
+                const optionSelector = '[role="option"], [role="menuitem"], [data-radix-select-item], [data-radix-collection-item], [cmdk-item], [data-value], [tabindex]';
+                const listRoots = [];
+                const pushRoot = (root, source) => {
+                    if (!root || !visible(root) || listRoots.some((item) => item.root === root)) return;
+                    const rows = Array.from(root.querySelectorAll(optionSelector)).filter(visible);
+                    if (!rows.length && !/listbox|menu/i.test(root.getAttribute?.('role') || '')) return;
+                    const rect = root.getBoundingClientRect();
+                    const scrollables = Array.from(root.querySelectorAll('[data-radix-select-viewport], [data-radix-scroll-area-viewport], [style*="overflow"], div'))
+                        .filter(visible)
+                        .filter((el) => el.scrollHeight > el.clientHeight + 8)
+                        .map((el) => {
+                            const sr = el.getBoundingClientRect();
+                            return {
+                                tag: el.tagName,
+                                role: el.getAttribute?.('role') || '',
+                                className: String(el.className || '').slice(0, 120),
+                                scrollTop: el.scrollTop,
+                                clientHeight: el.clientHeight,
+                                scrollHeight: el.scrollHeight,
+                                x: Math.round(sr.left),
+                                y: Math.round(sr.top),
+                                w: Math.round(sr.width),
+                                h: Math.round(sr.height)
+                            };
+                        })
+                        .slice(0, 8);
+                    listRoots.push({
+                        source,
+                        id: root.getAttribute?.('id') || '',
+                        role: root.getAttribute?.('role') || '',
+                        dataState: root.getAttribute?.('data-state') || '',
+                        text: textOf(root).slice(0, 260),
+                        x: Math.round(rect.left),
+                        y: Math.round(rect.top),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                        optionCount: rows.length,
+                        rows: rows.slice(0, 80).map(rowOf),
+                        scrollables,
+                        html: String(root.outerHTML || '').slice(0, 12000)
+                    });
+                };
+                if (controlId) pushRoot(document.getElementById(controlId), 'aria-controls');
+                const active = document.activeElement;
+                const activeDescendantId = active?.getAttribute?.('aria-activedescendant') || '';
+                if (activeDescendantId) {
+                    pushRoot(document.getElementById(activeDescendantId)?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-descendant');
+                }
+                pushRoot(active?.closest?.('[role="listbox"], [role="menu"], [data-radix-select-content], [data-radix-popper-content-wrapper]'), 'active-root');
+                for (const root of Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [role="dialog"], [data-radix-select-content], [data-radix-popper-content-wrapper], [cmdk-list], [data-side], [data-state="open"], [popover]')).filter(visible)) {
+                    pushRoot(root, 'open-node');
+                }
+                const perfResources = Array.from(performance.getEntriesByType?.('resource') || [])
+                    .map((entry) => ({
+                        name: String(entry.name || '').slice(0, 360),
+                        initiatorType: String(entry.initiatorType || ''),
+                        duration: Math.round(Number(entry.duration || 0)),
+                        transferSize: Number(entry.transferSize || 0),
+                    }))
+                    .filter((entry) => /chatgpt|openai|payment|billing|subscription|pricing|country|locale|backend-api|checkout|offer/i.test(entry.name))
+                    .slice(-160);
+                const regionNodes = Array.from(document.querySelectorAll('button, [role], [aria-haspopup], [data-testid], [tabindex], div, span'))
+                    .filter(visible)
+                    .filter((el) => /country|currency|region|japan|united states|\bus\b|usa|usd|jpy|国家|地区|地域|日本|美国|美國|アメリカ|米国/i.test([textOf(el), el.getAttribute?.('aria-label') || '', el.getAttribute?.('data-testid') || ''].join(' ')));
+                return {
+                    reason,
+                    url: location.href,
+                    title: document.title || '',
+                    activeElement: document.activeElement ? itemOf(document.activeElement) : null,
+                    regionControl: trigger ? itemOf(trigger) : null,
+                    regionControlId: controlId,
+                    listboxDetails: listRoots,
+                    buttons: Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"], [data-testid]'))
+                        .filter(visible)
+                        .map(itemOf)
+                        .slice(0, 80),
+                    regionCandidates: regionNodes
+                        .map(itemOf)
+                        .slice(0, 40),
+                    regionAncestors: regionNodes
+                        .slice(0, 12)
+                        .map((node) => ({ text: textOf(node).slice(0, 180), chain: ancestorsOf(node) })),
+                    popoverCandidates: Array.from(document.querySelectorAll('[role="listbox"], [role="menu"], [role="dialog"], [data-radix-popper-content-wrapper], [cmdk-list], [data-side], [data-state="open"], [popover]'))
+                        .filter(visible)
+                        .map(itemOf)
+                        .slice(0, 40),
+                    perfResources,
+                    bodyHead: textOf(document.body).slice(0, 3000)
+                };
+            }""",
+            reason,
+        )
+        if isinstance(state, dict):
+            state["offerNetworkEvents"] = _get_chatgpt_offer_network_events(page)[-240:]
+        (out_dir / "state.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log(f"[ChatGPTOffer] debug state save failed: {exc}")
+    try:
+        await page.screenshot(path=str(out_dir / "screenshot.png"), full_page=True)
+    except Exception as exc:
+        log(f"[ChatGPTOffer] debug screenshot save failed: {exc}")
+    log(f"[ChatGPTOffer] failure debug saved: {out_dir}")
+    return out_dir
+
+
+async def _save_chatgpt_offer_failure_debug_once(page, email: str, reason: str) -> Path | None:
+    """同一页面同一原因只保存一次，避免轮询阶段反复截屏。"""
+    key = f"{id(page)}:{email.lower()}:{reason}"
+    if key in _CHATGPT_OFFER_DEBUG_KEYS:
+        return None
+    _CHATGPT_OFFER_DEBUG_KEYS.add(key)
+    return await _save_chatgpt_offer_failure_debug(page, email, reason)
+
+
+def _chatgpt_offer_probe_url(url: str) -> bool:
+    """记录 ChatGPT 优惠页关键请求，辅助判断地区列表是否由网络返回异常。"""
+    value = str(url or "").lower()
+    if not any(host in value for host in ("chatgpt.com", "openai.com", "pay.openai.com", "stripe.com")):
+        return False
+    return any(
+        marker in value
+        for marker in (
+            "backend-api",
+            "payments",
+            "payment",
+            "billing",
+            "subscription",
+            "subscriptions",
+            "checkout",
+            "pricing",
+            "country",
+            "locale",
+            "region",
+            "currency",
+            "offer",
+            "trial",
+            "plans",
+            "accounts",
+        )
+    )
+
+
+def _chatgpt_offer_short_url(url: str, limit: int = 420) -> str:
+    text = str(url or "")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _get_chatgpt_offer_network_events(page) -> list[dict[str, Any]]:
+    try:
+        events = getattr(page, "_flow2_chatgpt_offer_network_events", None)
+        if isinstance(events, list):
+            return list(events)
+    except Exception:
+        pass
+    return []
+
+
+def _append_chatgpt_offer_network_event(page, item: dict[str, Any]) -> None:
+    try:
+        events = getattr(page, "_flow2_chatgpt_offer_network_events", None)
+        if not isinstance(events, list):
+            events = []
+            setattr(page, "_flow2_chatgpt_offer_network_events", events)
+        events.append(item)
+        if len(events) > 900:
+            events[:] = events[-700:]
+    except Exception:
+        pass
+
+
+def _attach_chatgpt_offer_network_probe(page) -> None:
+    """登录后进入优惠页前挂网络探针；失败现场写入 state.json。"""
+    try:
+        if getattr(page, "_flow2_chatgpt_offer_network_probe_attached", False):
+            return
+        setattr(page, "_flow2_chatgpt_offer_network_probe_attached", True)
+        setattr(page, "_flow2_chatgpt_offer_network_events", [])
+    except Exception:
+        return
+
+    def on_request(request) -> None:
+        try:
+            url = str(getattr(request, "url", "") or "")
+            if not _chatgpt_offer_probe_url(url):
+                return
+            _append_chatgpt_offer_network_event(
+                page,
+                {
+                    "kind": "request",
+                    "method": str(getattr(request, "method", "") or ""),
+                    "resource": str(getattr(request, "resource_type", "") or ""),
+                    "url": _chatgpt_offer_short_url(url),
+                    "ts": round(time.time(), 3),
+                },
+            )
+        except Exception:
+            pass
+
+    def on_response(response) -> None:
+        try:
+            url = str(getattr(response, "url", "") or "")
+            if not _chatgpt_offer_probe_url(url):
+                return
+            request = getattr(response, "request", None)
+            _append_chatgpt_offer_network_event(
+                page,
+                {
+                    "kind": "response",
+                    "status": int(getattr(response, "status", 0) or 0),
+                    "ok": bool(getattr(response, "ok", False)),
+                    "method": str(getattr(request, "method", "") or ""),
+                    "resource": str(getattr(request, "resource_type", "") or ""),
+                    "url": _chatgpt_offer_short_url(url),
+                    "ts": round(time.time(), 3),
+                },
+            )
+        except Exception:
+            pass
+
+    def on_request_failed(request) -> None:
+        try:
+            url = str(getattr(request, "url", "") or "")
+            if not _chatgpt_offer_probe_url(url):
+                return
+            failure = getattr(request, "failure", None)
+            _append_chatgpt_offer_network_event(
+                page,
+                {
+                    "kind": "requestfailed",
+                    "method": str(getattr(request, "method", "") or ""),
+                    "resource": str(getattr(request, "resource_type", "") or ""),
+                    "error": str(failure or "")[:500],
+                    "url": _chatgpt_offer_short_url(url),
+                    "ts": round(time.time(), 3),
+                },
+            )
+        except Exception:
+            pass
+
+    try:
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfailed", on_request_failed)
+    except Exception:
+        pass
 
 
 async def _prepare_checkout_from_chatgpt_offer(
@@ -1163,6 +4303,7 @@ async def _prepare_checkout_from_chatgpt_offer(
         proxy=proxy,
     )
     await _install_click_watcher(page, item["email"], enabled=watcher_enabled, label="flow2_direct_offer")
+    _attach_chatgpt_offer_network_probe(page)
     log(f"{prefix} long link disabled; login ChatGPT and open offer checkout")
     await register.run_until_logged_in(account, datetime.now(timezone.utc))
     start_url = paypal_direct_checkout_start_url(flow_env or load_env(".env"))
@@ -1172,29 +4313,103 @@ async def _prepare_checkout_from_chatgpt_offer(
     await _dismiss_chatgpt_interstitials(page, prefix)
     if await _checkout_surface_ready(page):
         return
-    for attempt in range(1, 31):
-        if attempt in {1, 6, 11, 16, 21, 26}:
-            log(f"{prefix} waiting direct checkout surface via ChatGPT offer ({attempt}/30), url={page.url}")
+    region_failures = 0
+    for attempt in range(1, _CHATGPT_OFFER_SURFACE_MAX_ATTEMPTS + 1):
+        if attempt in {1, 4, 8, 12, 16, 20, 24, 30, _CHATGPT_OFFER_SURFACE_MAX_ATTEMPTS}:
+            log(
+                f"{prefix} waiting direct checkout surface via ChatGPT offer "
+                f"({attempt}/{_CHATGPT_OFFER_SURFACE_MAX_ATTEMPTS}), url={page.url}"
+            )
         if await _checkout_surface_ready(page):
             return
         await _dismiss_chatgpt_interstitials(page, prefix)
+        region_ready = await _select_chatgpt_offer_region_us(page, prefix)
+        if await _chatgpt_offer_modal_visible(page) and not region_ready:
+            region_failures += 1
+            if region_failures >= 3:
+                await _save_chatgpt_offer_failure_debug(
+                    page,
+                    item["email"],
+                    "offer region failed to switch US after 3 attempts",
+                )
+                raise RuntimeError("套餐页右下角地区未能自动切换到美国")
+            await page.wait_for_timeout(1200)
+            continue
+        submit_attempted = False
+        submit_ok = False
         clicked_trial = await _click_zero_trial_plus_option(page, prefix)
+        if clicked_trial:
+            submit_attempted = True
+            submit_ok = await _click_chatgpt_offer_plan_submit(page, prefix, email=item["email"])
+        elif await _chatgpt_offer_modal_visible(page):
+            submit_attempted = True
+            submit_ok = await _click_chatgpt_offer_plan_submit(page, prefix, email=item["email"])
+        if submit_attempted and not submit_ok and await _chatgpt_offer_modal_visible(page):
+            region_failures += 1
+            if region_failures >= 3:
+                await _save_chatgpt_offer_failure_debug(
+                    page,
+                    item["email"],
+                    "offer region/currency failed before submit after 3 attempts",
+                )
+                raise RuntimeError("套餐页地区/货币未能切换到美国")
+            await page.wait_for_timeout(1200)
+            continue
+        if region_ready or submit_ok:
+            region_failures = 0
         if await _checkout_surface_ready(page):
             return
         clicked = await _click_visible_offer_entry(page, prefix)
+        if clicked:
+            submit_attempted = True
+            submit_ok = await _click_chatgpt_offer_plan_submit(page, prefix, email=item["email"])
+            if not submit_ok and await _chatgpt_offer_modal_visible(page):
+                region_failures += 1
+                if region_failures >= 3:
+                    await _save_chatgpt_offer_failure_debug(
+                        page,
+                        item["email"],
+                        "offer region/currency failed after entry click",
+                    )
+                    raise RuntimeError("套餐页地区/货币未能切换到美国")
+                await page.wait_for_timeout(1200)
+                continue
         if await _checkout_surface_ready(page):
             return
         if clicked:
-            await _click_zero_trial_plus_option(page, prefix)
+            await _select_chatgpt_offer_region_us(page, prefix)
+            clicked_trial_after_offer = await _click_zero_trial_plus_option(page, prefix)
+            if clicked_trial_after_offer:
+                submit_attempted = True
+                submit_ok = await _click_chatgpt_offer_plan_submit(page, prefix, email=item["email"])
+            elif await _chatgpt_offer_modal_visible(page):
+                submit_attempted = True
+                submit_ok = await _click_chatgpt_offer_plan_submit(page, prefix, email=item["email"])
+            if submit_attempted and not submit_ok and await _chatgpt_offer_modal_visible(page):
+                region_failures += 1
+                if region_failures >= 3:
+                    await _save_chatgpt_offer_failure_debug(
+                        page,
+                        item["email"],
+                        "offer region/currency failed after offer entry retry",
+                    )
+                    raise RuntimeError("套餐页地区/货币未能切换到美国")
+                await page.wait_for_timeout(1200)
+                continue
             if await _checkout_surface_ready(page):
                 return
-        if not clicked and not clicked_trial and attempt in {8, 16, 24}:
+        if not clicked and not clicked_trial and attempt in {8, 16, 24, 30}:
             try:
                 await page.goto("https://chatgpt.com/#pricing", wait_until="domcontentloaded", timeout=30_000)
                 await page.wait_for_timeout(1800)
             except Exception:
                 pass
         await page.wait_for_timeout(1500)
+    await _save_chatgpt_offer_failure_debug(
+        page,
+        item["email"],
+        "direct offer checkout surface not found after region US",
+    )
     raise RuntimeError(
         _zh(
             r"\u5df2\u5173\u95ed\u957f\u94fe\uff0c\u4f46\u767b\u5f55\u540e\u672a\u80fd\u81ea\u52a8\u627e\u5230\u9886\u53d6\u4f18\u60e0/\u5347\u7ea7\u5165\u53e3\u6216\u652f\u4ed8\u9875\u5143\u7d20"
@@ -1249,6 +4464,10 @@ def mark_link_for_regeneration(email: str, *, account_line: str = "", reason: st
 
 def _is_recreate_link_reason(reason: str | None) -> bool:
     return str(reason or "").startswith(PAYPAL_FLOW2_RECREATE_LINK)
+
+
+def _is_no_paypal_option_reason(reason: str | None) -> bool:
+    return str(reason or "").startswith(PAYPAL_FLOW2_NO_PAYPAL_OPTION)
 
 
 async def regenerate_flow2_payment_link(
@@ -1487,6 +4706,15 @@ def classify_checkout_due_amount(text: str) -> dict[str, Any]:
         "amount_value": selected["amount_value"],
         "source_text": selected["source_text"],
     }
+
+
+def _checkout_due_amount_looks_jpy(due_amount: dict[str, Any]) -> bool:
+    """短链日区必须在套餐页切美国；若 checkout 仍是 JPY，则不会出现 PayPal。"""
+    text = " ".join(
+        str(due_amount.get(key) or "")
+        for key in ("amount_text", "source_text", "selector", "amount_candidates")
+    )
+    return bool(re.search(r"(?i)(?:JPY|\u5186|[\u00a5\uffe5])", text))
 
 
 async def inspect_checkout_due_amount(page) -> dict[str, Any]:
@@ -1835,9 +5063,1208 @@ async def _fill_paypal_jp_identity(page, *, email: str, card: CardInfo) -> None:
     except Exception as exc:
         log(f"[PayPal][JP] 日本实名字段填充异常: {exc}")
 
-async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "US") -> None:
+
+async def _ensure_stripe_paypal_selected(page, prefix: str = "[Stripe]") -> bool:
+    """Stripe/Checkout 页：确认 PayPal 支付方式可见并重新点选，防止切国家后被重置。"""
+    async def _click_paypal_in_target(target, target_name: str) -> str:
+        try:
+            result = await target.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.02;
+                    };
+                    const metaOf = (el) => [
+                        el?.innerText || '',
+                        el?.textContent || '',
+                        el?.getAttribute?.('aria-label') || '',
+                        el?.getAttribute?.('title') || '',
+                        el?.getAttribute?.('alt') || '',
+                        el?.getAttribute?.('data-testid') || '',
+                        el?.getAttribute?.('id') || '',
+                        el?.getAttribute?.('name') || '',
+                        el?.getAttribute?.('value') || '',
+                        el?.getAttribute?.('src') || ''
+                    ].join(' ').replace(/\s+/g, ' ').trim();
+                    const selectedState = () => {
+                        const radio = document.querySelector(
+                            '#payment-method-accordion-item-title-paypal, input[type="radio"][value="paypal"], input[name="payment-method-accordion-item-title"][value="paypal"]'
+                        );
+                        const item = document.querySelector('[data-testid="paypal-accordion-item"]');
+                        const button = document.querySelector('[data-testid="paypal-accordion-item-button"]');
+                        const values = [
+                            radio && ('checked' in radio ? String(!!radio.checked) : ''),
+                            radio?.getAttribute?.('aria-checked') || '',
+                            item?.getAttribute?.('aria-checked') || '',
+                            item?.getAttribute?.('aria-expanded') || '',
+                            item?.getAttribute?.('data-state') || '',
+                            button?.getAttribute?.('aria-checked') || '',
+                            button?.getAttribute?.('aria-expanded') || '',
+                            button?.getAttribute?.('data-state') || '',
+                            String(radio?.className || ''),
+                            String(item?.className || ''),
+                            String(button?.className || '')
+                        ].join(' ').toLowerCase();
+                        const selectedByText = /已选择\s*PayPal|PayPal\s*已选择|PayPal[\s\S]{0,30}selected|selected[\s\S]{0,30}PayPal/i.test(
+                            [
+                                item && metaOf(item),
+                                button && metaOf(button),
+                                document.body?.innerText || document.body?.textContent || ''
+                            ].join(' ').replace(/\s+/g, ' ')
+                        );
+                        return /true|open|checked|selected|active/.test(values) || selectedByText;
+                    };
+                    const firePointerClick = (node) => {
+                        if (!node) return false;
+                        try { node.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+                        for (const [name, init] of [
+                            ['pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse' }],
+                            ['mousedown', { bubbles: true, cancelable: true }],
+                            ['pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse' }],
+                            ['mouseup', { bubbles: true, cancelable: true }],
+                            ['click', { bubbles: true, cancelable: true }]
+                        ]) {
+                            try {
+                                const ctor = name.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+                                node.dispatchEvent(new ctor(name, init));
+                            } catch (e) {}
+                        }
+                        try { node.click(); } catch (e) {}
+                        return true;
+                    };
+                    const clickAt = (node, xRatio, yRatio) => {
+                        if (!node || !visible(node)) return false;
+                        const rect = node.getBoundingClientRect();
+                        const x = Math.max(rect.left + 4, Math.min(rect.right - 4, rect.left + rect.width * xRatio));
+                        const y = Math.max(rect.top + 4, Math.min(rect.bottom - 4, rect.top + rect.height * yRatio));
+                        let hit = document.elementFromPoint(x, y) || node;
+                        for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                            try {
+                                const init = {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window,
+                                    clientX: x,
+                                    clientY: y,
+                                    pointerType: 'mouse',
+                                };
+                                const ctor = name.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+                                hit.dispatchEvent(new ctor(name, init));
+                            } catch (e) {}
+                        }
+                        return true;
+                    };
+                    const nativeCheckRadio = (radio) => {
+                        if (!radio) return false;
+                        try {
+                            const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+                            if (desc && typeof desc.set === 'function') desc.set.call(radio, true);
+                            else radio.checked = true;
+                            radio.setAttribute('aria-checked', 'true');
+                            radio.dispatchEvent(new Event('input', { bubbles: true }));
+                            radio.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        } catch (e) {
+                            return false;
+                        }
+                    };
+                    const tryCandidate = (node, mode) => {
+                        if (!node || !visible(node)) return null;
+                        const item = node.closest?.('[data-testid="paypal-accordion-item"], .PaymentMethodFormAccordionItem, [role="listitem"], label') || node;
+                        // 优先点真实 radio 与其左侧位置；避免点到包含“银行卡 PayPal 电话号码”的大表单容器。
+                        const radio = item.querySelector?.('input[type="radio"][value="paypal"], input[name="payment-method-accordion-item-title"][value="paypal"]')
+                            || (String(node.matches?.('input[type="radio"]')) === 'true' ? node : null);
+                        firePointerClick(radio || node);
+                        clickAt(radio || item, 0.06, 0.5);
+                        clickAt(item, 0.08, 0.5);
+                        clickAt(item, 0.5, 0.5);
+                        if (selectedState()) {
+                            return { clicked: true, selected: true, mode, label: metaOf(item).slice(0, 180) || metaOf(node).slice(0, 180) };
+                        }
+                        nativeCheckRadio(radio);
+                        if (selectedState()) {
+                            return { clicked: true, selected: true, mode: `${mode}:native-radio`, label: metaOf(item).slice(0, 180) || metaOf(node).slice(0, 180) };
+                        }
+                        return { clicked: true, selected: false, mode, label: metaOf(item).slice(0, 180) || metaOf(node).slice(0, 180) };
+                    };
+
+                    const directSelectors = [
+                        '#payment-method-accordion-item-title-paypal',
+                        'input[type="radio"][value="paypal"]',
+                        'input[name="payment-method-accordion-item-title"][value="paypal"]',
+                        '[aria-labelledby="payment-method-label-paypal"]',
+                        '[data-testid="paypal-accordion-item"]',
+                        '[data-testid="paypal-accordion-item-button"]'
+                    ];
+                    for (const selector of directSelectors) {
+                        const node = document.querySelector(selector);
+                        const result = tryCandidate(node, `direct:${selector}`);
+                        if (result?.selected) return result;
+                    }
+                    const label = document.querySelector('#payment-method-label-paypal');
+                    const labelResult = tryCandidate(label, 'label-id');
+                    if (labelResult?.selected) return labelResult;
+
+                    const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="radio"], label, [data-testid], [aria-label], div, span'))
+                        .filter(visible)
+                        .map((el) => {
+                            const rect = el.getBoundingClientRect();
+                            const text = metaOf(el);
+                            const hasPayPal = /paypal|pay\s*pal/i.test(text);
+                            const badLarge = rect.width > Math.max(620, window.innerWidth * 0.55)
+                                || rect.height > 180
+                                || /银行卡|card|电话号码|phone|联系信息|subscription|订阅|subscribe/i.test(text.replace(/pay\s*pal/ig, ''));
+                            return { el, rect, text, hasPayPal, badLarge };
+                        })
+                        .filter((item) => item.hasPayPal && !item.badLarge && !/powered\s+by/i.test(item.text))
+                        .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+                    for (const item of nodes.slice(0, 8)) {
+                        const result = tryCandidate(item.el, 'scoped-text-paypal');
+                        if (result?.selected) return result;
+                    }
+                    return { clicked: false, selected: selectedState(), mode: '', label: '' };
+                }"""
+            )
+            if isinstance(result, dict) and result.get("clicked") and result.get("selected"):
+                label = str(result.get("label") or "")
+                mode = str(result.get("mode") or "direct-paypal")
+                return f"{target_name}:{mode}:{label[:80]}"
+        except Exception:
+            pass
+        selectors = (
+            '#payment-method-accordion-item-title-paypal',
+            'input[type="radio"][value="paypal"]',
+            'input[name="payment-method-accordion-item-title"][value="paypal"]',
+            '[aria-labelledby="payment-method-label-paypal"]',
+            '[data-testid="paypal-accordion-item"]',
+            '[data-testid="paypal-accordion-item-button"]',
+            'button[aria-label*="PayPal" i]',
+            '[role="button"][aria-label*="PayPal" i]',
+            '[role="radio"][aria-label*="PayPal" i]',
+            'label[aria-label*="PayPal" i]',
+            'button:has-text("PayPal")',
+            '[role="button"]:has-text("PayPal")',
+            '[role="radio"]:has-text("PayPal")',
+            'label:has-text("PayPal")',
+            'img[alt*="PayPal" i]',
+            'img[src*="paypal" i]',
+        )
+        for selector in selectors:
+            try:
+                locator = target.locator(selector).first
+                if await locator.is_visible(timeout=500):
+                    await locator.scroll_into_view_if_needed(timeout=1000)
+                    await locator.click(timeout=2500, force=True)
+                    await page.wait_for_timeout(350)
+                    snapshot = await _paypal_snapshot(target, target_name)
+                    if snapshot.get("selected"):
+                        return f"{target_name}:{selector}"
+            except Exception:
+                continue
+        return ""
+
+    async def _paypal_snapshot(target, target_name: str) -> dict[str, Any]:
+        try:
+            result = await target.evaluate(
+                r"""() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const metaOf = (el) => [
+                        el?.innerText || '',
+                        el?.textContent || '',
+                        el?.getAttribute?.('aria-label') || '',
+                        el?.getAttribute?.('title') || '',
+                        el?.getAttribute?.('alt') || '',
+                        el?.getAttribute?.('data-testid') || '',
+                        el?.getAttribute?.('id') || '',
+                        el?.getAttribute?.('name') || '',
+                        el?.getAttribute?.('value') || '',
+                        el?.getAttribute?.('src') || ''
+                    ].join(' ').replace(/\s+/g, ' ').trim();
+                    const radio = document.querySelector(
+                        '#payment-method-accordion-item-title-paypal, input[type="radio"][value="paypal"], input[name="payment-method-accordion-item-title"][value="paypal"]'
+                    );
+                    const item = document.querySelector('[data-testid="paypal-accordion-item"]');
+                    const button = document.querySelector('[data-testid="paypal-accordion-item-button"]');
+                    const nodes = Array.from(document.querySelectorAll(
+                        'button, [role="button"], [role="radio"], label, a, [tabindex], [data-testid], [aria-label], img, svg, div, span, input[type="radio"]'
+                    ))
+                        .filter(visible)
+                        .filter((el) => /paypal|pay\s*pal/i.test(metaOf(el)) && !/powered\s+by/i.test(metaOf(el)));
+                    const selectedText = [
+                        radio && ('checked' in radio ? String(!!radio.checked) : ''),
+                        radio?.getAttribute?.('aria-checked') || '',
+                        item?.getAttribute?.('aria-checked') || '',
+                        item?.getAttribute?.('aria-expanded') || '',
+                        item?.getAttribute?.('data-state') || '',
+                        button?.getAttribute?.('aria-checked') || '',
+                        button?.getAttribute?.('aria-expanded') || '',
+                        button?.getAttribute?.('data-state') || '',
+                        String(radio?.className || ''),
+                        String(item?.className || ''),
+                        String(button?.className || '')
+                    ].join(' ').toLowerCase();
+                    const body = String(document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
+                    const selectedByText = /已选择\s*PayPal|PayPal\s*已选择|PayPal[\s\S]{0,30}selected|selected[\s\S]{0,30}PayPal/i.test(
+                        [metaOf(radio), metaOf(item), metaOf(button), body].filter(Boolean).join(' ')
+                    );
+                    const selected = /true|open|checked|selected|active/.test(selectedText) || selectedByText;
+                    return {
+                        hasPayPal: nodes.length > 0 || !!radio || !!item || !!button,
+                        selected,
+                        label: [metaOf(radio), metaOf(item), metaOf(button), ...nodes.map(metaOf)]
+                            .filter(Boolean).slice(0, 5).join(' | ').slice(0, 260),
+                        radioChecked: radio && ('checked' in radio ? !!radio.checked : null),
+                        radioAria: radio?.getAttribute?.('aria-checked') || '',
+                        selectedByText,
+                        body: body.slice(0, 220)
+                    };
+                }"""
+            )
+            if isinstance(result, dict):
+                result["target"] = target_name
+                return result
+        except Exception as exc:
+            return {"target": target_name, "error": str(exc)[:160], "hasPayPal": False, "selected": False, "label": "", "body": ""}
+        return {"target": target_name, "hasPayPal": False, "selected": False, "label": "", "body": ""}
+
+    async def _targets() -> list[tuple[str, Any]]:
+        targets: list[tuple[str, Any]] = [("main", page)]
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            url = str(getattr(frame, "url", "") or "").lower()
+            if "stripe" not in url and "private" not in url and "payment" not in url:
+                continue
+            targets.append((f"iframe-paypal:{len(targets)}", frame))
+        return targets
+
+    click_mode = ""
+    try:
+        for attempt in range(3):
+            for name, target in await _targets():
+                click_mode = await _click_paypal_in_target(target, name)
+                if click_mode:
+                    await page.wait_for_timeout(700)
+                    snapshot = await _paypal_snapshot(target, name)
+                    if snapshot.get("selected"):
+                        break
+                    log(
+                        f"{prefix} PayPal click did not select yet "
+                        f"(attempt={attempt + 1}/3, mode={click_mode}, "
+                        f"radio_checked={snapshot.get('radioChecked')}, label={snapshot.get('label', '')})"
+                    )
+                    click_mode = ""
+            if click_mode:
+                await page.wait_for_timeout(800)
+                break
+            await page.wait_for_timeout(500)
+    except Exception as exc:
+        log(f"{prefix} PayPal payment method click probe failed: {exc}")
+    clicked = bool(click_mode)
+    snapshots: list[dict[str, Any]] = []
+    try:
+        for name, target in await _targets():
+            snapshot = await _paypal_snapshot(target, name)
+            snapshots.append(snapshot)
+            if snapshot.get("hasPayPal") and snapshot.get("selected"):
+                log(
+                    f"{prefix} PayPal payment method confirmed "
+                    f"(clicked={clicked}, mode={click_mode}, target={snapshot.get('target')}, "
+                    f"selected={snapshot.get('selected')}, label={snapshot.get('label', '')})"
+                )
+                return True
+        summary = [
+            {
+                "target": item.get("target", ""),
+                "hasPayPal": item.get("hasPayPal", False),
+                "selected": item.get("selected", False),
+                "label": str(item.get("label", ""))[:120],
+                "body": str(item.get("body", ""))[:120],
+                "error": item.get("error", ""),
+            }
+            for item in snapshots
+        ][:8]
+        log(f"{prefix} PayPal payment method not visible before submit: {summary}")
+    except Exception as exc:
+        log(f"{prefix} PayPal payment method probe failed: {exc}")
+    return False
+
+
+async def _ensure_stripe_required_checkboxes(page, prefix: str = "[Stripe]") -> dict[str, Any]:
+    """Stripe 页：只勾选必要条款类 checkbox，避开 AI-agent / Link CLI 引导控件。"""
+    try:
+        result = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const labelOf = (el) => {
+                    const labels = [];
+                    if (el.id) {
+                        const byFor = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                        if (byFor) labels.push(textOf(byFor));
+                    }
+                    const label = el.closest && el.closest('label');
+                    if (label) labels.push(textOf(label));
+                    let parent = el.parentElement;
+                    for (let i = 0; parent && i < 3; i += 1, parent = parent.parentElement) {
+                        const text = textOf(parent);
+                        if (text) labels.push(text);
+                    }
+                    return labels.find(Boolean)?.slice(0, 180) || textOf(el).slice(0, 180) || el.getAttribute?.('name') || el.getAttribute?.('id') || '';
+                };
+                const checkedOf = (el) => {
+                    if ('checked' in el) return !!el.checked;
+                    return String(el.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+                };
+                const setUnchecked = (el) => {
+                    if (!checkedOf(el)) return;
+                    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+                    try { el.click(); } catch {}
+                    if ('checked' in el && el.checked) {
+                        el.checked = false;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    if (!('checked' in el)) {
+                        el.setAttribute('aria-checked', 'false');
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                };
+                const setChecked = (el) => {
+                    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch {}
+                    try { el.click(); } catch {}
+                    if ('checked' in el && !el.checked) {
+                        el.checked = true;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    if (!('checked' in el)) {
+                        el.setAttribute('aria-checked', 'true');
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                };
+                const allBoxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]'))
+                    .filter(visible);
+                const agentPattern = /ai\s*agent|link\s*cli|agent_identity_token|agent\s*identity|underlying payment credentials/i;
+                const boxes = [];
+                const skippedAgent = [];
+                const uncheckedAgent = [];
+                for (const box of allBoxes) {
+                    const label = labelOf(box);
+                    const agentHost = box.closest && box.closest('.AiAgentPaymentSteering, [class*="AiAgentPaymentSteering"]');
+                    const agentText = [
+                        label,
+                        textOf(box.closest && box.closest('label')),
+                        box.getAttribute?.('name') || '',
+                        box.getAttribute?.('id') || '',
+                        box.getAttribute?.('aria-label') || ''
+                    ].join(' ');
+                    if (agentHost || agentPattern.test(agentText)) {
+                        const before = checkedOf(box);
+                        setUnchecked(box);
+                        const after = checkedOf(box);
+                        if (before && !after) uncheckedAgent.push(label);
+                        else skippedAgent.push(label);
+                        continue;
+                    }
+                    boxes.push({ box, label });
+                }
+                const touched = [];
+                for (const item of boxes) {
+                    const box = item.box;
+                    if (checkedOf(box)) continue;
+                    const before = checkedOf(box);
+                    setChecked(box);
+                    const after = checkedOf(box);
+                    touched.push({ label: item.label, before, after });
+                }
+                return {
+                    total: boxes.length,
+                    totalAll: allBoxes.length,
+                    touched: touched.length,
+                    labels: touched.map((x) => `${x.after ? 'checked' : 'forced'}:${x.label}`).slice(0, 8),
+                    checkedAfter: boxes.map((x) => x.box).filter(checkedOf).length,
+                    skippedAgent: skippedAgent.length,
+                    uncheckedAgent: uncheckedAgent.length,
+                    agentLabels: [...uncheckedAgent, ...skippedAgent].slice(0, 4)
+                };
+            }"""
+        )
+        if isinstance(result, dict):
+            log(
+                f"{prefix} checkout checkbox sweep: total={result.get('total', 0)} "
+                f"all={result.get('totalAll', 0)} "
+                f"touched={result.get('touched', 0)} checked={result.get('checkedAfter', 0)} "
+                f"skipped_agent={result.get('skippedAgent', 0)} "
+                f"unchecked_agent={result.get('uncheckedAgent', 0)} "
+                f"labels={result.get('labels', [])}"
+            )
+            return result
+    except Exception as exc:
+        log(f"{prefix} checkout checkbox sweep skipped: {exc}")
+    return {"total": 0, "touched": 0, "checkedAfter": 0, "labels": []}
+
+
+def _stripe_probe_url(url: str) -> bool:
+    """仅记录 Stripe/PayPal 关键请求，避免日志膨胀。"""
+    value = str(url or "").lower()
+    if not any(host in value for host in ("stripe.com", "pay.openai.com", "paypal.com")):
+        return False
+    return any(
+        marker in value
+        for marker in (
+            "payment_pages",
+            "confirm",
+            "sessions",
+            "checkout",
+            "redirect",
+            "paypal",
+            "hcaptcha",
+            "human-security",
+            "pay.openai.com/c/pay",
+        )
+    )
+
+
+def _stripe_short_url(url: str, limit: int = 360) -> str:
+    text = str(url or "")
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+_STRIPE_CONFIRM_BODY_CAPTURE_LIMIT = 120_000
+_STRIPE_CONFIRM_REQUEST_CAPTURE_LIMIT = 12_000
+
+
+def _get_stripe_network_events(page) -> list[dict[str, Any]]:
+    try:
+        events = getattr(page, "_flow2_stripe_network_events", None)
+        if isinstance(events, list):
+            return list(events)
+    except Exception:
+        pass
+    return []
+
+
+def _append_stripe_network_event(page, item: dict[str, Any]) -> None:
+    try:
+        events = getattr(page, "_flow2_stripe_network_events", None)
+        if not isinstance(events, list):
+            events = []
+            setattr(page, "_flow2_stripe_network_events", events)
+        events.append(item)
+        if len(events) > 1200:
+            important = [
+                event for event in events
+                if "/poll?" not in str(event.get("url") or "").lower()
+            ][-400:]
+            recent = events[-700:]
+            merged: list[dict[str, Any]] = []
+            seen: set[tuple[str, str, str, str]] = set()
+            for event in [*important, *recent]:
+                key = (
+                    str(event.get("kind") or ""),
+                    str(event.get("method") or ""),
+                    str(event.get("status") or event.get("error") or ""),
+                    str(event.get("url") or ""),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(event)
+            events[:] = merged[-1000:]
+    except Exception:
+        pass
+
+
+def _attach_stripe_network_probe(page) -> None:
+    """提交 Stripe 前挂网络探针，失败现场可见真实请求状态。"""
+    try:
+        if getattr(page, "_flow2_stripe_network_probe_attached", False):
+            return
+        setattr(page, "_flow2_stripe_network_probe_attached", True)
+        setattr(page, "_flow2_stripe_network_events", [])
+    except Exception:
+        return
+
+    def on_request(request) -> None:
+        try:
+            url = str(getattr(request, "url", "") or "")
+            if not _stripe_probe_url(url):
+                return
+            body = ""
+            body_length = 0
+            body_truncated = False
+            if "/confirm" in url.lower():
+                try:
+                    raw_body = getattr(request, "post_data", "")
+                    if callable(raw_body):
+                        raw_body = raw_body()
+                    body = str(raw_body or "")
+                    body_length = len(body)
+                    body_truncated = body_length > _STRIPE_CONFIRM_REQUEST_CAPTURE_LIMIT
+                    body = body[:_STRIPE_CONFIRM_REQUEST_CAPTURE_LIMIT]
+                except Exception as exc:
+                    body = f"<post_data_error:{exc}>"
+            _append_stripe_network_event(
+                page,
+                {
+                    "kind": "request",
+                    "method": str(getattr(request, "method", "") or ""),
+                    "resource": str(getattr(request, "resource_type", "") or ""),
+                    "url": _stripe_short_url(url),
+                    "body": body,
+                    "body_length": body_length,
+                    "body_truncated": body_truncated,
+                    "ts": round(time.time(), 3),
+                },
+            )
+        except Exception:
+            pass
+
+    def on_response(response) -> None:
+        try:
+            url = str(getattr(response, "url", "") or "")
+            if not _stripe_probe_url(url):
+                return
+            request = getattr(response, "request", None)
+            _append_stripe_network_event(
+                page,
+                {
+                    "kind": "response",
+                    "status": int(getattr(response, "status", 0) or 0),
+                    "ok": bool(getattr(response, "ok", False)),
+                    "method": str(getattr(request, "method", "") or ""),
+                    "resource": str(getattr(request, "resource_type", "") or ""),
+                    "url": _stripe_short_url(url),
+                    "ts": round(time.time(), 3),
+                },
+            )
+            if "/confirm" in url.lower():
+                try:
+                    loop = asyncio.get_running_loop()
+
+                    async def capture_confirm_body() -> None:
+                        try:
+                            body = await response.text()
+                            body_text = str(body or "")
+                            _append_stripe_network_event(
+                                page,
+                                {
+                                    "kind": "response_body",
+                                    "status": int(getattr(response, "status", 0) or 0),
+                                    "method": str(getattr(request, "method", "") or ""),
+                                    "url": _stripe_short_url(url),
+                                    "body": body_text[:_STRIPE_CONFIRM_BODY_CAPTURE_LIMIT],
+                                    "body_length": len(body_text),
+                                    "body_truncated": len(body_text) > _STRIPE_CONFIRM_BODY_CAPTURE_LIMIT,
+                                    "ts": round(time.time(), 3),
+                                },
+                            )
+                        except Exception as exc:
+                            _append_stripe_network_event(
+                                page,
+                                {
+                                    "kind": "response_body_error",
+                                    "status": int(getattr(response, "status", 0) or 0),
+                                    "method": str(getattr(request, "method", "") or ""),
+                                    "url": _stripe_short_url(url),
+                                    "error": str(exc)[:500],
+                                    "ts": round(time.time(), 3),
+                                },
+                            )
+
+                    loop.create_task(capture_confirm_body())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def on_request_failed(request) -> None:
+        try:
+            url = str(getattr(request, "url", "") or "")
+            if not _stripe_probe_url(url):
+                return
+            failure = getattr(request, "failure", None)
+            _append_stripe_network_event(
+                page,
+                {
+                    "kind": "requestfailed",
+                    "method": str(getattr(request, "method", "") or ""),
+                    "resource": str(getattr(request, "resource_type", "") or ""),
+                    "error": str(failure or ""),
+                    "url": _stripe_short_url(url),
+                    "ts": round(time.time(), 3),
+                },
+            )
+        except Exception:
+            pass
+
+    try:
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfailed", on_request_failed)
+    except Exception:
+        pass
+
+
+def _summarize_stripe_network_events(page) -> str:
+    events = _get_stripe_network_events(page)
+    if not events:
+        return "none"
+    parts: list[str] = []
+    for item in events[-10:]:
+        kind = str(item.get("kind") or "")
+        status = str(item.get("status") or item.get("error") or "")
+        method = str(item.get("method") or "")
+        url = str(item.get("url") or "")
+        parts.append(f"{kind}:{status}:{method}:{url[:120]}")
+    return " || ".join(parts)
+
+
+def _walk_json_values(value: Any) -> list[Any]:
+    stack: list[Any] = [value]
+    values: list[Any] = []
+    while stack:
+        current = stack.pop()
+        values.append(current)
+        if isinstance(current, dict):
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return values
+
+
+def _is_paypal_redirect_url(value: str) -> bool:
+    """只接受真实 PayPal 域名跳转，避免把 Stripe 的 PayPal 图标资源当成跳转地址。"""
+    cleaned = str(value or "").replace("\\/", "/").strip()
+    match = re.match(r"^https://([^/?#]+)([^?#]*)", cleaned, re.I)
+    if not match:
+        return False
+    host = match.group(1).split("@")[-1].split(":", 1)[0].lower()
+    path = match.group(2) or ""
+    if host != "paypal.com" and not host.endswith(".paypal.com"):
+        return False
+    if re.search(r"\.(?:png|jpe?g|gif|svg|webp|ico)(?:$|[?#])", path, re.I):
+        return False
+    return True
+
+
+def _first_paypal_redirect_in_text(text: str) -> str:
+    for match in re.finditer(r"https://[^\"'\\\s<>]+paypal[^\"'\\\s<>]+", str(text or ""), re.I):
+        candidate = match.group(0).replace("\\/", "/")
+        if _is_paypal_redirect_url(candidate):
+            return candidate
+    return ""
+
+
+def _find_paypal_redirect_in_value(value: Any) -> str:
+    for current in _walk_json_values(value):
+        if isinstance(current, str):
+            cleaned = current.replace("\\/", "/")
+            if _is_paypal_redirect_url(cleaned):
+                return cleaned
+    return ""
+
+
+def _stripe_confirm_response_snapshot(page) -> dict[str, Any]:
+    """提取最近一次 Stripe confirm 响应摘要，失败现场可快速判断是否有 PayPal action。"""
+    for item in reversed(_get_stripe_network_events(page)):
+        if item.get("kind") != "response_body":
+            continue
+        body = str(item.get("body") or "")
+        snapshot: dict[str, Any] = {
+            "http_status": item.get("status"),
+            "method": item.get("method"),
+            "url": item.get("url"),
+            "body_length": item.get("body_length", len(body)),
+            "body_truncated": bool(item.get("body_truncated")),
+            "paypal_url": "",
+            "parse_ok": False,
+        }
+        if not body:
+            return snapshot
+        text = body.replace("\\/", "/")
+        direct = _first_paypal_redirect_in_text(text)
+        if direct:
+            snapshot["paypal_url"] = direct
+        try:
+            data = json.loads(body)
+        except Exception as exc:
+            snapshot["parse_error"] = str(exc)[:220]
+            return snapshot
+        snapshot["parse_ok"] = True
+        if isinstance(data, dict):
+            elements_options = data.get("elements_options") if isinstance(data.get("elements_options"), dict) else {}
+            for key in (
+                "id",
+                "object",
+                "mode",
+                "status",
+                "payment_status",
+                "currency",
+                "amount_total",
+                "payment_intent",
+                "setup_intent",
+                "subscription",
+                "success_url",
+                "cancel_url",
+                "url",
+                "approval_method",
+            ):
+                if key in data:
+                    snapshot[key] = data.get(key)
+            snapshot["payment_method_types"] = data.get("payment_method_types") or elements_options.get("payment_method_types")
+            if not snapshot.get("paypal_url"):
+                snapshot["paypal_url"] = _find_paypal_redirect_in_value(data)
+        return snapshot
+    return {}
+
+
+def _summarize_stripe_confirm_response(page) -> str:
+    snapshot = _stripe_confirm_response_snapshot(page)
+    if not snapshot:
+        return "none"
+    parts = [
+        f"http={snapshot.get('http_status')}",
+        f"len={snapshot.get('body_length')}",
+        f"trunc={snapshot.get('body_truncated')}",
+        f"parse={snapshot.get('parse_ok')}",
+    ]
+    for key in ("object", "mode", "status", "payment_status", "amount_total", "payment_method_types"):
+        value = snapshot.get(key)
+        if value not in (None, "", []):
+            parts.append(f"{key}={value}")
+    if snapshot.get("paypal_url"):
+        parts.append("paypal_url=yes")
+    if snapshot.get("parse_error"):
+        parts.append(f"parse_error={snapshot.get('parse_error')}")
+    return "; ".join(str(item) for item in parts)
+
+
+def _extract_stripe_confirm_redirect_url(page) -> str:
+    """从 Stripe confirm 响应体里提取 PayPal 跳转地址，前端卡住时手动接管跳转。"""
+    for item in reversed(_get_stripe_network_events(page)):
+        if item.get("kind") != "response_body":
+            continue
+        body = str(item.get("body") or "")
+        if not body:
+            continue
+        text = body.replace("\\/", "/")
+        direct = _first_paypal_redirect_in_text(text)
+        if direct:
+            return direct
+        try:
+            data = json.loads(body)
+        except Exception:
+            data = None
+        redirect = _find_paypal_redirect_in_value(data) if isinstance(data, (dict, list)) else ""
+        if redirect:
+            return redirect
+    return ""
+
+
+async def _accept_stripe_address_suggestion(
+    page,
+    card: CardInfo,
+    city_value: str,
+    zip_value: str,
+    prefix: str = "[Stripe]",
+) -> bool:
+    """选择 Stripe/Google 地址建议中匹配账单城市的首条，避免未提交规范化地址导致 PayPal 跳转卡死。"""
+    payload = {
+        "street": (card.street or "").strip(),
+        "city": (city_value or card.city or "").strip(),
+        "state": (card.state or "").strip(),
+        "zip": (zip_value or card.zip_code or "").strip(),
+    }
+    for _ in range(5):
+        try:
+            point = await page.evaluate(
+                r"""(payload) => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const compact = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+                const street = compact(payload?.street || '');
+                const city = compact(payload?.city || '');
+                const state = compact(payload?.state || '');
+                const zip = compact(payload?.zip || '');
+                const stateNames = {
+                    al: 'alabama', ak: 'alaska', az: 'arizona', ar: 'arkansas', ca: 'california',
+                    co: 'colorado', ct: 'connecticut', de: 'delaware', dc: 'districtofcolumbia',
+                    fl: 'florida', ga: 'georgia', hi: 'hawaii', id: 'idaho', il: 'illinois',
+                    in: 'indiana', ia: 'iowa', ks: 'kansas', ky: 'kentucky', la: 'louisiana',
+                    me: 'maine', md: 'maryland', ma: 'massachusetts', mi: 'michigan', mn: 'minnesota',
+                    ms: 'mississippi', mo: 'missouri', mt: 'montana', ne: 'nebraska', nv: 'nevada',
+                    nh: 'newhampshire', nj: 'newjersey', nm: 'newmexico', ny: 'newyork',
+                    nc: 'northcarolina', nd: 'northdakota', oh: 'ohio', ok: 'oklahoma',
+                    or: 'oregon', pa: 'pennsylvania', ri: 'rhodeisland', sc: 'southcarolina',
+                    sd: 'southdakota', tn: 'tennessee', tx: 'texas', ut: 'utah', vt: 'vermont',
+                    va: 'virginia', wa: 'washington', wv: 'westvirginia', wi: 'wisconsin', wy: 'wyoming'
+                };
+                const stateFull = stateNames[state] || state;
+                const streetNumber = String(payload?.street || '').match(/\d+/)?.[0] || '';
+                const streetWord = compact(String(payload?.street || '').replace(/^\d+\s*/, '').split(/\s+/).slice(0, 2).join(' '));
+                const bodyText = textOf(document.body);
+                if (!/results available|建议|suggest|google/i.test(bodyText)) {
+                    return { ok: false, reason: 'no-suggestion-overlay', label: '' };
+                }
+                const matchesAddress = (text) => {
+                    const key = compact(text);
+                    if (!key) return false;
+                    const streetHit = (
+                        (street && key.includes(street)) ||
+                        (streetNumber && streetWord && key.includes(streetNumber) && key.includes(streetWord))
+                    );
+                    const localityHit = (
+                        (city && key.includes(city)) ||
+                        (zip && key.includes(zip)) ||
+                        (state && key.includes(state)) ||
+                        (stateFull && key.includes(stateFull))
+                    );
+                    return streetHit && localityHit;
+                };
+                const nodes = Array.from(document.querySelectorAll('[role="option"], li, button, div, span'))
+                    .filter(visible)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = textOf(el);
+                        return { el, rect, text };
+                    })
+                    .filter((item) => {
+                        if (!item.text || item.text.length > 220) return false;
+                        if (item.rect.width > window.innerWidth * 0.65 || item.rect.height > window.innerHeight * 0.22) return false;
+                        return matchesAddress(item.text);
+                    })
+                    .sort((a, b) => {
+                        const aExact = compact(a.text).includes(street) && city && compact(a.text).includes(city) ? 1 : 0;
+                        const bExact = compact(b.text).includes(street) && city && compact(b.text).includes(city) ? 1 : 0;
+                        const aArea = a.rect.width * a.rect.height;
+                        const bArea = b.rect.width * b.rect.height;
+                        return (bExact - aExact) || (aArea - bArea) || (a.text.length - b.text.length);
+                    });
+                let targetItem = nodes[0] || null;
+                if (!targetItem) {
+                    const overlays = Array.from(document.querySelectorAll('div, ul, [role="listbox"]'))
+                        .filter(visible)
+                        .map((el) => ({ el, rect: el.getBoundingClientRect(), text: textOf(el) }))
+                        .filter((item) => /results available|建议|suggest/i.test(item.text) && matchesAddress(item.text))
+                        .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+                    const overlay = overlays[0];
+                    if (!overlay) return { ok: false, reason: 'candidate-not-found', label: '' };
+                    return {
+                        ok: true,
+                        mode: 'overlay-fallback',
+                        label: overlay.text.slice(0, 180),
+                        x: Math.round(overlay.rect.left + Math.max(18, Math.min(overlay.rect.width - 18, overlay.rect.width * 0.35))),
+                        y: Math.round(overlay.rect.top + Math.max(48, Math.min(overlay.rect.height - 12, 58)))
+                    };
+                }
+                const rect = targetItem.rect;
+                return {
+                    ok: true,
+                    mode: 'node',
+                    label: targetItem.text.slice(0, 180),
+                    x: Math.round(rect.left + Math.max(8, Math.min(rect.width - 8, rect.width / 2))),
+                    y: Math.round(rect.top + Math.max(8, Math.min(rect.height - 8, rect.height / 2)))
+                };
+            }""",
+                payload,
+            )
+            if isinstance(point, dict) and point.get("ok"):
+                await page.mouse.click(float(point.get("x") or 0), float(point.get("y") or 0))
+                await page.wait_for_timeout(900)
+                log(
+                    f"{prefix} accepted address suggestion: "
+                    f"mode={point.get('mode', '')} label={point.get('label', '')}"
+                )
+                return True
+        except Exception as exc:
+            log(f"{prefix} address suggestion accept skipped: {exc}")
+            return False
+        await page.wait_for_timeout(450)
+    return False
+
+
+async def _dismiss_stripe_address_suggestions(page, prefix: str = "[Stripe]") -> None:
+    """Stripe 地址输入后可能出现 Google 建议浮层；提交前强制失焦并关闭，避免挡住 PayPal 跳转。"""
+    try:
+        for selector in (
+            "button.AddressAutocomplete--clear-dropdown-button",
+            "[class*='AddressAutocomplete--clear-dropdown-button']",
+            "#billing-address-autocomplete-results button",
+        ):
+            try:
+                button = page.locator(selector).first
+                if await button.is_visible(timeout=500):
+                    await button.click(timeout=1000, force=True)
+                    await page.wait_for_timeout(250)
+                    break
+            except Exception:
+                continue
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(250)
+        await page.evaluate(
+            r"""() => {
+                if (document.activeElement && document.activeElement.blur) {
+                    document.activeElement.blur();
+                }
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const overlays = Array.from(document.querySelectorAll('div, ul, li, [role="listbox"], [role="option"]'))
+                    .filter(visible)
+                    .filter((el) => /results available|建议|suggest/i.test(textOf(el)) && textOf(el).length < 1200);
+                for (const overlay of overlays) {
+                    const close = Array.from(overlay.querySelectorAll('button, [role="button"], svg, span, div'))
+                        .filter(visible)
+                        .find((el) => /^(×|x|close|关闭|關閉)$/i.test(textOf(el)) || /close|关闭|關閉/i.test(el.getAttribute?.('aria-label') || ''));
+                    if (close) {
+                        try { close.click(); return; } catch {}
+                    }
+                }
+                const input = document.querySelector('#billingAddressLine1');
+                if (input) {
+                    input.setAttribute('aria-expanded', 'false');
+                    input.removeAttribute('aria-activedescendant');
+                    try { input.blur(); } catch {}
+                }
+                for (const sel of [
+                    '#billing-address-autocomplete-results',
+                    '.AddressAutocomplete-results',
+                    '.AutocompleteInput-dropdown-container',
+                    '.AddressAutocomplete-suggestions-container'
+                ]) {
+                    for (const node of document.querySelectorAll(sel)) {
+                        node.setAttribute('aria-hidden', 'true');
+                        node.style.display = 'none';
+                        node.style.visibility = 'hidden';
+                        node.style.opacity = '0';
+                        node.style.pointerEvents = 'none';
+                    }
+                }
+            }"""
+        )
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(250)
+        await page.locator("body").click(position={"x": 8, "y": 8}, force=True)
+        await page.wait_for_timeout(350)
+    except Exception:
+        pass
+
+    try:
+        snapshot = await page.evaluate(
+            r"""() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+                const nodes = Array.from(document.querySelectorAll('[role="listbox"], [role="option"], [aria-label*="suggest" i], [id*="autocomplete" i], [class*="autocomplete" i], [class*="pac-container" i], div, ul, li'))
+                    .filter(visible)
+                    .filter((el) => {
+                        const text = textOf(el);
+                        return text && text.length <= 800 && /suggest|results available|建议|候補|候选|address/i.test(text);
+                    });
+                return {
+                    count: nodes.length,
+                    labels: nodes.slice(0, 3).map((el) => textOf(el).slice(0, 180))
+                };
+            }"""
+        )
+        if isinstance(snapshot, dict) and int(snapshot.get("count") or 0) > 0:
+            log(f"{prefix} address suggestion overlay still visible: {snapshot.get('labels', [])}")
+    except Exception:
+        pass
+
+
+async def _save_stripe_failure_debug(page, email: str, reason: str) -> Path | None:
+    """Stripe 失败时落 HTML/截图/表单快照，便于复盘真实页面状态。"""
+    try:
+        out_dir = PAYPAL_OUTPUT_ROOT / "debug" / "stripe_failure" / f"{safe_filename(email)}_{int(time.time())}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log(f"[Stripe] debug dir create failed: {exc}")
+        return None
+
+    try:
+        (out_dir / "page.html").write_text(await page.content(), encoding="utf-8")
+    except Exception as exc:
+        log(f"[Stripe] debug html save failed: {exc}")
+    try:
+        body_text = await page.evaluate("() => document.body?.innerText || ''")
+        (out_dir / "body.txt").write_text(str(body_text or ""), encoding="utf-8")
+    except Exception as exc:
+        log(f"[Stripe] debug body save failed: {exc}")
+    try:
+        state = await page.evaluate(
+            r"""(reason) => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                const fieldOf = (el) => ({
+                    tag: el.tagName,
+                    id: el.id || '',
+                    name: el.getAttribute('name') || '',
+                    type: el.getAttribute('type') || '',
+                    aria: el.getAttribute('aria-label') || '',
+                    value: String(el.value || '').slice(0, 180),
+                    text: textOf(el).slice(0, 180),
+                    checked: ('checked' in el) ? !!el.checked : String(el.getAttribute('aria-checked') || ''),
+                    invalid: el.getAttribute('aria-invalid') || '',
+                    testid: el.getAttribute('data-testid') || ''
+                });
+                const errorNodes = Array.from(document.querySelectorAll('[role="alert"], .Error, .ErrorMessage, [class*="error" i], [aria-invalid="true"]'))
+                    .filter(visible)
+                    .map((el) => textOf(el).slice(0, 240))
+                    .filter(Boolean);
+                return {
+                    reason,
+                    url: location.href,
+                    title: document.title || '',
+                    paymentMethods: Array.from(document.querySelectorAll('[data-testid*="accordion-item-button"], button, [role="button"], label'))
+                        .filter(visible)
+                        .map(fieldOf)
+                        .filter((x) => /paypal|card|link|支付|付款|銀行|银行卡/i.test([x.text, x.aria, x.testid].join(' ')))
+                        .slice(0, 20),
+                    checkboxes: Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]')).filter(visible).map(fieldOf).slice(0, 20),
+                    selects: Array.from(document.querySelectorAll('select')).filter(visible).map(fieldOf).slice(0, 20),
+                    inputs: Array.from(document.querySelectorAll('input, textarea')).filter(visible).map(fieldOf).slice(0, 40),
+                    errors: errorNodes.slice(0, 20),
+                    submitButtons: Array.from(document.querySelectorAll('button, input[type="submit"], [data-testid="hosted-payment-submit-button"]'))
+                        .filter(visible)
+                        .map(fieldOf)
+                        .filter((x) => /subscribe|processing|submit|订阅|購読|正在处理|処理/i.test([x.text, x.aria, x.testid, x.type].join(' ')))
+                        .slice(0, 10),
+                    iframes: Array.from(document.querySelectorAll('iframe'))
+                        .map((el) => ({
+                            name: el.getAttribute('name') || '',
+                            title: el.getAttribute('title') || '',
+                            src: String(el.getAttribute('src') || '').slice(0, 260)
+                        }))
+                        .slice(0, 20),
+                    resources: performance.getEntriesByType('resource')
+                        .map((entry) => ({
+                            name: String(entry.name || '').slice(0, 260),
+                            type: entry.initiatorType || '',
+                            duration: Math.round(entry.duration || 0),
+                            transferSize: entry.transferSize || 0
+                        }))
+                        .filter((entry) => /stripe|paypal|openai|confirm|payment|checkout|hcaptcha|human-security/i.test(entry.name))
+                        .slice(-80),
+                    bodyHead: textOf(document.body).slice(0, 2000)
+                };
+            }""",
+            reason,
+        )
+        if isinstance(state, dict):
+            state["networkEvents"] = _get_stripe_network_events(page)
+            state["confirmSummary"] = _summarize_stripe_confirm_response(page)
+            state["confirmResponse"] = _stripe_confirm_response_snapshot(page)
+            frame_states = []
+            for frame in page.frames:
+                if frame is page.main_frame:
+                    continue
+                url = str(getattr(frame, "url", "") or "")
+                if "stripe" not in url and "private" not in url and "payment" not in url and "address" not in url:
+                    continue
+                try:
+                    frame_states.append(
+                        await frame.evaluate(
+                            r"""() => {
+                                const visible = (el) => {
+                                    if (!el) return false;
+                                    const rect = el.getBoundingClientRect();
+                                    const style = getComputedStyle(el);
+                                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                                };
+                                const textOf = (el) => String(el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+                                const fieldOf = (el) => ({
+                                    tag: el.tagName,
+                                    id: el.id || '',
+                                    name: el.getAttribute('name') || '',
+                                    type: el.getAttribute('type') || '',
+                                    aria: el.getAttribute('aria-label') || '',
+                                    autocomplete: el.getAttribute('autocomplete') || '',
+                                    placeholder: el.getAttribute('placeholder') || '',
+                                    value: String(el.value || '').slice(0, 180),
+                                    text: textOf(el).slice(0, 180),
+                                    invalid: el.getAttribute('aria-invalid') || '',
+                                    checked: ('checked' in el) ? !!el.checked : String(el.getAttribute('aria-checked') || ''),
+                                });
+                                return {
+                                    url: location.href,
+                                    title: document.title || '',
+                                    body: textOf(document.body).slice(0, 500),
+                                    selects: Array.from(document.querySelectorAll('select')).filter(visible).map(fieldOf).slice(0, 30),
+                                    inputs: Array.from(document.querySelectorAll('input, textarea')).filter(visible).map(fieldOf).slice(0, 50),
+                                    errors: Array.from(document.querySelectorAll('[role="alert"], [aria-invalid="true"], [class*="error" i]')).filter(visible).map((el) => textOf(el).slice(0, 240)).filter(Boolean).slice(0, 20),
+                                };
+                            }"""
+                        )
+                    )
+                except Exception as exc:
+                    frame_states.append({"url": url[:260], "error": str(exc)[:200]})
+            state["frameStates"] = frame_states
+        (out_dir / "state.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            (out_dir / "network.json").write_text(
+                json.dumps(_get_stripe_network_events(page), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        log(f"[Stripe] debug state save failed: {exc}")
+    try:
+        await page.screenshot(path=str(out_dir / "screenshot.png"), full_page=True)
+    except Exception as exc:
+        log(f"[Stripe] debug screenshot save failed: {exc}")
+    log(f"[Stripe] failure debug saved: {out_dir}")
+    return out_dir
+
+
+async def fill_stripe(
+    page,
+    email: str,
+    card: CardInfo,
+    *,
+    country_code: str = "US",
+    recreate_on_missing_paypal: bool = True,
+):
     """Stripe 页面：选 PayPal + 填地址 + Subscribe。"""
     stripe_started_at = time.perf_counter()
+    _attach_stripe_network_probe(page)
     await page.wait_for_load_state("domcontentloaded", timeout=30000)
     try:
         await page.locator(
@@ -1856,21 +6283,87 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
         if not zip_value:
             zip_value = (m_city_zip.group("zip") or "").strip()
 
-    # 选 PayPal
-    paypal_btn = page.locator('[data-testid="paypal-accordion-item-button"], [aria-label*="PayPal" i], text=PayPal').first
-    try:
-        await paypal_btn.click(timeout=5000, force=True)
-    except Exception:
-        await page.evaluate('document.querySelector("[data-testid=\\"paypal-accordion-item-button\\"]")?.click()')
-    await page.wait_for_timeout(2000)
+    await _ensure_stripe_paypal_selected(page)
 
     desired_country = "JP" if str(country_code or "").upper() == "JP" else "US"
     desired_labels = ["Japan", "日本"] if desired_country == "JP" else ["United States", "美国"]
+    if desired_country == "US":
+        stable_street, stable_city, stable_state, stable_zip = _pick_stripe_stable_us_billing_profile(
+            f"{email}:{card.raw_line}:{card.street}:{card.city}:{card.zip_code}"
+        )
+        if (
+            stable_street != (card.street or "").strip()
+            or stable_city != (card.city or "").strip()
+            or stable_state != (card.state or "").strip()
+            or stable_zip != (card.zip_code or "").strip()
+        ):
+            log(
+                f"[Stripe] using stable US billing address: "
+                f"city={stable_city}, state={stable_state}, zip={stable_zip}"
+            )
+        # Stripe 的 Google 地址建议对随机街道很敏感；此处同步 card，后续 PayPal 地址也保持一致。
+        card.street = stable_street
+        card.city = stable_city
+        card.state = stable_state
+        card.zip_code = stable_zip
+        city_value = stable_city
+        zip_value = stable_zip
     manual_address_jp = _zh(r"\u4f4f\u6240\u3092\u624b\u52d5\u3067\u5165\u529b")
     subscribe_jp = _zh(r"\u8cfc\u8aad")
     subscribe_jp_alt = _zh(r"\u30b5\u30d6\u30b9\u30af\u30e9\u30a4\u30d6")
     apply_jp = _zh(r"\u7533\u3057\u8fbc\u3080")
     continue_jp = _zh(r"\u7d9a\u884c")
+
+    async def _stripe_address_targets() -> list[Any]:
+        targets: list[Any] = [page]
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            url = str(getattr(frame, "url", "") or "").lower()
+            title = ""
+            try:
+                frame_el = await frame.frame_element()
+                title = str(await frame_el.get_attribute("title") or "").lower()
+            except Exception:
+                pass
+            if (
+                "elements-inner-address" in url
+                or "componentname=address" in url
+                or "安全地址输入框" in title
+                or "address" in title
+            ):
+                targets.append(frame)
+        return targets
+
+    async def _select_first_visible(
+        target,
+        selector: str,
+        value: str,
+        labels: list[str] | None = None,
+        timeout: int = 1800,
+    ) -> bool:
+        for loc_selector in selector.split(","):
+            loc_selector = loc_selector.strip()
+            if not loc_selector:
+                continue
+            try:
+                loc = target.locator(loc_selector).first
+                if not await loc.is_visible(timeout=500):
+                    continue
+                try:
+                    await loc.select_option(value, timeout=timeout)
+                    return True
+                except Exception:
+                    pass
+                for label in labels or []:
+                    try:
+                        await loc.select_option(label=label, timeout=timeout)
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return False
 
     # 国家选择 - 先等待下拉框可交互
     country_select = page.locator('#billingCountry, select[name*="country" i], select[autocomplete="country"]').first
@@ -1888,6 +6381,16 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
                 break
             except Exception:
                 continue
+    if not country_changed:
+        for target in await _stripe_address_targets():
+            if await _select_first_visible(
+                target,
+                '#billingCountry, select[name*="country" i], select[autocomplete="country"], select[autocomplete="country-name"]',
+                desired_country,
+                desired_labels,
+            ):
+                country_changed = True
+                break
 
     # 等待国家切换后页面重新渲染地址字段
     await page.wait_for_timeout(1200 if country_changed else 500)
@@ -1899,9 +6402,13 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
             log(f"[Stripe] 国家仍为 {current_val}，再次尝试切到 {desired_country}...")
             await country_select.select_option(desired_country, timeout=1800)
             await page.wait_for_timeout(900)
+        else:
+            log(f"[Stripe] billing country confirmed: {current_val}")
     except Exception:
         pass
     country_finished_at = time.perf_counter()
+
+    await _ensure_stripe_paypal_selected(page)
 
     # 手动输入地址
     try:
@@ -1920,6 +6427,53 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
         if not str(value or "").strip():
             return False
         val = str(value).strip()
+        for target in await _stripe_address_targets():
+            try:
+                loc = target.locator(f"{selector}:visible").first
+                if await loc.is_visible(timeout=500):
+                    await loc.fill("", timeout=1000)
+                    await loc.fill(val, timeout=timeout)
+                    read_back = (await loc.input_value()).strip()
+                    if read_back:
+                        return True
+            except Exception:
+                pass
+            try:
+                ok = await target.evaluate(
+                    """(selector, value) => {
+                        const isVisible = (el) => {
+                            if (!el) return false;
+                            const r = el.getBoundingClientRect();
+                            if (r.width < 6 || r.height < 6) return false;
+                            const st = window.getComputedStyle(el);
+                            if (!st) return false;
+                            if (st.display === 'none' || st.visibility === 'hidden') return false;
+                            if (Number(st.opacity || '1') < 0.05) return false;
+                            return !el.disabled && !el.readOnly;
+                        };
+                        const nodes = Array.from(document.querySelectorAll(selector)).filter(isVisible);
+                        if (!nodes.length) return false;
+                        const input = nodes[0];
+                        const proto = input.tagName.toLowerCase() === 'textarea'
+                            ? HTMLTextAreaElement.prototype
+                            : HTMLInputElement.prototype;
+                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                        if (desc && typeof desc.set === 'function') desc.set.call(input, value);
+                        else input.value = value;
+                        input.focus();
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        input.dispatchEvent(new Event('blur', { bubbles: true }));
+                        return String(input.value || '').trim().length > 0;
+                    }""",
+                    selector,
+                    val,
+                )
+                if ok:
+                    return True
+            except Exception:
+                pass
+
         # 先尝试可见输入框
         try:
             loc = page.locator(f"{selector}:visible").first
@@ -1966,6 +6520,402 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
             return bool(ok)
         except Exception:
             return False
+
+    async def _fill_stripe_address_element() -> dict[str, bool]:
+        """Stripe 地址 Element 常在 iframe 内，且字段名随版本变化；按语义一次性补齐。"""
+        state_code = str(card.state or "").strip().upper()
+        state_full = _US_STATE_NAMES.get(state_code, str(card.state or "").strip())
+        payload = {
+            "name": card.holder_name or f"{card.first_name} {card.last_name}".strip() or email,
+            "street": card.street,
+            "city": city_value,
+            "state": state_code or card.state,
+            "stateFull": state_full,
+            "stateLabels": [item for item in (state_code, state_full, card.state) if str(item or "").strip()],
+            "zip": zip_value,
+            "country": desired_country,
+            "countryLabels": desired_labels,
+        }
+        result: dict[str, bool] = {}
+
+        async def _verify_select_committed(
+            loc,
+            *,
+            values: tuple[str, ...],
+            labels: tuple[str, ...],
+        ) -> bool:
+            try:
+                info = await loc.evaluate(
+                    r"""(el, payload) => {
+                        const opt = el && el.options ? el.options[el.selectedIndex] : null;
+                        return {
+                            value: String(el?.value || '').trim(),
+                            text: String((opt && (opt.text || opt.label)) || el?.innerText || el?.textContent || '').trim(),
+                            invalid: String(el?.getAttribute('aria-invalid') || '').toLowerCase(),
+                        };
+                    }""",
+                    {
+                        "values": [str(item or "") for item in values],
+                        "labels": [str(item or "") for item in labels],
+                    },
+                )
+            except Exception:
+                return False
+            value = str((info or {}).get("value") or "").strip()
+            text = str((info or {}).get("text") or "").strip()
+            invalid = str((info or {}).get("invalid") or "").lower() == "true"
+            if invalid or not value:
+                return False
+            value_keys = {str(item or "").strip().lower() for item in values if str(item or "").strip()}
+            label_keys = {str(item or "").strip().lower() for item in labels if str(item or "").strip()}
+            value_lower = value.lower()
+            text_lower = text.lower()
+            return value_lower in value_keys or any(key and key in text_lower for key in label_keys)
+
+        async def _native_select_stripe_option(
+            selectors: tuple[str, ...],
+            *,
+            values: tuple[str, ...],
+            labels: tuple[str, ...],
+            field_name: str,
+        ) -> bool:
+            """优先用 Playwright 真实 select 操作；避免 JS 强设 value 后 React 状态未提交。"""
+            for target in await _stripe_address_targets():
+                for selector in selectors:
+                    try:
+                        loc = target.locator(selector).first
+                        if not await loc.is_visible(timeout=550):
+                            continue
+                        with contextlib.suppress(Exception):
+                            await loc.scroll_into_view_if_needed(timeout=800)
+                        for value in [item for item in values if str(item or "").strip()]:
+                            try:
+                                await loc.select_option(value=value, timeout=2200)
+                                await page.wait_for_timeout(350)
+                                if await _verify_select_committed(loc, values=values, labels=labels):
+                                    committed_label = (
+                                        "billing country dropdown committed"
+                                        if field_name == "country"
+                                        else "billing state dropdown committed"
+                                    )
+                                    log(f"[Stripe] {committed_label}: {value}")
+                                    return True
+                            except Exception:
+                                pass
+                        for label in [item for item in labels if str(item or "").strip()]:
+                            try:
+                                await loc.select_option(label=label, timeout=2200)
+                                await page.wait_for_timeout(350)
+                                if await _verify_select_committed(loc, values=values, labels=labels):
+                                    committed_label = (
+                                        "billing country dropdown committed"
+                                        if field_name == "country"
+                                        else "billing state dropdown committed"
+                                    )
+                                    log(f"[Stripe] {committed_label}: {label}")
+                                    return True
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
+            return False
+
+        country_committed = await _native_select_stripe_option(
+            (
+                '#billingAddress-countryInput',
+                'select[name="country"]',
+                'select[autocomplete*="country" i]',
+                'select[id*="country" i]',
+            ),
+            values=(desired_country,),
+            labels=tuple(desired_labels),
+            field_name="country",
+        )
+        result["country"] = bool(result.get("country")) or bool(country_committed)
+        if desired_country == "US":
+            state_committed = await _native_select_stripe_option(
+                (
+                    '#billingAddress-administrativeAreaInput',
+                    'select[name="administrativeArea"]',
+                    'select[autocomplete*="address-level1" i]',
+                    'select[id*="administrative" i]',
+                    'select[id*="state" i]',
+                    'select[name*="state" i]',
+                ),
+                values=tuple(item for item in (state_code, state_full, card.state) if str(item or "").strip()),
+                labels=tuple(item for item in (state_full, state_code, card.state) if str(item or "").strip()),
+                field_name="state",
+            )
+            result["state"] = bool(result.get("state")) or bool(state_committed)
+        for target in await _stripe_address_targets():
+            try:
+                filled = await target.evaluate(
+                    r"""(payload) => {
+                        const out = {};
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const r = el.getBoundingClientRect();
+                            if (r.width < 6 || r.height < 6) return false;
+                            const st = getComputedStyle(el);
+                            return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity || '1') > 0.05 && !el.disabled && !el.readOnly;
+                        };
+                        const meta = (el) => [
+                            el.id || '',
+                            el.name || '',
+                            el.autocomplete || '',
+                            el.placeholder || '',
+                            el.getAttribute('aria-label') || '',
+                            el.getAttribute('data-testid') || '',
+                            el.labels ? Array.from(el.labels).map(x => x.innerText || x.textContent || '').join(' ') : ''
+                        ].join(' ').toLowerCase();
+                        const setVal = (el, value) => {
+                            if (!el || !String(value || '').trim()) return false;
+                            const proto = el.tagName.toLowerCase() === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (desc && typeof desc.set === 'function') desc.set.call(el, String(value));
+                            else el.value = String(value);
+                            try { el.focus(); } catch {}
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            el.dispatchEvent(new Event('blur', { bubbles: true }));
+                            return String(el.value || '').trim().length > 0;
+                        };
+                        const clickEl = (el) => {
+                            if (!el) return false;
+                            try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch {}
+                            try { el.click(); } catch {}
+                            try {
+                                const r = el.getBoundingClientRect();
+                                for (const name of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                                    const init = {bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, pointerType: 'mouse'};
+                                    const ctor = name.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+                                    el.dispatchEvent(new ctor(name, init));
+                                }
+                            } catch {}
+                            return true;
+                        };
+                        const norm = (s) => String(s || '').toLowerCase().replace(/[\s\-ー—‐－_]/g, '');
+                        const stateKeys = (payload.stateLabels || []).map(norm).filter(Boolean);
+                        const matchesState = (s) => {
+                            const t = norm(s);
+                            return stateKeys.some(k => t === k || t.includes(k) || k.includes(t));
+                        };
+                        const selects = Array.from(document.querySelectorAll('select')).filter(visible);
+                        for (const sel of selects) {
+                            const m = meta(sel);
+                            if (!/country|国家|地区|國家|地域/.test(m) && !(sel.options && sel.options.length > 100)) continue;
+                            const opts = Array.from(sel.options || []);
+                            const labels = (payload.countryLabels || []).map(x => String(x || '').toLowerCase());
+                            const hit = opts.find(o => String(o.value || '').toUpperCase() === String(payload.country || '').toUpperCase())
+                                || opts.find(o => labels.some(k => String(o.text || o.label || '').toLowerCase().includes(k)));
+                            if (!hit) continue;
+                            sel.value = String(hit.value || '');
+                            sel.dispatchEvent(new Event('input', { bubbles: true }));
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                            const selected = sel.options && sel.options[sel.selectedIndex];
+                            const selectedText = String((selected && (selected.text || selected.label)) || '');
+                            const countryValue = String(sel.value || '').toUpperCase();
+                            out.country = countryValue === String(payload.country || '').toUpperCase()
+                                || labels.some(k => selectedText.toLowerCase().includes(k));
+                            break;
+                        }
+                        const selectState = () => {
+                            for (const sel of selects) {
+                                const opts = Array.from(sel.options || []);
+                                const hit = opts.find(o => matchesState(o.value) || matchesState(o.text || o.label));
+                                if (!hit) continue;
+                                sel.value = String(hit.value || '');
+                                sel.dispatchEvent(new Event('input', { bubbles: true }));
+                                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                const selected = sel.options && sel.options[sel.selectedIndex];
+                                out.state = matchesState(sel.value) || matchesState((selected && (selected.text || selected.label)) || '');
+                                return true;
+                            }
+                            const controls = Array.from(document.querySelectorAll('[role="combobox"], button, [aria-haspopup="listbox"], [tabindex]'))
+                                .filter(visible)
+                                .filter(el => {
+                                    const hint = [meta(el), el.innerText || el.textContent || ''].join(' ');
+                                    return /(^|\s)(州|state|province|region|administrative)($|\s)/i.test(hint) || /^州$/.test(String(el.innerText || el.textContent || '').trim());
+                                });
+                            for (const ctl of controls) {
+                                clickEl(ctl);
+                                const options = Array.from(document.querySelectorAll('[role="option"], [role="menuitem"], li, div, span'))
+                                    .filter(visible)
+                                    .filter(el => matchesState(el.innerText || el.textContent || el.getAttribute('aria-label') || ''));
+                                const opt = options[0];
+                                if (!opt) continue;
+                                clickEl(opt);
+                                out.state = true;
+                                return true;
+                            }
+                            return false;
+                        };
+                        selectState();
+                        const inputs = Array.from(document.querySelectorAll('input, textarea')).filter(visible);
+                        const used = new Set();
+                        const fillBy = (key, value, patterns) => {
+                            const el = inputs.find((node) => !used.has(node) && patterns.some((re) => re.test(meta(node))));
+                            if (!el) return false;
+                            used.add(el);
+                            out[key] = setVal(el, value);
+                            return out[key];
+                        };
+                        fillBy('name', payload.name, [/name|fullname|full name|姓名|全名/]);
+                        fillBy('street', payload.street, [/address-line1|line1|address1|address|street|住所|地址/]);
+                        fillBy('city', payload.city, [/address-level2|locality|city|市区町村|城市|市/]);
+                        if (!out.state) fillBy('state', payload.state, [/address-level1|administrative|state|province|region|都道府県|州|省/]);
+                        fillBy('zip', payload.zip, [/postal|zip|postcode|邮编|郵便/]);
+                        return out;
+                    }""",
+                    payload,
+                )
+                if isinstance(filled, dict):
+                    for key, value in filled.items():
+                        result[key] = bool(value) or result.get(key, False)
+            except Exception:
+                continue
+        if result:
+            log(f"[Stripe] billing address iframe fill: {result}")
+        return result
+
+    async def _verify_stripe_billing_address_complete() -> dict[str, Any]:
+        """提交前核验 Stripe 地址 Element 的真实提交值，防止下拉框视觉占位仍被误判成功。"""
+        state_code = str(card.state or "").strip().upper()
+        state_full = _US_STATE_NAMES.get(state_code, str(card.state or "").strip())
+        payload = {
+            "country": desired_country,
+            "countryLabels": desired_labels,
+            "stateLabels": [item for item in (state_code, state_full, card.state) if str(item or "").strip()],
+            "expected": {
+                "name": card.holder_name or f"{card.first_name} {card.last_name}".strip() or email,
+                "street": card.street,
+                "city": city_value,
+                "zip": zip_value,
+            },
+        }
+        snapshots: list[dict[str, Any]] = []
+        for target in await _stripe_address_targets():
+            try:
+                status = await target.evaluate(
+                    r"""(payload) => {
+                        const visible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width < 6 || rect.height < 6) return false;
+                            const style = window.getComputedStyle(el);
+                            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.05;
+                        };
+                        const textOf = (el) => String(
+                            el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || ''
+                        ).replace(/\s+/g, ' ').trim();
+                        const compact = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+                        const meta = (el) => [
+                            el.id || '',
+                            el.name || '',
+                            el.autocomplete || '',
+                            el.placeholder || '',
+                            el.getAttribute('aria-label') || '',
+                            el.getAttribute('data-testid') || '',
+                            el.labels ? Array.from(el.labels).map(x => x.innerText || x.textContent || '').join(' ') : ''
+                        ].join(' ').toLowerCase();
+                        const selectInfo = (sel) => {
+                            if (!sel) return {present: false, ok: false, value: '', text: '', invalid: false};
+                            const opt = sel.options && sel.options[sel.selectedIndex];
+                            return {
+                                present: true,
+                                value: String(sel.value || '').trim(),
+                                text: String((opt && (opt.text || opt.label)) || '').trim(),
+                                invalid: String(sel.getAttribute('aria-invalid') || '').toLowerCase() === 'true',
+                            };
+                        };
+                        const inputInfo = (input) => {
+                            if (!input) return {present: false, ok: false, value: '', invalid: false};
+                            return {
+                                present: true,
+                                value: String(input.value || '').trim(),
+                                invalid: String(input.getAttribute('aria-invalid') || '').toLowerCase() === 'true',
+                            };
+                        };
+                        const hasExpectedText = (actual, expected) => {
+                            const a = compact(actual);
+                            const e = compact(expected);
+                            if (!e) return !!a;
+                            return !!a && (a.includes(e) || e.includes(a));
+                        };
+                        const allSelects = Array.from(document.querySelectorAll('select')).filter(visible);
+                        const allInputs = Array.from(document.querySelectorAll('input, textarea')).filter(visible);
+                        const findSelect = (patterns, manyOptions = false) => allSelects.find((el) => {
+                            const m = meta(el);
+                            return patterns.some((re) => re.test(m)) || (manyOptions && (el.options || []).length > 80);
+                        }) || null;
+                        const findInput = (patterns) => allInputs.find((el) => patterns.some((re) => re.test(meta(el)))) || null;
+                        const country = selectInfo(findSelect([/country|国家|地区|國家|地域/], true));
+                        const state = selectInfo(findSelect([/administrative|address-level1|state|province|region|州|省/], false));
+                        const fields = {
+                            name: inputInfo(findInput([/name|fullname|full name|姓名|全名/])),
+                            street: inputInfo(findInput([/address-line1|line1|address1|street|住所|地址/])),
+                            city: inputInfo(findInput([/address-level2|locality|city|市区町村|城市|市/])),
+                            zip: inputInfo(findInput([/postal|zip|postcode|邮编|郵便/])),
+                        };
+                        const countryLabels = (payload.countryLabels || []).map(x => String(x || '').toLowerCase()).filter(Boolean);
+                        country.ok = country.present
+                            && !country.invalid
+                            && !!country.value
+                            && (
+                                country.value.toUpperCase() === String(payload.country || '').toUpperCase()
+                                || countryLabels.some(k => country.text.toLowerCase().includes(k))
+                            );
+                        const stateLabels = (payload.stateLabels || []).map(compact).filter(Boolean);
+                        state.ok = state.present
+                            && !state.invalid
+                            && !!state.value
+                            && stateLabels.some((key) => compact(state.value) === key || compact(state.text).includes(key));
+                        for (const [key, info] of Object.entries(fields)) {
+                            info.ok = info.present
+                                && !info.invalid
+                                && hasExpectedText(info.value, payload.expected?.[key] || '');
+                        }
+                        const relevant = (
+                            country.present || state.present || Object.values(fields).some(x => x.present)
+                            || /国家或地区|全名|billingaddress|address element|地址第 1 行/i.test(textOf(document.body))
+                        );
+                        const missing = [];
+                        if (relevant) {
+                            if (!country.ok) missing.push('country');
+                            if (String(payload.country || '').toUpperCase() === 'US' && !state.ok) missing.push('state');
+                            for (const [key, info] of Object.entries(fields)) {
+                                if (!info.ok) missing.push(key);
+                            }
+                        }
+                        const invalidFields = Array.from(document.querySelectorAll('[aria-invalid="true"]'))
+                            .filter(visible)
+                            .map((el) => {
+                                const m = meta(el);
+                                const v = String(el.value || '').trim();
+                                const t = textOf(el);
+                                return {meta: m.slice(0, 120), value: v.slice(0, 80), text: t.slice(0, 120)};
+                            });
+                        return {
+                            relevant,
+                            ok: relevant && missing.length === 0 && invalidFields.length === 0,
+                            missing,
+                            country,
+                            state,
+                            fields,
+                            invalidFields,
+                            body: textOf(document.body).slice(0, 220),
+                        };
+                    }""",
+                    payload,
+                )
+                if isinstance(status, dict) and status.get("relevant"):
+                    snapshots.append(status)
+            except Exception as exc:
+                snapshots.append({"relevant": False, "ok": False, "error": str(exc)[:180]})
+        if not snapshots:
+            return {"ok": False, "missing": ["address_frame"], "snapshots": []}
+        best = next((item for item in snapshots if item.get("ok")), snapshots[-1])
+        return {"ok": bool(best.get("ok")), "missing": best.get("missing") or [], "snapshots": snapshots}
 
     # 日本地址表单通常需要“邮编 -> 都道府县 -> 城市 -> 地址”顺序
     if desired_country == "JP":
@@ -2562,7 +7512,9 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
 
     else:
         # 美区等旧流程
+        await _fill_stripe_address_element()
         for selector, value in [
+            ('#billingName, input[name*="name" i], input[autocomplete="name"], input[placeholder*="姓名" i], input[placeholder*="Name" i]', card.holder_name or f"{card.first_name} {card.last_name}".strip() or email),
             ('#billingAddressLine1, input[name*="addressLine1" i], input[name*="address" i], input[placeholder*="地址" i], input[placeholder*="Address" i]', card.street),
             ('#billingLocality, input[name*="locality" i], input[name*="city" i], input[placeholder*="城市" i], input[placeholder*="City" i]', city_value),
             ('#billingPostalCode, input[name*="postalCode" i], input[name*="zip" i], input[placeholder*="邮编" i], input[placeholder*="ZIP" i]', zip_value),
@@ -2579,26 +7531,7 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
                         await state_el.select_option(value=card.state, timeout=3000)
                     except Exception:
                         # 尝试用全称
-                        state_names = {
-                            "MN": "Minnesota", "TN": "Tennessee", "CA": "California",
-                            "TX": "Texas", "NY": "New York", "FL": "Florida",
-                            "IL": "Illinois", "PA": "Pennsylvania", "OH": "Ohio",
-                            "GA": "Georgia", "NC": "North Carolina", "MI": "Michigan",
-                            "NJ": "New Jersey", "VA": "Virginia", "WA": "Washington",
-                            "AZ": "Arizona", "MA": "Massachusetts", "IN": "Indiana",
-                            "MO": "Missouri", "MD": "Maryland", "WI": "Wisconsin",
-                            "CO": "Colorado", "SC": "South Carolina", "AL": "Alabama",
-                            "LA": "Louisiana", "KY": "Kentucky", "OR": "Oregon",
-                            "OK": "Oklahoma", "CT": "Connecticut", "IA": "Iowa",
-                            "MS": "Mississippi", "AR": "Arkansas", "KS": "Kansas",
-                            "NV": "Nevada", "UT": "Utah", "NE": "Nebraska",
-                            "NM": "New Mexico", "WV": "West Virginia", "ID": "Idaho",
-                            "HI": "Hawaii", "ME": "Maine", "NH": "New Hampshire",
-                            "RI": "Rhode Island", "MT": "Montana", "DE": "Delaware",
-                            "SD": "South Dakota", "ND": "North Dakota", "AK": "Alaska",
-                            "VT": "Vermont", "WY": "Wyoming", "DC": "District of Columbia",
-                        }
-                        full_name = state_names.get(card.state, card.state)
+                        full_name = _US_STATE_NAMES.get(str(card.state or "").strip().upper(), card.state)
                         try:
                             await state_el.select_option(label=full_name, timeout=3000)
                         except Exception:
@@ -2608,29 +7541,62 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
         except Exception:
             pass
 
-    # 勾选条款。该控件会随 Stripe 页面版本/地区变化而缺失，因此只作为诊断信号，不作为坏链硬判定。
-    try:
-        cb = page.locator('input[type="checkbox"], [role="checkbox"]').first
-        if await cb.is_visible(timeout=2000):
-            if not await cb.is_checked():
-                await cb.click(force=True)
-                await page.wait_for_timeout(1000)
-            log("[Stripe] checkout agreement checkbox detected")
-        else:
-            log("[Stripe] checkout agreement checkbox not detected; keep as diagnostic only")
-    except Exception as exc:
-        log(f"[Stripe] checkout agreement checkbox probe skipped: {exc}")
+    if desired_country == "US":
+        await _accept_stripe_address_suggestion(page, card, city_value, zip_value)
+        # 地址建议可能重绘 Stripe Address Element；接受建议后必须再次补齐下拉框。
+        await _fill_stripe_address_element()
 
-    # 关闭可能弹出的地址建议下拉框（Google 地址自动补全）
-    # 按 Escape 关闭下拉，再点击页面空白处确保焦点离开输入框
-    try:
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(500)
-        # 点击页面标题区域，确保没有下拉遮挡
-        await page.locator('body').click(position={"x": 10, "y": 10}, force=True)
-        await page.wait_for_timeout(500)
-    except Exception:
-        pass
+    # 勾选条款/代理声明。Stripe 会按地区动态增减 checkbox，须扫全量，不可只点第一个。
+    checkbox_state = await _ensure_stripe_required_checkboxes(page)
+    await page.wait_for_timeout(700)
+    checkbox_state_second = await _ensure_stripe_required_checkboxes(page)
+    if int(checkbox_state_second.get("total") or 0) > int(checkbox_state.get("total") or 0):
+        checkbox_state = checkbox_state_second
+    if not checkbox_state.get("total"):
+        log("[Stripe] checkout agreement checkbox not detected; keep as diagnostic only")
+    elif checkbox_state.get("touched"):
+        log("[Stripe] checkout agreement checkbox JS fallback sweep applied")
+    else:
+        log("[Stripe] checkout agreement checkbox detected")
+
+    if desired_country == "US":
+        await _accept_stripe_address_suggestion(page, card, city_value, zip_value)
+
+    await _dismiss_stripe_address_suggestions(page)
+
+    if desired_country == "US":
+        billing_verify: dict[str, Any] = {"ok": False, "missing": ["not_checked"]}
+        for attempt in range(3):
+            await _fill_stripe_address_element()
+            await _dismiss_stripe_address_suggestions(page)
+            billing_verify = await _verify_stripe_billing_address_complete()
+            log(
+                f"[Stripe] billing address verify attempt {attempt + 1}/3: "
+                f"ok={billing_verify.get('ok')} missing={billing_verify.get('missing')}"
+            )
+            if billing_verify.get("ok"):
+                break
+            await page.wait_for_timeout(600)
+        if not billing_verify.get("ok"):
+            await _save_stripe_failure_debug(
+                page,
+                email,
+                f"stripe billing address incomplete before subscribe: missing={billing_verify.get('missing')}",
+            )
+            raise RuntimeError(
+                f"stripe_billing_address_incomplete: missing={billing_verify.get('missing')}"
+            )
+
+    if not await _ensure_stripe_paypal_selected(page):
+        await _save_stripe_failure_debug(page, email, "paypal payment option not available before subscribe")
+        reason = (
+            PAYPAL_FLOW2_RECREATE_LINK
+            if recreate_on_missing_paypal
+            else PAYPAL_FLOW2_NO_PAYPAL_OPTION
+        )
+        raise RuntimeError(f"{reason}: paypal payment option not available before subscribe")
+    await _dismiss_stripe_address_suggestions(page)
+    await _ensure_stripe_required_checkboxes(page)
 
     # Subscribe / 订阅 - 多种选择器兜底
     log("[Stripe] 点击订阅按钮...")
@@ -2794,30 +7760,71 @@ async def fill_stripe(page, email: str, card: CardInfo, *, country_code: str = "
     if not subscribe_attempted:
         raise RuntimeError("Stripe subscribe button was not clicked")
 
-    # 等跳转 PayPal；若提交已进入处理态但长时间不跳转，不再复用当前 checkout session。
-    # 该场景通常是生成的支付长链/Stripe session 没有 provider redirect，交给外层重新生成长链。
+    async def _paypal_redirect_page():
+        """Stripe 可能在当前页或新页打开 PayPal；两者都要监听。"""
+        try:
+            pages = list(page.context.pages)
+        except Exception:
+            pages = [page]
+        for candidate in [page, *[item for item in pages if item is not page]]:
+            try:
+                if "paypal.com" in str(candidate.url or "").lower():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    # 等跳转 PayPal；若提交已进入处理态但长时间不跳转，不再做长链兜底。
     jumped = False
-    for _ in range(60):
-        if "paypal.com" in page.url:
+    redirect_page = None
+    for second in range(180):
+        redirect_page = await _paypal_redirect_page()
+        if redirect_page:
             jumped = True
             break
+        manual_redirect = _extract_stripe_confirm_redirect_url(page)
+        if manual_redirect:
+            log(f"[Stripe] PayPal redirect found in confirm response, navigating manually: {manual_redirect[:180]}")
+            try:
+                await page.goto(manual_redirect, wait_until="domcontentloaded", timeout=60000)
+                redirect_page = page
+                jumped = True
+                break
+            except Exception as exc:
+                log(f"[Stripe] manual PayPal redirect failed: {exc}")
+        if second in {5, 10, 30, 60, 120}:
+            log(
+                f"[Stripe] waiting PayPal redirect... {second}s url={page.url} "
+                f"confirm={_summarize_stripe_confirm_response(page)} "
+                f"network={_summarize_stripe_network_events(page)}"
+            )
         await page.wait_for_timeout(1000)
     if not jumped:
         log(
-            _zh(r"[Stripe] 60s \u672a\u8df3\u8f6c PayPal\uff0c\u68c0\u67e5\u662f\u5426\u6709\u8868\u5355\u9519\u8bef...")
+            _zh(r"[Stripe] 180s \u672a\u8df3\u8f6c PayPal\uff0c\u68c0\u67e5\u662f\u5426\u6709\u8868\u5355\u9519\u8bef...")
         )
         has_error = await page.evaluate("""() => {
             const text = (document.body?.innerText || '');
             return /This is required|必填|invalid|错误|error/i.test(text);
         }""")
         if has_error:
-            log("[Stripe] 检测到表单错误，仍按长链失效处理并重新生成支付链接")
+            log("[Stripe] 检测到表单错误，按 Stripe/PayPal 跳转超时处理，不再做长链兜底")
+        log(f"[Stripe] recent network events: {_summarize_stripe_network_events(page)}")
+        await _save_stripe_failure_debug(
+            page,
+            email,
+            f"submit entered processing but did not redirect PayPal in 180s; form_error={bool(has_error)}",
+        )
         raise RuntimeError(
-            f"{PAYPAL_FLOW2_RECREATE_LINK}: submit entered processing but did not redirect PayPal in 60s; "
+            f"{PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT}: submit entered processing but did not redirect PayPal in 180s; "
             f"form_error={bool(has_error)} url={page.url}"
         )
 
+    if redirect_page is not None and redirect_page is not page:
+        log(f"[Stripe] PayPal opened in new page: {redirect_page.url}")
+        page = redirect_page
     await page.wait_for_timeout(3000)
+    return page
 
 
 async def fill_paypal(
@@ -4662,6 +9669,7 @@ async def pay_one(
     flow2_region_mode: str = "default",
     last_error: dict[str, str] | None = None,
     proxy_attempt: int = 1,
+    us_proxy: str | None = None,
 ) -> bool:
     """执行一次 PayPal 支付。"""
     email = item["email"]
@@ -4688,12 +9696,17 @@ async def pay_one(
         fingerprint_seed=f"{email}|flow2",
         account_id=email,
         log_prefix=prefix,
+        browser_engine=browser_cfg.get("engine"),
+        browser_locale=browser_cfg.get("locale"),
+        camoufox_executable_path=browser_cfg.get("camoufox_executable_path"),
+        camoufox_geoip=browser_cfg.get("camoufox_geoip"),
     )
 
     phone: PhoneInfo | None = None
     try:
         flow_env = load_env(".env")
         use_long_link = paypal_use_long_link(flow_env)
+        open_payment_link = use_long_link
         watcher_enabled = paypal_click_watcher_enabled(flow_env)
         stripe_country = _payment_form_country_code(region_mode, use_long_link=use_long_link)
         paypal_country = _paypal_form_country_code(region_mode, use_long_link=use_long_link)
@@ -4708,24 +9721,56 @@ async def pay_one(
                     + f"{working_card.city}, {working_card.state}, {working_card.zip_code}"
                 )
             else:
-                _ensure_short_link_jp_proxy(proxy, env=flow_env, prefix=prefix)
-                us_billing = _generate_local_random_card(worker_id, email, flow_env, region_mode="default")
-                working_card = _with_billing_profile(card, us_billing)
-                log(
-                    f"{prefix} "
-                    + _zh(
-                        r"\u77ed\u94fe\u5b98\u65b9\u8ba2\u9605\u6a21\u5f0f: \u4f7f\u7528\u65e5\u672c IP \u83b7\u53d6 0 \u5143\u8bd5\u7528\uff0c"
-                        r"\u5168\u7a0b\u4fdd\u6301\u540c\u4e00\u65e5\u672c\u4ee3\u7406\uff0c\u652f\u4ed8\u9875/PayPal \u8d26\u5355\u6539\u7528\u7f8e\u56fd "
+                if payment_link.startswith("https://www.paypal.com/agreements/approve?ba_token=BA-"):
+                    if not us_proxy:
+                        raise RuntimeError("zenpic PayPal BA 短链必须绑定 US 代理打开")
+                    working_card = card
+                    paypal_country = "JP"
+                    log(
+                        f"{prefix} "
+                        + _zh(
+                            r"\u65e5\u533a\u77ed\u94fe\u65b0\u6a21\u5f0f: "
+                            r"\u4f7f\u7528 US \u4ee3\u7406\u6253\u5f00 PayPal BA \u77ed\u94fe\uff0c"
+                            r"\u8fdb\u5165\u6ce8\u518c\u8868\u5355\u540e\u5207\u6362\u65e5\u672c\u5730\u533a"
+                        )
                     )
-                    + f"{working_card.city}, {working_card.state}, {working_card.zip_code}"
-                )
+                else:
+                    _ensure_short_link_jp_proxy(proxy, env=flow_env, prefix=prefix)
+                    us_billing = _generate_local_random_card(worker_id, email, flow_env, region_mode="default")
+                    working_card = _with_billing_profile(card, us_billing)
+                    log(
+                        f"{prefix} "
+                        + _zh(
+                            r"\u77ed\u94fe\u5b98\u65b9\u8ba2\u9605\u6a21\u5f0f: \u4f7f\u7528\u65e5\u672c IP \u83b7\u53d6 0 \u5143\u8bd5\u7528\uff0c"
+                            r"\u5168\u7a0b\u4fdd\u6301\u540c\u4e00\u65e5\u672c\u4ee3\u7406\uff0c\u652f\u4ed8\u9875/PayPal \u8d26\u5355\u6539\u7528\u7f8e\u56fd "
+                        )
+                        + f"{working_card.city}, {working_card.state}, {working_card.zip_code}"
+                    )
+
+        if region_mode == "jp" and not use_long_link and payment_link.startswith("https://www.paypal.com/agreements/approve?ba_token=BA-"):
+            session = BrowserSession(
+                profile_dir=profile_dir,
+                headless=bool(browser_cfg.get("headless", False)),
+                slow_mo=int(browser_cfg.get("slow_mo", 80)),
+                timeout_ms=int(browser_cfg.get("timeout_ms", 60000)),
+                proxy=us_proxy,
+                isolated=True,
+                fingerprint_seed=f"{email}|flow2|paypal-ba-us",
+                account_id=email,
+                log_prefix=prefix,
+                browser_engine=browser_cfg.get("engine"),
+                browser_locale=browser_cfg.get("locale"),
+                camoufox_executable_path=browser_cfg.get("camoufox_executable_path"),
+                camoufox_geoip=browser_cfg.get("camoufox_geoip"),
+            )
+            log(f"{prefix} 打开 PayPal BA 短链代理(US): {_display_proxy(us_proxy)}")
 
         await session.__aenter__()
         page = await session.current_page()
         await _install_click_watcher(page, email, enabled=watcher_enabled, label="flow2")
 
-        # 打开支付页。默认使用长链接；禁用长链接时从 ChatGPT 领取优惠入口进入。
-        if use_long_link:
+        # 长链仅在显式长链模式下打开；短链模式不再接受任何长链兜底。
+        if open_payment_link:
             log(f"{prefix} 打开支付链接...")
             await page.goto(payment_link, wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
@@ -4739,6 +9784,10 @@ async def pay_one(
                 raise RuntimeError(
                     f"{PAYPAL_FLOW2_RECREATE_LINK}: opened long link shows Link payment; generated link is invalid"
                 )
+        elif payment_link.startswith("https://www.paypal.com/agreements/approve?ba_token=BA-"):
+            log(f"{prefix} 打开 PayPal BA 短链...")
+            await page.goto(payment_link, wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
         else:
             await _prepare_checkout_from_chatgpt_offer(
                 page,
@@ -4749,28 +9798,59 @@ async def pay_one(
                 watcher_enabled=watcher_enabled,
                 flow_env=flow_env,
             )
-        try:
-            await page.locator(
-                f'input[autocomplete="cc-number"], iframe[name*="__privateStripeFrame"], text={_zh(r"\u652f\u4ed8\u65b9\u5f0f")}'
-            ).first.wait_for(timeout=2500)
-        except Exception:
-            pass
-        await page.wait_for_timeout(1200)
-        due_amount = await inspect_checkout_due_amount(page)
+        if payment_link.startswith("https://www.paypal.com/agreements/approve?ba_token=BA-"):
+            due_amount = {"status": "zero", "amount_text": "BA 短链", "source": "zenpic"}
+        else:
+            try:
+                await page.locator(
+                    f'input[autocomplete="cc-number"], iframe[name*="__privateStripeFrame"], text={_zh(r"\u652f\u4ed8\u65b9\u5f0f")}'
+                ).first.wait_for(timeout=2500)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1200)
+            due_amount = await inspect_checkout_due_amount(page)
         if due_amount.get("status") == "nonzero":
             reason = (
                 f"{PAYPAL_FLOW2_NONZERO_AMOUNT}: "
                 f"{due_amount.get('amount_text') or due_amount.get('amount_value')} | "
                 f"{due_amount.get('source_text') or ''}"
             )
-            log(
-                f"{prefix} "
-                + _zh(r"\u68c0\u6d4b\u5230\u652f\u4ed8\u9875\u5e94\u4ed8\u91d1\u989d\u975e 0\uff0c\u4f5c\u5e9f\u8be5\u8d26\u53f7\u5e76\u8df3\u5230\u4e0b\u4e00\u4e2a: ")
-                + f"{due_amount.get('amount_text') or due_amount.get('amount_value')}"
-            )
-            discard_flow2_link(email, reason=reason)
+            if use_long_link:
+                log(
+                    f"{prefix} "
+                    + _zh(r"\u68c0\u6d4b\u5230\u652f\u4ed8\u9875\u5e94\u4ed8\u91d1\u989d\u975e 0\uff0c\u4f5c\u5e9f\u8be5\u8d26\u53f7\u5e76\u8df3\u5230\u4e0b\u4e00\u4e2a: ")
+                    + f"{due_amount.get('amount_text') or due_amount.get('amount_value')}"
+                )
+                discard_flow2_link(email, reason=reason)
+            else:
+                log(
+                    f"{prefix} "
+                    + _zh(r"\u77ed\u94fe\u6a21\u5f0f\u68c0\u6d4b\u5230\u652f\u4ed8\u9875\u975e 0\uff0c\u7ec8\u6b62\u5f53\u524d\u8d26\u53f7\uff0c\u4e0d\u505a\u957f\u94fe\u515c\u5e95: ")
+                    + f"{due_amount.get('amount_text') or due_amount.get('amount_value')}"
+                )
+                discard_flow2_link(email, reason=reason)
             if last_error is not None:
                 last_error["reason"] = PAYPAL_FLOW2_NONZERO_AMOUNT
+            return False
+        if (
+            due_amount.get("status") == "zero"
+            and region_mode == "jp"
+            and not use_long_link
+            and _checkout_due_amount_looks_jpy(due_amount)
+        ):
+            reason = (
+                "checkout still JPY after US offer region: "
+                f"{due_amount.get('amount_text') or due_amount.get('amount_value')} | "
+                f"{due_amount.get('source_text') or ''}"
+            )
+            log(
+                f"{prefix} "
+                + _zh(r"\u652f\u4ed8\u9875\u4ecd\u663e\u793a\u65e5\u5143\u96f6\u91d1\u989d\uff0c\u5730\u533a/\u8d27\u5e01\u672a\u6309\u7f8e\u56fd\u5237\u65b0\uff0c\u7ec8\u6b62\u5f53\u524d\u4efb\u52a1: ")
+                + f"{due_amount.get('amount_text') or due_amount.get('amount_value')}"
+            )
+            await _save_chatgpt_offer_failure_debug_once(page, email, reason)
+            if last_error is not None:
+                last_error["reason"] = f"{PAYPAL_FLOW2_NO_PAYPAL_OPTION}: checkout still JPY after US offer region"
             return False
         if due_amount.get("status") == "zero":
             log(
@@ -4789,9 +9869,18 @@ async def pay_one(
                 + (f" candidates={candidates_text}" if candidates_text else "")
             )
 
-        # Stripe
-        log(f"{prefix} Stripe 填充...")
-        await fill_stripe(page, email, working_card, country_code=stripe_country)
+        if not payment_link.startswith("https://www.paypal.com/agreements/approve?ba_token=BA-"):
+            # Stripe
+            log(f"{prefix} Stripe 填充...")
+            stripe_page = await fill_stripe(
+                page,
+                email,
+                working_card,
+                country_code=stripe_country,
+                recreate_on_missing_paypal=False,
+            )
+            if stripe_page is not None:
+                page = stripe_page
 
         # PayPal - 可能需要换手机号重试
         for attempt in range(1, max_phone_retries + 1):
@@ -4902,6 +9991,11 @@ async def run_paypal_pay(
     selected = (selected_email or "").strip().lower()
     if selected and use_long_link:
         pool = [item for item in pool if str(item.get("email") or "").strip().lower() == selected]
+    if not pool and not use_long_link:
+        fallback_pool = _load_mail_pool_direct_accounts(cfg, selected_email or "")
+        if fallback_pool:
+            pool = fallback_pool
+            log(f"PayPal 流程2：短链直付池为空，改从当前邮箱池取未处理账号 {len(pool)} 个继续")
     if not pool:
         detail = f" (selected={selected_email})" if selected_email else ""
         if use_long_link:
@@ -4926,7 +10020,9 @@ async def run_paypal_pay(
     from .proxy_pool import ProxyPool
     use_proxy = paypal_flow2_proxy_enabled(env)
     proxy_pool: ProxyPool | None = None
+    us_proxy_pool: ProxyPool | None = None
     fallback_proxy = ""
+    fallback_us_proxy = ""
     if use_proxy:
         proxy_file = paypal_flow2_proxy_file(env, resolved_region_mode)
         proxy_pool = ProxyPool(proxy_file)
@@ -4937,11 +10033,20 @@ async def run_paypal_pay(
         if resolved_region_mode == "jp":
             count_text = proxy_pool.count() if proxy_pool else 0
             log(f"PayPal 流程2：日本代理模式已启用，代理池={proxy_file}，代理数={count_text}")
+            us_proxy_file = paypal_flow2_proxy_file(env, "default")
+            us_proxy_pool = ProxyPool(us_proxy_file)
+            if us_proxy_pool.count() <= 0:
+                fallback_us_proxy = local_proxy_url(env)
+                us_proxy_pool = None
+                log(f"PayPal 流程2：US 代理池为空，改用本地代理: {us_proxy_file} -> {_display_proxy(fallback_us_proxy)}")
+            else:
+                log(f"PayPal 流程2：US 代理池已启用，代理池={us_proxy_file}，代理数={us_proxy_pool.count()}")
         else:
             count_text = proxy_pool.count() if proxy_pool else 0
             log(f"PayPal 流程2：美国支付代理已启用，代理池={proxy_file}，代理数={count_text}")
     else:
         fallback_proxy = local_proxy_url(env)
+        fallback_us_proxy = fallback_proxy
         if fallback_proxy:
             log(f"PayPal 流程2：代理池关闭，使用本地代理: {_display_proxy(fallback_proxy)}")
 
@@ -4980,7 +10085,7 @@ async def run_paypal_pay(
     async def next_item() -> tuple[int, dict[str, str]] | None:
         nonlocal active_slots, next_index
         async with queue_lock:
-            if success + failed_slots + active_slots >= target:
+            if success + active_slots >= target:
                 return None
             if next_index >= len(pool):
                 return None
@@ -5009,14 +10114,45 @@ async def run_paypal_pay(
                             failed_slots += 1
                         return
                 proxies = proxy_pool.random_sequence() if proxy_pool else [fallback_proxy or None]
+                us_proxies = us_proxy_pool.random_sequence() if us_proxy_pool else [fallback_us_proxy or None]
+                zenpic_mode = _short_link_entry_uses_zenpic(
+                    resolved_region_mode,
+                    use_long_link=use_long_link,
+                    card_source_mode=card_source_mode,
+                )
                 ok = False
                 flow2_discarded = False
                 flow2_recreate_link = False
+                flow2_no_paypal_stop = False
                 stripe_timeout_stop = False
                 for proxy_attempt, proxy in enumerate(proxies, start=1):
+                    us_proxy = us_proxies[(proxy_attempt - 1) % len(us_proxies)] if us_proxies else None
                     link_attempt = 1
                     while True:
                         last_error: dict[str, str] = {}
+                        if zenpic_mode:
+                            session_text = find_session_text_for_email(item["email"], env)
+                            if not session_text:
+                                last_error["reason"] = "zenpic session cache missing; run register-only with successful session first"
+                                log(f"[paypal-pay-{index:02d}][{item['email']}] {last_error['reason']}")
+                                ok = False
+                                break
+                            try:
+                                result = create_zenpic_short_link(
+                                    email=item["email"],
+                                    session_text=session_text,
+                                    us_proxy=us_proxy or "",
+                                    jp_proxy=proxy or "",
+                                    env=env,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                last_error["reason"] = str(exc)
+                                log(f"[paypal-pay-{index:02d}][{item['email']}] zenpic 短链生成失败: {exc}")
+                                ok = False
+                                break
+                            item["payment_link"] = result.long_url
+                            item["link_method"] = "zenpic_stage2_ba"
+                            log(f"[paypal-pay-{index:02d}][{item['email']}] zenpic 阶段二 BA 短链: {result.long_url}")
                         ok = await pay_one(
                             item,
                             card,
@@ -5028,6 +10164,7 @@ async def run_paypal_pay(
                             flow2_region_mode=resolved_region_mode,
                             last_error=last_error,
                             proxy_attempt=proxy_attempt,
+                            us_proxy=us_proxy,
                         )
                         reason = last_error.get("reason", "")
                         if ok:
@@ -5038,53 +10175,22 @@ async def run_paypal_pay(
                             async with queue_lock:
                                 active_slots = max(0, active_slots - 1)
                             break
-                        if _is_recreate_link_reason(reason):
-                            if link_attempt >= PAYPAL_FLOW2_RECREATE_LINK_MAX:
-                                flow2_recreate_link = True
-                                mark_link_for_regeneration(
-                                    item["email"],
-                                    account_line=item.get("account_line", ""),
-                                    reason=reason,
-                                    failed_link_method=item.get("link_method", ""),
-                                )
-                                log(
-                                    f"[paypal-pay-{index:02d}][{item['email']}] "
-                                    + _zh(
-                                        r"\u652f\u4ed8\u957f\u94fe\u63d0\u4ea4 3 \u6b21\u4ecd\u672a\u8df3\u8f6c PayPal\uff0c"
-                                        r"\u5224\u5b9a\u957f\u94fe\u4e0d\u6b63\u786e\uff0c\u5df2\u9000\u56de\u5f85\u751f\u6210\u957f\u94fe\u72b6\u6001"
-                                    )
-                                )
-                                break
-                            link_attempt += 1
+                        if _is_no_paypal_option_reason(reason):
+                            flow2_no_paypal_stop = True
+                            discard_flow2_link(item["email"], reason=reason or PAYPAL_FLOW2_NO_PAYPAL_OPTION)
                             log(
                                 f"[paypal-pay-{index:02d}][{item['email']}] "
-                                + _zh(r"\u957f\u94fe\u6821\u9a8c/\u63d0\u4ea4\u540e\u672a\u8fdb\u5165 PayPal\uff0c\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe\u540e\u91cd\u8bd5 ")
-                                + f"({link_attempt}/{PAYPAL_FLOW2_RECREATE_LINK_MAX})"
+                                + _zh(r"\u5b98\u65b9\u4f18\u60e0\u8d26\u5355\u9875\u672a\u51fa\u73b0 PayPal \u652f\u4ed8\u9009\u9879\uff0c\u6309\u89c4\u5219\u7ec8\u6b62\u5f53\u524d\u4efb\u52a1")
                             )
-                            try:
-                                await regenerate_flow2_payment_link(
-                                    item,
-                                    cfg,
-                                    worker_id=index,
-                                    proxy=proxy,
-                                    flow2_region_mode=resolved_region_mode,
-                                )
-                            except Exception as recreate_exc:  # noqa: BLE001
-                                reason = f"{PAYPAL_FLOW2_RECREATE_LINK}: recreate failed: {recreate_exc}"
-                                log(
-                                    f"[paypal-pay-{index:02d}][{item['email']}] "
-                                    + _zh(r"\u91cd\u65b0\u751f\u6210\u652f\u4ed8\u957f\u94fe\u5931\u8d25: ")
-                                    + str(recreate_exc)
-                                )
-                                flow2_recreate_link = True
-                                mark_link_for_regeneration(
-                                    item["email"],
-                                    account_line=item.get("account_line", ""),
-                                    reason=reason,
-                                    failed_link_method=item.get("link_method", ""),
-                                )
-                                break
-                            continue
+                            break
+                        if _is_recreate_link_reason(reason):
+                            flow2_recreate_link = True
+                            discard_flow2_link(item["email"], reason=reason)
+                            log(
+                                f"[paypal-pay-{index:02d}][{item['email']}] "
+                                + _zh(r"\u957f\u94fe/\u91cd\u5efa\u957f\u94fe\u515c\u5e95\u5df2\u7981\u7528\uff0c\u5f53\u524d\u8d26\u53f7\u76f4\u63a5\u7ec8\u6b62")
+                            )
+                            break
                         if not proxy_pool or proxy_attempt >= len(proxies):
                             break
                         if reason == PAYPAL_FLOW2_STRIPE_PAYPAL_TIMEOUT and proxy_attempt >= 4:
@@ -5100,7 +10206,7 @@ async def run_paypal_pay(
                             f"流程失败，随机切换代理 ({retry_label}): {_display_proxy(proxy)}"
                         )
                         break
-                    if ok or flow2_discarded or flow2_recreate_link or stripe_timeout_stop:
+                    if ok or flow2_discarded or flow2_recreate_link or flow2_no_paypal_stop or stripe_timeout_stop:
                         break
                 if ok and not local_random_mode:
                     card_pool.remove(card)
@@ -5115,9 +10221,9 @@ async def run_paypal_pay(
                     if flow2_recreate_link:
                         log(
                             f"[paypal-pay-{index:02d}][{item['email']}] "
-                            + _zh(r"\u8bf7\u5148\u91cd\u65b0\u751f\u6210\u8be5\u8d26\u53f7\u957f\u94fe\uff0c\u518d\u7ee7\u7eed\u6d41\u7a0b2")
+                            + _zh(r"\u957f\u94fe\u6d41\u7a0b\u5df2\u505c\u7528\uff0c\u672c\u6b21\u4e0d\u518d\u91cd\u5efa\u6216\u590d\u7528\u957f\u94fe")
                         )
-                    return
+                    continue
 
     tasks = [asyncio.create_task(worker(i + 1)) for i in range(max(1, workers))]
     await asyncio.gather(*tasks)

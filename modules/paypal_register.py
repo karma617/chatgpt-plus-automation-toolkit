@@ -520,6 +520,10 @@ async def register_one(
         fingerprint_seed=f"{email}|paypal-register",
         account_id=email,
         log_prefix=prefix,
+        browser_engine=browser_cfg.get("engine"),
+        browser_locale=browser_cfg.get("locale"),
+        camoufox_executable_path=browser_cfg.get("camoufox_executable_path"),
+        camoufox_geoip=browser_cfg.get("camoufox_geoip"),
     )
     session = BrowserSession(**session_kwargs)
 
@@ -734,6 +738,10 @@ async def login_existing_account_for_checkout(
         fingerprint_seed=f"{email}|paypal-login",
         account_id=email,
         log_prefix=prefix,
+        browser_engine=browser_cfg.get("engine"),
+        browser_locale=browser_cfg.get("locale"),
+        camoufox_executable_path=browser_cfg.get("camoufox_executable_path"),
+        camoufox_geoip=browser_cfg.get("camoufox_geoip"),
     )
     page = None
     try:
